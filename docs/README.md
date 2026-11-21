@@ -3,6 +3,7 @@
 | 想了解什么 | 从这里开始 |
 | --- | --- |
 | 项目目标、本地开发命令和路线图 | [简体中文](./overview.zh-CN.md) · [English](./overview.md) |
+| 安装 macOS 测试包、选择角色和验证局域网连接 | [macOS 双机测试](./macos.md) |
 | 模块职责、设备授权和通信协议 | [架构设计](./architecture.md) |
 | 当前要交付什么、按什么顺序验收 | [Phase 1 实现计划](./implementation.md) |
 | 如何设计、实现和评审改动 | [开发规则](./development.md) |

@@ -3,3 +3,7 @@ name = "koko-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+koko-p2p.workspace = true
+tokio.workspace = true

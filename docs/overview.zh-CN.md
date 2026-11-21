@@ -14,7 +14,7 @@
   </p>
 </div>
 
-> Phase 1 的 Rust 工作区骨架已就绪。本文介绍规划中的远程桌面功能和 v0.1 接口。
+> Phase 1 已支持持久化设备身份与局域网授权连接检查。下文的远程桌面功能和 MCP 接口仍处于规划阶段。
 
 ## 什么是 Koko？
 
@@ -69,11 +69,9 @@
 cargo build --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo run --locked -p koko-daemon
-cargo run --locked -p koko-agent
 ```
 
-两个程序目前在输出骨架状态后退出。
+双机验收可安装同一个 [macOS 测试包](./macos.md) 并在两端选择角色。[局域网验收命令](./implementation.md#身份与连接验收命令)用于命令行调试。
 
 ## 代码仓库结构
 

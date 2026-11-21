@@ -53,6 +53,42 @@
 
 第一轮交付以工作项 1–3 通过为准。工作项 4 和 5 可分别推进，Phase 1 的完整演示仍以架构文档的验收标准为准。
 
+## 身份与连接验收命令
+
+双机测试可以使用同一个 [macOS 测试包](./macos.md) 在两端选择角色。以下命令供开发时检查 CLI 和协议入口。
+
+在各自的 Mac 上从仓库根目录运行对应命令。身份文件保留在本机的 `~/.koko/`，两端只交换命令输出的公钥标识。
+
+被控端生成或读取主机身份。
+
+```bash
+mkdir -p ~/.koko
+cargo run --locked -p koko-daemon -- identity ~/.koko/host.key
+```
+
+控制端生成或读取自己的身份。
+
+```bash
+mkdir -p ~/.koko
+cargo run --locked -p koko-agent -- identity ~/.koko/controller.key
+```
+
+将 `CONTROLLER_ID` 设为控制端命令输出，将 `HOST_ID` 设为被控端命令输出。把示例地址 `192.168.1.10:4444` 换成被控端用于验收的局域网地址与端口。
+
+被控端启动前台监听。
+
+```bash
+cargo run --locked -p koko-daemon -- serve ~/.koko/host.key 192.168.1.10:4444 "$CONTROLLER_ID"
+```
+
+控制端验证身份与授权。成功时输出 `Authorized by` 和主机公钥标识。用另一份控制端身份重复相同命令，应以失败退出。
+
+```bash
+cargo run --locked -p koko-agent -- check ~/.koko/controller.key "$HOST_ID" 192.168.1.10:4444
+```
+
+本地复现可在同一台机器上使用 `127.0.0.1:4444` 和两份独立的身份文件。
+
 ## 测试与依赖
 
 - 自动化覆盖帧编解码、已授权与未授权的真实连接、CLI 文件输出。带图形权限的截图与双机网络行为用实机验收补足。

@@ -14,7 +14,7 @@
   </p>
 </div>
 
-> The Phase 1 Rust workspace is in place. This README describes the planned remote desktop capabilities and v0.1 interfaces.
+> Phase 1 supports persistent device identities and authorized LAN connection checks. The remote desktop features and MCP interfaces below are planned.
 
 ## What is Koko?
 
@@ -69,11 +69,9 @@ Install [rustup](https://rust-lang.org/install) and run these commands from the 
 cargo build --workspace --locked
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo run --locked -p koko-daemon
-cargo run --locked -p koko-agent
 ```
 
-Both binaries print a scaffold status message and exit.
+Use the [macOS test app](./macos.md) to select roles on two Macs. The [LAN connection commands](./implementation.md#身份与连接验收命令) cover CLI debugging.
 
 ## Workspace Layout
 

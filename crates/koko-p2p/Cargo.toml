@@ -3,3 +3,8 @@ name = "koko-p2p"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+koko-proto.workspace = true
+tempfile.workspace = true

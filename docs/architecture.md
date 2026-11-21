@@ -85,6 +85,8 @@ flowchart LR
 | **0x03 Input** | 双向可靠 Stream | Compact Binary / CBOR | 标准化键鼠与剪贴板事件，每条事件携带 `actor: Human \| Agent` 与 `lease_id` |
 | **0x04 Agent RPC** | 双向可靠 Stream | Length-Prefixed JSON-RPC 2.0 | 承载 `koko-agent` 发往远端的按需抓帧（PNG/WebP + 坐标缩放元数据）、UI 树查询、受控命令执行 |
 
+身份与连接工作项在一条双向流上验证授权。每个方向发送一帧，格式依次为 `0x01`、四字节大端载荷长度和 JSON 字符串。控制端发 `"hello"`，授权后的主机回 `"ready"`。本轮使用固定的七字节 JSON 载荷。主机在读取请求前根据 QUIC 握手确认的公钥检查授权名单，检查完成后由控制端关闭连接。
+
 ## 4. `koko-agent`（MCP 工具集）与人机协同仲裁
 
 ### 4.1 暴露给大模型的标准 MCP 工具
