@@ -32,20 +32,20 @@
 | `koko-proto` | 声明 `koko/1` 使用的截图请求、结果、稳定错误类型和必要的帧约束。首轮支持一张主显示器 PNG，返回图像宽高。 |
 | `koko-p2p` | 管理本地持久化设备身份，通过 iroh 建立带公钥身份的 QUIC 连接。在局域网验收配置中使用明确的设备标识与直连地址，关闭中继和外部地址查询。 |
 | `koko-daemon` | 在已登录的 macOS 图形会话中以前台模式运行。主机所有者显式允许一个指定控制端作为 `Observer`。根据连接认证的公钥授权，再调用采集模块。 |
-| `koko-capture` | 通过 xcap 按需采集主显示器并编码 PNG，向 daemon 返回采集结果或原因明确的错误。 |
+| macOS 采集 | 图形版在 `Koko.app` 进程内检查录屏权限，并按需通过 ScreenCaptureKit 采集主显示器和编码 PNG。CLI 独立运行时使用 `koko-desktop` 中的同一采集实现。 |
 | `koko-agent` | 提供查询本机设备标识与一次性截图命令，接受目标设备标识、直接地址和本地输出路径。使用同一调用路径对接后续 MCP。 |
 | `koko-input` | 待进入键鼠里程碑时接入。 |
 
-首轮使用架构中的 `0x04 Agent RPC` 通道完成截图，复用长度前缀和 JSON-RPC 格式。首次实现根据支持的截图尺寸确定请求与响应的帧上限，接收方在分配缓冲前检查长度。daemon 在解码请求边界完成格式校验，权限依据来自连接认证的公钥。MCP 接入后，工具参数只在各自外部入口解析，内部使用已定型的请求数据。
+macOS 测试版通过 `koko/remote/1` 传递截图和键鼠命令。每条双向流处理一个有长度上限的 JSON 请求和一个结果。daemon 在解码边界执行请求校验，并以连接认证的控制端公钥检查授权。后续 MCP 可以复用这条路径。
 
-短码配对通过局域网发现获取主机公钥和地址，被控端用户确认请求后才授权。需要指定身份和地址时可使用下文的 CLI 调试入口。重启从同一身份文件读取密钥。macOS 屏幕录制权限由主机所有者授予。[iroh 地址文档](https://docs.rs/iroh/latest/iroh/struct.EndpointAddr.html) · [iroh 中继模式](https://docs.rs/iroh/latest/iroh/endpoint/enum.RelayMode.html) · [xcap 项目文档](https://github.com/nashaofu/xcap) · [Apple 屏幕录制权限说明](https://support.apple.com/zh-cn/guide/mac-help/mchld6aa7d23/mac)
+被控端发出的授权码可直接开始查看和键鼠会话。从局域网结果发起远程控制时，由被控端确认。需要指定身份和地址时可使用下文的 CLI 调试入口。重启从同一身份文件读取密钥。macOS 录屏和辅助功能权限由主机所有者授予。[iroh 地址文档](https://docs.rs/iroh/latest/iroh/struct.EndpointAddr.html) · [macOS 权限设计](./macos-permissions.md)
 
 ## 实现顺序与验收
 
 | 工作项 | 实现内容 | 通过条件 |
 | --- | --- | --- |
 | 1. 身份与连接 | 两端保留独立的设备身份，主机只接受显式授权的控制端。用真实 iroh 连接集成测试覆盖鉴权与协议入口。 | 本地两个 Endpoint 可以交换测试请求。重启后身份不变。换用未授权的控制端身份或指定错误的主机标识，连接或请求被拒绝。 |
-| 2. 真实截图 | 用 xcap 抓主显示器，将一次截图请求接到 daemon，应用显示 PNG，CLI 可保存 PNG。[macOS 权限设计](./macos-permissions.md) | 主机打开只含测试文字的窗口，控制端能看到文字和正确尺寸。未授权请求无法得到图像。关闭共享或撤销系统录屏权限时，控制端收到可区分的错误。 |
+| 2. 真实截图 | 用 ScreenCaptureKit 抓主显示器，应用显示由 daemon 返回的 PNG。[macOS 权限设计](./macos-permissions.md) | 主机打开只含测试文字的窗口，控制端能看到文字和正确比例。未授权请求无法得到图像。结束会话或撤销系统录屏权限时，控制端收到可区分的错误。 |
 | 3. 双机局域网验收 | 在两台实际 Mac 上安装同一个 DMG，记录配对、连接和截图步骤。 | 局域网验收配置禁用中继和外部地址查询。授权成功、未授权拒绝、重启复用身份三种场景通过。记录 macOS 版本、直连状态和截图尺寸。 |
 | 4. 只读 MCP | 双机截图验收后引入 `rmcp` stdio，先接 `koko_screenshot`，随后通过真实配对数据实现 `koko_list_devices`。 | MCP 客户端能发现并调用截图工具。工具返回图像，连接与授权仍走同一主机路径，诊断日志写到 stderr。[rmcp stdio 示例](https://github.com/modelcontextprotocol/rust-sdk/tree/main/examples/servers) |
 | 5. 跨公网验收 | 在独立测试中启用所需的地址发现及中继，使用不同网络的授权设备。 | 验证可直连环境和需要中继的环境，记录当前连接路径。两种路径都保持同一对设备身份和截图权限。条件不足时记录哪条路径待验证。 |
@@ -92,5 +92,5 @@ cargo run --locked -p koko-agent -- check ~/.koko/controller.key "$HOST_ID" 192.
 ## 测试与依赖
 
 - 自动化覆盖帧编解码、已授权与未授权的真实连接、CLI 文件输出。带图形权限的截图与双机网络行为用实机验收补足。
-- 依赖按工作项引入，连接阶段验证 iroh，截图阶段验证 xcap，MCP 阶段再引入 rmcp。以选定版本的文档和真实构建确定 API 与最小特性，Cargo 生成锁文件。
+- 依赖按工作项引入，连接验证 iroh，macOS 屏幕采集使用系统 ScreenCaptureKit，MCP 阶段再引入 rmcp。以选定版本的文档和真实构建确定 API 与最小特性，Cargo 生成锁文件。
 - 每项执行[开发规则里的仓库检查](./development.md#验证与复盘)，并记录该项通过的实机场景。对速度或稳定性的改动以测量数据为依据。

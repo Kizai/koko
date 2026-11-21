@@ -14,7 +14,7 @@
   </p>
 </div>
 
-> Phase 1 supports short-code LAN pairing and a screen recording permission panel on macOS. The remote desktop features and MCP interfaces below are planned.
+> The macOS test app supports one-time authorization codes, LAN discovery with host approval, primary-display snapshots, and basic keyboard and mouse control. MCP interfaces are planned.
 
 ## What is Koko?
 

@@ -11,6 +11,25 @@ disk_image="$build_dir/Koko-$version.dmg"
 image_dir="$build_dir/image"
 app="$image_dir/Koko.app"
 launcher_sources=("$repo_root"/apps/koko-macos/*.swift)
+signing_identity="${KOKO_SIGN_IDENTITY:--}"
+require_apple_signing=false
+if [[ "$#" -eq 1 && "$1" == "--require-apple-signing" ]]; then
+    require_apple_signing=true
+elif [[ "$#" -ne 0 ]]; then
+    printf 'Usage: %s [--require-apple-signing]\n' "$0" >&2
+    exit 2
+fi
+
+ad_hoc=false
+if [[ "$signing_identity" == "-" ]]; then
+    if [[ "$require_apple_signing" == true ]]; then
+        printf 'Set KOKO_SIGN_IDENTITY to an Apple code-signing identity in the build Mac keychain.\n' >&2
+        exit 1
+    fi
+    ad_hoc=true
+    printf 'Ad hoc test build. macOS permissions may need to be granted again after upgrading.\n' >&2
+fi
+signing_options=(--force --sign "$signing_identity")
 
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources"
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -26,6 +45,10 @@ for architecture in arm64 x86_64; do
     xcrun swiftc -parse-as-library -swift-version 6 -O \
         -target "$architecture-apple-macosx$MACOSX_DEPLOYMENT_TARGET" \
         "${launcher_sources[@]}" -o "$build_dir/Koko-$architecture"
+    xcrun swiftc -parse-as-library -swift-version 6 -O \
+        -target "$architecture-apple-macosx$MACOSX_DEPLOYMENT_TARGET" \
+        apps/koko-macos/ScreenCapture.swift apps/koko-macos/DesktopInput.swift apps/koko-macos/desktop/KokoDesktop.swift \
+        -o "$build_dir/koko-desktop-$architecture"
 done
 
 xcrun lipo -create "$build_dir/Koko-arm64" "$build_dir/Koko-x86_64" \
@@ -35,17 +58,38 @@ for executable in koko-daemon koko-agent; do
         "$repo_root/target/aarch64-apple-darwin/release/$executable" \
         "$repo_root/target/x86_64-apple-darwin/release/$executable" \
         -output "$app/Contents/Helpers/$executable"
-    codesign --force --sign - "$app/Contents/Helpers/$executable"
+    codesign "${signing_options[@]}" --identifier "io.github.kizai.koko.$executable" \
+        "$app/Contents/Helpers/$executable"
 done
+
+xcrun lipo -create "$build_dir/koko-desktop-arm64" "$build_dir/koko-desktop-x86_64" \
+    -output "$app/Contents/Helpers/koko-desktop"
+codesign "${signing_options[@]}" --identifier io.github.kizai.koko.koko-desktop \
+    "$app/Contents/Helpers/koko-desktop"
 
 ditto apps/koko-macos/Info.plist "$app/Contents/Info.plist"
 plutil -insert CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 plutil -insert CFBundleVersion -string "$version" "$app/Contents/Info.plist"
+plutil -insert KokoAdHocSigned -bool "$ad_hoc" "$app/Contents/Info.plist"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
-codesign --force --sign - "$app"
+codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"
+if [[ "$require_apple_signing" == true ]]; then
+    codesign --verify -R '=anchor apple generic' "$app"
+fi
 
 ln -sfn /Applications "$image_dir/Applications"
 hdiutil create -quiet -volname "Koko $version" -srcfolder "$image_dir" \
     -format UDZO -ov "$disk_image"
+hdiutil verify -quiet "$disk_image"
+
+for older in "$build_dir"/Koko*.dmg; do
+    [[ "$older" == "$disk_image" || ! -f "$older" ]] && continue
+    filename="$(basename "$older")"
+    if [[ "$filename" == "Koko.dmg" ]] ||
+       [[ "$filename" =~ ^Koko-[0-9]+\.[0-9]+\.[0-9]+\.dmg$ &&
+          "$(printf '%s\n' "$filename" "Koko-$version.dmg" | LC_ALL=C sort -V | tail -n 1)" == "Koko-$version.dmg" ]]; then
+        rm -- "$older"
+    fi
+done
 printf 'App: %s\nDMG: %s\n' "$app" "$disk_image"

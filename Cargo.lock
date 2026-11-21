@@ -1384,48 +1384,57 @@ dependencies = [
 
 [[package]]
 name = "koko-agent"
-version = "0.1.1"
+version = "0.1.7"
 dependencies = [
+ "iroh",
  "koko-p2p",
+ "koko-proto",
+ "serde_json",
  "tokio",
 ]
 
 [[package]]
 name = "koko-capture"
-version = "0.1.1"
+version = "0.1.7"
 
 [[package]]
 name = "koko-daemon"
-version = "0.1.1"
+version = "0.1.7"
 dependencies = [
+ "base64 0.22.1",
  "iroh",
  "koko-capture",
  "koko-p2p",
  "koko-proto",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "koko-input"
-version = "0.1.1"
+version = "0.1.7"
 
 [[package]]
 name = "koko-p2p"
-version = "0.1.1"
+version = "0.1.7"
 dependencies = [
  "blake3",
  "if-addrs",
  "iroh",
  "koko-proto",
  "mdns-sd",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "koko-proto"
-version = "0.1.1"
+version = "0.1.7"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "lazy_static"
@@ -2432,6 +2441,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -3780,3 +3802,9 @@ dependencies = [
  "quote",
  "syn 3.0.10",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

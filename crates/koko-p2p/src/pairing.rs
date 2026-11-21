@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -7,12 +7,13 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::presets};
-use koko_proto::{CONTROL_READY, PAIR_ALPN};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use koko_proto::{CONTROL_READY, CONTROL_REQUEST, PAIR_ALPN};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::time::timeout;
 
 const SERVICE: &str = "_koko-pair._udp.local.";
 const DIRECT_INVITE_PREFIX: &str = "koko://pair/v1/";
+const LAN_REQUEST_PREFIX: &str = "koko://request/v1/";
 const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 pub const CODE_LENGTH: usize = 10;
 pub const INVITE_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -85,43 +86,54 @@ pub fn listening_target(host: EndpointId, bind: SocketAddr) -> io::Result<Endpoi
 }
 
 pub fn direct_invite(target: &EndpointAddr, code: &InviteCode) -> Option<String> {
-    if target.is_empty() {
-        return None;
-    }
+    (!target.is_empty()).then(|| format!("{DIRECT_INVITE_PREFIX}{code}/{}", target_path(target)))
+}
+
+pub fn lan_request(target: &EndpointAddr) -> String {
+    format!("{LAN_REQUEST_PREFIX}{}", target_path(target))
+}
+
+fn target_path(target: &EndpointAddr) -> String {
     let addresses = target
         .ip_addrs()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    Some(format!(
-        "{DIRECT_INVITE_PREFIX}{code}/{}/{}",
-        target.id,
-        addresses.join(",")
-    ))
+    format!("{}/{}", target.id, addresses.join(","))
 }
 
-pub async fn resolve_invite(input: &str) -> Result<(InviteCode, EndpointAddr), Box<dyn Error>> {
+pub async fn resolve_invite(
+    input: &str,
+) -> Result<(Option<InviteCode>, EndpointAddr), Box<dyn Error>> {
     let input = input.trim();
     if let Some(invite) = input.strip_prefix(DIRECT_INVITE_PREFIX) {
-        let (code, host) = invite.split_once('/').ok_or("invalid direct invite")?;
-        let (host, addresses) = host.split_once('/').ok_or("invalid direct invite")?;
-        let addresses = addresses
-            .split(',')
-            .map(str::parse::<SocketAddr>)
-            .collect::<Result<BTreeSet<_>, _>>()
-            .map_err(|_| "invalid address in direct invite")?;
-        if addresses.iter().any(|address| {
-            !address.is_ipv4() || address.ip().is_unspecified() || address.port() == 0
-        }) {
-            return Err("invalid address in direct invite".into());
-        }
-        let target =
-            EndpointAddr::from_parts(host.parse()?, addresses.into_iter().map(TransportAddr::Ip));
-        Ok((code.parse()?, target))
+        let (code, target) = invite.split_once('/').ok_or("invalid direct invite")?;
+        Ok((Some(code.parse()?), parse_target(target)?))
+    } else if let Some(target) = input.strip_prefix(LAN_REQUEST_PREFIX) {
+        Ok((None, parse_target(target)?))
     } else {
         let code = input.parse()?;
         let target = discover_invite(&code).await?;
-        Ok((code, target))
+        Ok((Some(code), target))
     }
+}
+
+fn parse_target(input: &str) -> Result<EndpointAddr, Box<dyn Error>> {
+    let (host, addresses) = input.split_once('/').ok_or("invalid direct invite")?;
+    let addresses = addresses
+        .split(',')
+        .map(str::parse::<SocketAddr>)
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(|_| "invalid address in direct invite")?;
+    if addresses
+        .iter()
+        .any(|address| !address.is_ipv4() || address.ip().is_unspecified() || address.port() == 0)
+    {
+        return Err("invalid address in direct invite".into());
+    }
+    Ok(EndpointAddr::from_parts(
+        host.parse()?,
+        addresses.into_iter().map(TransportAddr::Ip),
+    ))
 }
 
 pub fn publish_invite(
@@ -159,20 +171,11 @@ async fn discover_invite(code: &InviteCode) -> Result<EndpointAddr, Box<dyn Erro
     let found = timeout(Duration::from_secs(8), async {
         while let Ok(event) = events.recv_async().await {
             if let ServiceEvent::ServiceResolved(service) = event
-                && let Some(host) = service
-                    .get_property_val_str("id")
-                    .and_then(|id| id.parse().ok())
+                && let Some(target) = discovered_target(&service)
                 && service.get_property_val_str("proof")
-                    == Some(code.discovery_proof(host).as_str())
+                    == Some(code.discovery_proof(target.id).as_str())
             {
-                let addresses = service
-                    .get_addresses_v4()
-                    .into_iter()
-                    .map(|ip| TransportAddr::Ip(SocketAddr::new(ip.into(), service.get_port())));
-                let target = EndpointAddr::from_parts(host, addresses);
-                if !target.is_empty() {
-                    return Some(target);
-                }
+                return Some(target);
             }
         }
         None
@@ -185,10 +188,41 @@ async fn discover_invite(code: &InviteCode) -> Result<EndpointAddr, Box<dyn Erro
         .ok_or_else(|| "Koko host not found for this code".into())
 }
 
+pub async fn discover_hosts() -> Result<Vec<EndpointAddr>, Box<dyn Error>> {
+    let daemon = ServiceDaemon::new()?;
+    let events = daemon.browse(SERVICE)?;
+    let mut hosts = BTreeMap::<EndpointId, EndpointAddr>::new();
+    let _ = timeout(Duration::from_secs(2), async {
+        while let Ok(event) = events.recv_async().await {
+            if let ServiceEvent::ServiceResolved(service) = event
+                && let Some(target) = discovered_target(&service)
+            {
+                let host = hosts
+                    .entry(target.id)
+                    .or_insert_with(|| EndpointAddr::new(target.id));
+                host.addrs.extend(target.addrs);
+            }
+        }
+    })
+    .await;
+    let _ = daemon.shutdown();
+    Ok(hosts.into_values().collect())
+}
+
+fn discovered_target(service: &ResolvedService) -> Option<EndpointAddr> {
+    let host = service.get_property_val_str("id")?.parse().ok()?;
+    let addresses = service
+        .get_addresses_v4()
+        .into_iter()
+        .map(|ip| TransportAddr::Ip(SocketAddr::new(ip.into(), service.get_port())));
+    let target = EndpointAddr::from_parts(host, addresses);
+    (!target.is_empty() && service.get_port() != 0).then_some(target)
+}
+
 pub async fn request_pairing(
     key: SecretKey,
     target: EndpointAddr,
-    code: &InviteCode,
+    code: Option<&InviteCode>,
 ) -> Result<SocketAddr, Box<dyn Error>> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(key)
@@ -196,7 +230,8 @@ pub async fn request_pairing(
         .await?;
     let connection = endpoint.connect(target, PAIR_ALPN).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    send.write_all(&code.0).await?;
+    send.write_all(code.map_or(CONTROL_REQUEST, |code| &code.0))
+        .await?;
     send.finish()?;
     let result = timeout(
         Duration::from_secs(90),

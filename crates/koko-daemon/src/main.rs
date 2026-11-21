@@ -1,3 +1,4 @@
+mod desktop;
 mod pairing;
 
 use std::error::Error;
@@ -48,13 +49,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.as_slice() {
         [option] if option == "--version" => println!("koko-daemon {}", env!("CARGO_PKG_VERSION")),
         #[cfg(target_os = "macos")]
-        [command, action] if command == "screen-permission" => {
+        [command, action] if matches!(command.as_str(), "screen-permission" | "input-permission") => {
             let request = match action.as_str() {
                 "check" => false,
                 "request" => true,
-                _ => return Err("usage: koko-daemon screen-permission <check|request>".into()),
+                _ => return Err("expected permission action check or request".into()),
             };
-            let granted = koko_capture::check_screen_recording_permission(request);
+            let granted = match desktop::permission(command, request) {
+                Ok(granted) => granted,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && command == "screen-permission" => {
+                    koko_capture::check_screen_recording_permission(request)
+                }
+                Err(error) => return Err(error.into()),
+            };
             println!("{}", if granted { "granted" } else { "required" });
         }
         [command, file] if command == "identity" => {
@@ -75,13 +82,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
+        [command, file, bind, option] if command == "serve-pair" && option == "--app-desktop" => {
+            let identity = load_or_create_identity(Path::new(file))?;
+            pairing::serve(identity, bind.parse()?, true).await?;
+        }
         [command, file, bind] if command == "serve-pair" => {
             let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, bind.parse()?).await?;
+            pairing::serve(identity, bind.parse()?, false).await?;
         }
         [command, file] if command == "serve-pair" => {
             let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, ([0, 0, 0, 0], 4444).into()).await?;
+            pairing::serve(identity, ([0, 0, 0, 0], 4444).into(), false).await?;
         }
         _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port] | screen-permission <check|request>".into()),
     }

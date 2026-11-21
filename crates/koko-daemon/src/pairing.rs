@@ -14,13 +14,17 @@ use koko_p2p::{
         CODE_LENGTH, INVITE_LIFETIME, InviteCode, direct_invite, listening_target, publish_invite,
     },
 };
-use koko_proto::{ALPN, CONTROL_READY, PAIR_ALPN};
+use koko_proto::{ALPN, CONTROL_READY, CONTROL_REQUEST, PAIR_ALPN, REMOTE_ALPN};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::Host;
+use crate::{
+    Host,
+    desktop::{AppDesktop, AppDesktopRequests, RemoteHost},
+};
 
 struct PairRequest {
     peer: EndpointId,
+    by_code: bool,
     decision: oneshot::Sender<bool>,
 }
 
@@ -42,7 +46,8 @@ impl ProtocolHandler for Pairing {
             .read_to_end(CODE_LENGTH)
             .await
             .map_err(AcceptError::from_err)?;
-        if !self.code.matches(&code) {
+        let by_code = self.code.matches(&code);
+        if !by_code && code != CONTROL_REQUEST {
             connection.close(1u32.into(), b"invalid pairing code");
             return Ok(());
         }
@@ -50,6 +55,7 @@ impl ProtocolHandler for Pairing {
         let (decision, response) = oneshot::channel();
         let request = PairRequest {
             peer: connection.remote_id(),
+            by_code,
             decision,
         };
         if self.requests.try_send(request).is_err() {
@@ -75,7 +81,11 @@ impl ProtocolHandler for Pairing {
     }
 }
 
-pub(crate) async fn serve(key: SecretKey, address: SocketAddr) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn serve(
+    key: SecretKey,
+    address: SocketAddr,
+    use_app_desktop: bool,
+) -> Result<(), Box<dyn Error>> {
     if !address.is_ipv4() {
         return Err("pairing requires an IPv4 listen address".into());
     }
@@ -99,7 +109,16 @@ pub(crate) async fn serve(key: SecretKey, address: SocketAddr) -> Result<(), Box
     };
     let (allow_peer, allowed_peer) = watch::channel(None);
     let (requests, mut incoming) = mpsc::channel(1);
+    let (app_desktop, mut desktop_requests) = AppDesktop::channel();
     let router = Router::builder(endpoint)
+        .accept(
+            REMOTE_ALPN,
+            RemoteHost {
+                allowed_peer: allow_peer.clone(),
+                app_desktop: use_app_desktop.then_some(app_desktop),
+                pointer: tokio::sync::Mutex::new(()),
+            },
+        )
         .accept(ALPN, Host { allowed_peer })
         .accept(PAIR_ALPN, Pairing { code, requests })
         .spawn();
@@ -125,6 +144,7 @@ pub(crate) async fn serve(key: SecretKey, address: SocketAddr) -> Result<(), Box
     let mut open = true;
     let mut pending: Option<(u64, PairRequest)> = None;
     let mut request_number = 0;
+    let mut app_desktops = AppDesktopRequests::default();
     loop {
         tokio::select! {
             biased;
@@ -134,21 +154,33 @@ pub(crate) async fn serve(key: SecretKey, address: SocketAddr) -> Result<(), Box
             }
             _ = &mut expires, if open => {
                 open = false;
-                pending = None;
-                incoming.close();
-                stop_discovery();
                 println!("Pair code expired");
             }
             Some(request) = incoming.recv() => {
-                if open && pending.as_ref().is_none_or(|(_, current)| current.decision.is_closed()) {
+                if open && request.by_code && !request.decision.is_closed() {
+                    allow_peer.send_replace(Some(request.peer));
+                    let _ = request.decision.send(true);
+                    open = false;
+                    pending = None;
+                    incoming.close();
+                    stop_discovery();
+                    println!("Pair approved");
+                } else if allow_peer.borrow().is_none() && !request.by_code
+                    && pending.as_ref().is_none_or(|(_, current)| current.decision.is_closed())
+                {
                     request_number += 1;
                     println!("Pair request: {request_number} {}", request.peer.fmt_short());
                     pending = Some((request_number, request));
                 }
             }
+            Some(request) = desktop_requests.recv() => app_desktops.request(request),
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 let Some((action, number)) = command.split_once(' ') else { continue; };
+                if action == "desktop-reply" {
+                    app_desktops.reply(number);
+                    continue;
+                }
                 if !matches!(action, "approve" | "decline")
                     || pending.as_ref().is_none_or(|(id, _)| number.parse::<u64>() != Ok(*id))
                 {
@@ -184,15 +216,14 @@ mod tests {
     use iroh::EndpointAddr;
     use koko_p2p::{
         check_host,
-        pairing::{request_pairing, resolve_invite},
+        pairing::{lan_request, request_pairing, resolve_invite},
     };
     use tokio::time::timeout;
 
     use super::*;
 
     #[tokio::test]
-    async fn a_direct_invite_to_a_wildcard_listener_still_requires_approval()
-    -> Result<(), Box<dyn Error>> {
+    async fn a_discovered_host_requires_approval() -> Result<(), Box<dyn Error>> {
         let host_key = SecretKey::generate();
         let host_id = host_key.public();
         let controller = SecretKey::generate();
@@ -203,14 +234,13 @@ mod tests {
         let (allow_peer, allowed_peer) = watch::channel(None);
         let (requests, mut incoming) = mpsc::channel(1);
         let code = InviteCode::generate();
-        let invitation = direct_invite(
+        let invitation = lan_request(
             &EndpointAddr::new(host_id)
                 .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)))
                 .with_ip_addr(address),
-            &code,
-        )
-        .unwrap();
+        );
         let (try_code, target) = resolve_invite(&invitation).await?;
+        assert!(try_code.is_none());
         let router = Router::builder(endpoint)
             .accept(ALPN, Host { allowed_peer })
             .accept(PAIR_ALPN, Pairing { code, requests })
@@ -228,7 +258,7 @@ mod tests {
                 request.decision.send(true).unwrap();
             };
             let (paired, ()) = tokio::join!(
-                request_pairing(controller.clone(), target, &try_code),
+                request_pairing(controller.clone(), target, try_code.as_ref()),
                 approve,
             );
             assert_eq!(paired?, address);
