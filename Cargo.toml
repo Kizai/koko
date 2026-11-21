@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/koko-proto",
+    "crates/koko-p2p",
+    "crates/koko-capture",
+    "crates/koko-input",
+    "crates/koko-daemon",
+    "crates/koko-agent",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
