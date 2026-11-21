@@ -3,8 +3,8 @@
   <p><b>敲一下，就连上。</b></p>
   <p>用 Rust 打造的 Agent 原生 P2P 远程桌面 —— 同时面向<b>人类</b>与 <b>AI Agent</b>。</p>
   <p>
-    <a href="./README.md">English</a> ·
-    <a href="./ARCHITECTURE.md">架构设计</a>
+    <a href="./overview.md">English</a> ·
+    <a href="./README.md">文档目录</a>
   </p>
   <p>
     <img src="https://img.shields.io/badge/Built%20with-Rust-orange?logo=rust" alt="Built with Rust" />
@@ -91,7 +91,7 @@ koko/
     └── koko-agent/      # 本地 MCP Server (rmcp) 与命令行工具
 ```
 
-`koko-client` 计划在 Phase 2 加入。完整的技术选型、四通道帧结构与状态机说明请见 [ARCHITECTURE.md](./ARCHITECTURE.md)。
+`koko-client` 计划在 Phase 2 加入。技术选型与协议设计见 [架构文档](./architecture.md)，首轮交付范围与验收方式见 [Phase 1 实现计划](./implementation.md)。
 
 ## 路线图 (Roadmap)
 
@@ -119,4 +119,4 @@ koko/
 
 ## 开源协议
 
-Koko 采用 GNU 通用公共许可证第 3 版（GPL-3.0），详见 [LICENSE](./LICENSE)。
+Koko 采用 GNU 通用公共许可证第 3 版（GPL-3.0），详见 [LICENSE](../LICENSE)。

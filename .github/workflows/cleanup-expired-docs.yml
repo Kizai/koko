@@ -1,0 +1,29 @@
+name: Clean up expired documentation
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+      timezone: Asia/Shanghai
+
+concurrency: cleanup-expired-docs
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Delete expired notes
+        run: python3 .github/scripts/cleanup_expired_docs.py --apply
+      - name: Commit deletions
+        env:
+          DEFAULT_REF: ${{ github.ref }}
+        run: |
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m 'Remove expired documentation notes'
+          git push origin "HEAD:$DEFAULT_REF"

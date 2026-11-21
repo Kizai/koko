@@ -1,8 +1,10 @@
 # Koko (叩叩) 技术架构与协议设计（MVP v0.1）
 
+[返回文档目录](./README.md)
+
 本文档定义 **Koko** 的 MVP 技术栈选型、基于 QUIC 的双模传输协议（`koko-p2p`）、AI Agent 桥接层（`koko-agent`）以及核心差异化能力——**人机控制权仲裁器（Human-in-the-Loop Arbiter）**的工程设计。
 
-> 本文描述 MVP v0.1 的设计目标与后续阶段规划。
+> 本文描述 MVP v0.1 的设计目标与后续阶段规划。首轮交付范围与验收顺序见 [Phase 1 实现计划](./implementation.md)。
 
 ## 1. MVP 技术栈定案
 
