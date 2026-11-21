@@ -27,8 +27,6 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
 private struct ConnectionView: View {
     @ObservedObject var connection: LocalConnection
     @AppStorage("deviceRole") private var role = DeviceRole.controller
-    @AppStorage("allowedControllerID") private var allowedPeer = ""
-    @AppStorage("lastConnectionCode") private var remoteCode = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -38,8 +36,13 @@ private struct ConnectionView: View {
                     .foregroundStyle(Color.accentColor)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Koko").font(.title2.bold())
-                    Text("局域网连接测试").foregroundStyle(.secondary)
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("Koko").font(.title2.bold())
+                        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                            Text("v\(version)").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Text("设备配对").foregroundStyle(.secondary)
                 }
                 Spacer()
             }
@@ -60,24 +63,27 @@ private struct ConnectionView: View {
         }
         .padding(24)
         .frame(width: 520)
-        .task(id: role) { await connection.prepareIdentity(for: role) }
+        .task(id: role) {
+            await connection.prepareIdentity(for: role)
+            if role == .host { await connection.refreshScreenPermission() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if role == .host { Task { await connection.refreshScreenPermission() } }
+        }
     }
 
     private var controllerForm: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("1. 复制控制端 ID，交给被控端。")
-            copyRow(connection.controllerID, placeholder: "正在读取设备 ID…", button: "复制 ID")
-
-            Text("2. 粘贴被控端生成的连接码。")
-            TextField("粘贴连接码", text: $remoteCode)
+            Text("输入被控端的连接码，或粘贴直连邀请。")
+            TextField("连接码或直连邀请", text: $connection.inviteInput)
                 .textFieldStyle(.roundedBorder)
                 .disabled(connection.isChecking)
                 .accessibilityIdentifier("remote-code")
 
             HStack {
-                Button("验证连接") { Task { await connection.verify(code: remoteCode) } }
+                Button("请求配对") { Task { await connection.verify(code: connection.inviteInput) } }
                     .buttonStyle(.borderedProminent)
-                    .disabled(connection.controllerID.isEmpty || remoteCode.isEmpty || connection.isChecking)
+                    .disabled(connection.controllerID.isEmpty || connection.inviteInput.isEmpty || connection.isChecking)
                 if connection.isChecking {
                     Button("取消") { connection.cancelCheck() }
                 }
@@ -88,30 +94,81 @@ private struct ConnectionView: View {
 
     private var hostForm: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("1. 粘贴要授权的控制端 ID。")
-            TextField("粘贴控制端 ID", text: $allowedPeer)
-                .textFieldStyle(.roundedBorder)
-                .disabled(connection.isHosting)
-                .accessibilityIdentifier("allowed-peer")
-
-            Text("2. 启动监听，将连接码交给控制端。")
+            Text("启动监听后，把临时连接码或直连邀请交给控制端。")
             HStack {
-                TextField("局域网 IP:端口", text: $connection.listenAddress)
+                Text("监听端口")
+                TextField("4444", text: $connection.listenPort)
                     .textFieldStyle(.roundedBorder)
+                    .frame(width: 88)
                     .disabled(connection.isHosting)
-                    .accessibilityIdentifier("listen-address")
+                    .accessibilityIdentifier("listen-port")
+                Spacer()
                 if connection.isHosting {
                     Button("停止监听") { connection.stopHosting() }
                 } else {
                     Button("启动监听") {
-                        Task { await connection.startHosting(address: connection.listenAddress, allowing: allowedPeer) }
+                        Task { await connection.startHosting() }
                     }
                         .buttonStyle(.borderedProminent)
-                        .disabled(connection.hostID.isEmpty || allowedPeer.isEmpty || connection.listenAddress.isEmpty)
+                        .disabled(connection.hostID.isEmpty || connection.listenPort.isEmpty)
                 }
             }
             copyRow(connection.connectionCode, placeholder: "启动后生成连接码", button: "复制连接码")
+            if !connection.directInvite.isEmpty {
+                HStack {
+                    Text("组网内找不到设备时，可用直连邀请。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("复制直连邀请") { copy(connection.directInvite) }
+                }
+            }
+            if let request = connection.pendingPair {
+                HStack {
+                    Text("设备 \(request.fingerprint) 请求配对")
+                    Spacer()
+                    Button("拒绝") { connection.respondToPairing(request, allow: false) }
+                    Button("允许") { connection.respondToPairing(request, allow: true) }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
             notice(connection.hostNotice)
+            Divider()
+            screenPermissionView
+        }
+    }
+
+    private var screenPermissionView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("屏幕录制").font(.headline)
+                Spacer()
+                if connection.isCheckingScreenPermission {
+                    Text("正在检查…").foregroundStyle(.secondary)
+                } else {
+                    switch connection.screenPermission {
+                    case .unknown: Text("待检查").foregroundStyle(.secondary)
+                    case .required: Text("未授权").foregroundStyle(.secondary)
+                    case .granted: Text("已授权").foregroundStyle(.green)
+                    case .failed: Text("检查失败").foregroundStyle(.red)
+                    }
+                }
+            }
+            if connection.screenPermission != .granted {
+                Text("如未弹出授权提示，可在「隐私与安全性 → 录屏与系统录音」中允许 Koko。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("申请录屏权限") { Task { await connection.refreshScreenPermission(request: true) } }
+                    Button("打开系统设置") {
+                        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    Button("重新检查") { Task { await connection.refreshScreenPermission() } }
+                }
+                .disabled(connection.isCheckingScreenPermission)
+            }
         }
     }
 
@@ -125,11 +182,15 @@ private struct ConnectionView: View {
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button(button) {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(value, forType: .string)
+                copy(value)
             }
             .disabled(value.isEmpty)
         }
+    }
+
+    private func copy(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 
     @ViewBuilder

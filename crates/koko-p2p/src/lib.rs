@@ -1,5 +1,7 @@
 //! Peer-to-peer transport and connection management for Koko.
 
+pub mod pairing;
+
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
@@ -7,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
-use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY};
+use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY, PAIR_ALPN};
 use tempfile::NamedTempFile;
 
 pub fn load_identity(path: &Path) -> io::Result<SecretKey> {
@@ -42,7 +44,7 @@ pub async fn bind_host(key: SecretKey, address: SocketAddr) -> Result<Endpoint, 
         .secret_key(key)
         .clear_ip_transports()
         .bind_addr(address)?
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PAIR_ALPN.to_vec()])
         .bind()
         .await?;
     Ok(endpoint)

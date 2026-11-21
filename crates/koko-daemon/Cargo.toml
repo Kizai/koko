@@ -8,8 +8,10 @@ license.workspace = true
 iroh.workspace = true
 koko-p2p.workspace = true
 koko-proto.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+tokio = { workspace = true, features = ["signal", "sync", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+koko-capture.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["time"] }

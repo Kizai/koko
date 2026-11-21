@@ -1,3 +1,5 @@
+mod pairing;
+
 use std::error::Error;
 use std::path::Path;
 
@@ -11,12 +13,12 @@ use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY};
 
 #[derive(Debug)]
 struct Host {
-    allowed_peer: EndpointId,
+    allowed_peer: tokio::sync::watch::Receiver<Option<EndpointId>>,
 }
 
 impl ProtocolHandler for Host {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        if connection.remote_id() != self.allowed_peer {
+        if *self.allowed_peer.borrow() != Some(connection.remote_id()) {
             connection.close(1u32.into(), b"peer not authorized");
             return Ok(());
         }
@@ -44,6 +46,17 @@ impl ProtocolHandler for Host {
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
+        [option] if option == "--version" => println!("koko-daemon {}", env!("CARGO_PKG_VERSION")),
+        #[cfg(target_os = "macos")]
+        [command, action] if command == "screen-permission" => {
+            let request = match action.as_str() {
+                "check" => false,
+                "request" => true,
+                _ => return Err("usage: koko-daemon screen-permission <check|request>".into()),
+            };
+            let granted = koko_capture::check_screen_recording_permission(request);
+            println!("{}", if granted { "granted" } else { "required" });
+        }
         [command, file] if command == "identity" => {
             let identity = load_or_create_identity(Path::new(file))?;
             println!("{}", identity.public());
@@ -51,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         [command, file, bind, peer] if command == "serve" => {
             let identity = load_identity(Path::new(file))?;
             let host = Host {
-                allowed_peer: peer.parse()?,
+                allowed_peer: tokio::sync::watch::channel(Some(peer.parse()?)).1,
             };
             let endpoint = bind_host(identity, bind.parse()?).await?;
             let router = Router::builder(endpoint).accept(ALPN, host).spawn();
@@ -62,7 +75,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
-        _ => return Err("usage: koko-daemon identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id>".into()),
+        [command, file, bind] if command == "serve-pair" => {
+            let identity = load_or_create_identity(Path::new(file))?;
+            pairing::serve(identity, bind.parse()?).await?;
+        }
+        [command, file] if command == "serve-pair" => {
+            let identity = load_or_create_identity(Path::new(file))?;
+            pairing::serve(identity, ([0, 0, 0, 0], 4444).into()).await?;
+        }
+        _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port] | screen-permission <check|request>".into()),
     }
     Ok(())
 }
@@ -97,7 +118,7 @@ mod tests {
             .accept(
                 ALPN,
                 Host {
-                    allowed_peer: controller_id,
+                    allowed_peer: tokio::sync::watch::channel(Some(controller_id)).1,
                 },
             )
             .spawn();

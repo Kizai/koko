@@ -12,15 +12,17 @@
     <string>Koko</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Koko 使用局域网连接你已授权的设备。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_koko-pair._udp</string>
+    </array>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Koko 使用录屏权限，供你向已授权的设备共享主显示器画面。</string>
 </dict>
 </plist>

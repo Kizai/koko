@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blake3.workspace = true
+if-addrs.workspace = true
 iroh.workspace = true
 koko-proto.workspace = true
+mdns-sd.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }

@@ -1,5 +1,4 @@
 import Combine
-import Darwin
 import Foundation
 
 enum DeviceRole: String, CaseIterable, Identifiable {
@@ -16,6 +15,15 @@ struct ConnectionNotice {
     var isError = false
 }
 
+enum ScreenPermission {
+    case unknown, required, granted, failed
+}
+
+struct PendingPair {
+    let number: String
+    let fingerprint: String
+}
+
 private struct CommandError: LocalizedError {
     let errorDescription: String?
 }
@@ -24,10 +32,11 @@ private struct CommandError: LocalizedError {
 private struct LocalCommand {
     let process = Process()
     private let output = Pipe()
+    private let input: Pipe?
     private let chunks: AsyncStream<Data>
     private let completion: AsyncStream<Int32>
 
-    init(_ role: DeviceRole, arguments: [String]) throws {
+    init(_ role: DeviceRole, arguments: [String], interactive: Bool = false) throws {
         let (chunks, outputEvents) = AsyncStream<Data>.makeStream()
         let (completion, exitEvents) = AsyncStream<Int32>.makeStream()
         self.chunks = chunks
@@ -36,7 +45,12 @@ private struct LocalCommand {
         let tools = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers", isDirectory: true)
         process.executableURL = tools.appendingPathComponent(role.executable)
         process.arguments = arguments
-        process.standardInput = FileHandle.nullDevice
+        input = interactive ? Pipe() : nil
+        if let input {
+            process.standardInput = input
+        } else {
+            process.standardInput = FileHandle.nullDevice
+        }
         process.standardOutput = output
         process.standardError = output
         process.terminationHandler = { process in
@@ -53,6 +67,10 @@ private struct LocalCommand {
                 outputEvents.yield(data)
             }
         }
+    }
+
+    func send(_ line: String) throws {
+        try input?.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
     }
 
     func result(onLine: (String) -> Void = { _ in }) async throws -> String {
@@ -85,18 +103,23 @@ private struct LocalCommand {
 
 @MainActor
 final class LocalConnection: ObservableObject {
-    @Published var listenAddress = preferredLANAddress()
+    @Published var listenPort = "4444"
+    @Published var inviteInput = ""
     @Published private(set) var controllerID = ""
     @Published private(set) var hostID = ""
     @Published private(set) var isChecking = false
     @Published private(set) var isHosting = false
     @Published private(set) var connectionCode = ""
+    @Published private(set) var directInvite = ""
+    @Published private(set) var pendingPair: PendingPair?
     @Published private(set) var controllerNotice: ConnectionNotice?
     @Published private(set) var hostNotice: ConnectionNotice?
+    @Published private(set) var screenPermission = ScreenPermission.unknown
+    @Published private(set) var isCheckingScreenPermission = false
 
     private let identityDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".koko", isDirectory: true)
-    private var hostProcess: Process?
+    private var hostCommand: LocalCommand?
     private var checkProcess: Process?
     private var stopRequested = false
     private var cancelRequested = false
@@ -121,28 +144,43 @@ final class LocalConnection: ObservableObject {
         }
     }
 
-    func startHosting(address: String, allowing peer: String) async {
+    func refreshScreenPermission(request: Bool = false) async {
+        guard !isCheckingScreenPermission else { return }
+        isCheckingScreenPermission = true
+        defer { isCheckingScreenPermission = false }
+
+        do {
+            let command = try LocalCommand(.host, arguments: ["screen-permission", request ? "request" : "check"])
+            let result = try await command.result()
+            switch result.split(separator: "\n").last {
+            case "granted": screenPermission = .granted
+            case "required": screenPermission = .required
+            default: screenPermission = .failed
+            }
+        } catch {
+            screenPermission = .failed
+        }
+    }
+
+    func startHosting() async {
         isHosting = true
         stopRequested = false
         hostNotice = ConnectionNotice(message: "正在启动监听…")
         defer {
-            hostProcess = nil
+            hostCommand = nil
             isHosting = false
             connectionCode = ""
+            directInvite = ""
+            pendingPair = nil
         }
 
         do {
+            let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
             let command = try LocalCommand(.host, arguments: [
-                "serve", keyPath(for: .host), address, peer.trimmingCharacters(in: .whitespacesAndNewlines),
-            ])
-            hostProcess = command.process
-            let listeningPrefix = "Listening on "
-            _ = try await command.result { line in
-                guard line.hasPrefix(listeningPrefix), !stopRequested else { return }
-                let boundAddress = line.dropFirst(listeningPrefix.count)
-                connectionCode = "\(hostID)@\(boundAddress)"
-                hostNotice = ConnectionNotice(message: "正在监听 \(boundAddress)")
-            }
+                "serve-pair", keyPath(for: .host), address,
+            ], interactive: true)
+            hostCommand = command
+            _ = try await command.result(onLine: updatePairingStatus)
             hostNotice = ConnectionNotice(message: "监听已停止。")
         } catch {
             hostNotice = stopRequested
@@ -151,24 +189,59 @@ final class LocalConnection: ObservableObject {
         }
     }
 
+    private func updatePairingStatus(_ line: String) {
+        guard !stopRequested else { return }
+        switch line {
+        case "Pair approved":
+            connectionCode = ""
+            directInvite = ""
+            pendingPair = nil
+            hostNotice = ConnectionNotice(message: "已授权本次会话。停止监听即可断开。")
+        case "Pair declined", "Pair request ended":
+            pendingPair = nil
+            hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
+        case "Pair code expired":
+            connectionCode = ""
+            directInvite = ""
+            pendingPair = nil
+            hostNotice = ConnectionNotice(message: "连接码已过期，重新启动监听可生成新码。")
+        default:
+            if line.hasPrefix("Pair code: ") {
+                connectionCode = String(line.dropFirst("Pair code: ".count))
+                hostNotice = ConnectionNotice(message: "连接码 5 分钟内有效，授权一次后失效。")
+            } else if line.hasPrefix("Pair invite: ") {
+                directInvite = String(line.dropFirst("Pair invite: ".count))
+            } else if line.hasPrefix("Pair request: ") {
+                let fields = line.dropFirst("Pair request: ".count).split(separator: " ", maxSplits: 1)
+                if fields.count == 2 {
+                    pendingPair = PendingPair(number: String(fields[0]), fingerprint: String(fields[1]))
+                }
+            }
+        }
+    }
+
+    func respondToPairing(_ request: PendingPair, allow: Bool) {
+        do {
+            try hostCommand?.send("\(allow ? "approve" : "decline") \(request.number)")
+            pendingPair = nil
+        } catch {
+            hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
+        }
+    }
+
     func stopHosting() {
         stopRequested = true
         connectionCode = ""
+        directInvite = ""
+        pendingPair = nil
         hostNotice = ConnectionNotice(message: "正在停止监听…")
-        if let hostProcess, hostProcess.isRunning { hostProcess.interrupt() }
+        if let process = hostCommand?.process, process.isRunning { process.interrupt() }
     }
 
     func verify(code: String) async {
-        let parts = code.trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
-            controllerNotice = ConnectionNotice(message: "请粘贴被控端生成的完整连接码。", isError: true)
-            return
-        }
-
         isChecking = true
         cancelRequested = false
-        controllerNotice = ConnectionNotice(message: "正在验证连接…")
+        controllerNotice = ConnectionNotice(message: "正在查找被控端，请在对方设备上确认请求。")
         defer {
             checkProcess = nil
             isChecking = false
@@ -176,17 +249,23 @@ final class LocalConnection: ObservableObject {
 
         do {
             let command = try LocalCommand(.controller, arguments: [
-                "check", keyPath(for: .controller), String(parts[0]), String(parts[1]),
+                "pair", keyPath(for: .controller), code,
             ])
             checkProcess = command.process
             _ = try await command.result()
-            controllerNotice = ConnectionNotice(message: "连接通过，主机已授权此设备。")
+            controllerNotice = ConnectionNotice(message: "配对完成，被控端已授权本次会话。")
         } catch {
             let message = error.localizedDescription
             if cancelRequested {
-                controllerNotice = ConnectionNotice(message: "已取消连接验证。")
-            } else if message.contains("peer not authorized") {
-                controllerNotice = ConnectionNotice(message: "主机未授权此设备。请核对被控端填写的控制端 ID。", isError: true)
+                controllerNotice = ConnectionNotice(message: "已取消配对。")
+            } else if message.contains("Koko host not found") {
+                controllerNotice = ConnectionNotice(message: "找不到被控端。请核对连接码。通过组网连接时，可以改用被控端的直连邀请。", isError: true)
+            } else if message.contains("direct invite") {
+                controllerNotice = ConnectionNotice(message: "直连邀请格式无效，请在被控端重新复制。", isError: true)
+            } else if message.contains("pairing declined or expired") || message.contains("pairing unavailable") {
+                controllerNotice = ConnectionNotice(message: "请求被拒绝、已过期或被控端正在处理另一请求。", isError: true)
+            } else if message.contains("connection code") {
+                controllerNotice = ConnectionNotice(message: "请输入被控端显示的 10 位连接码。", isError: true)
             } else {
                 controllerNotice = ConnectionNotice(message: message, isError: true)
             }
@@ -199,36 +278,11 @@ final class LocalConnection: ObservableObject {
     }
 
     func stopForQuit() {
-        if let hostProcess, hostProcess.isRunning { hostProcess.terminate() }
+        if let process = hostCommand?.process, process.isRunning { process.terminate() }
         if let checkProcess, checkProcess.isRunning { checkProcess.terminate() }
     }
 
     private func keyPath(for role: DeviceRole) -> String {
         identityDirectory.appendingPathComponent(role.keyFilename).path
     }
-}
-
-func preferredLANAddress() -> String {
-    var interfaces: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&interfaces) == 0 else { return "" }
-    defer { freeifaddrs(interfaces) }
-
-    var addresses: [(name: String, ip: String)] = []
-    var current = interfaces
-    while let interface = current {
-        let info = interface.pointee
-        current = info.ifa_next
-        let name = String(cString: info.ifa_name)
-        guard name.hasPrefix("en"), (info.ifa_flags & UInt32(IFF_UP)) != 0,
-              let address = info.ifa_addr, Int32(address.pointee.sa_family) == AF_INET else {
-            continue
-        }
-
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        if getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
-            let ip = String(decoding: host.prefix(while: { $0 != 0 }).map(UInt8.init(bitPattern:)), as: UTF8.self)
-            if !ip.hasPrefix("169.254.") { addresses.append((name, ip)) }
-        }
-    }
-    return addresses.min(by: { $0.name < $1.name }).map { "\($0.ip):4444" } ?? ""
 }

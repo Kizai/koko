@@ -14,7 +14,7 @@
   </p>
 </div>
 
-> Phase 1 supports persistent device identities and authorized LAN connection checks. The remote desktop features and MCP interfaces below are planned.
+> Phase 1 supports short-code LAN pairing and a screen recording permission panel on macOS. The remote desktop features and MCP interfaces below are planned.
 
 ## What is Koko?
 

@@ -5,7 +5,9 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 export MACOSX_DEPLOYMENT_TARGET=13.0
+version="$(cargo metadata --locked --no-deps --format-version 1 | plutil -extract packages.0.version raw -)"
 build_dir="$repo_root/target/koko-macos"
+disk_image="$build_dir/Koko-$version.dmg"
 image_dir="$build_dir/image"
 app="$image_dir/Koko.app"
 launcher_sources=("$repo_root"/apps/koko-macos/*.swift)
@@ -37,11 +39,13 @@ for executable in koko-daemon koko-agent; do
 done
 
 ditto apps/koko-macos/Info.plist "$app/Contents/Info.plist"
+plutil -insert CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
+plutil -insert CFBundleVersion -string "$version" "$app/Contents/Info.plist"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict "$app"
 
 ln -sfn /Applications "$image_dir/Applications"
-hdiutil create -quiet -volname Koko -srcfolder "$image_dir" \
-    -format UDZO -ov "$build_dir/Koko.dmg"
-printf 'App: %s\nDMG: %s\n' "$app" "$build_dir/Koko.dmg"
+hdiutil create -quiet -volname "Koko $version" -srcfolder "$image_dir" \
+    -format UDZO -ov "$disk_image"
+printf 'App: %s\nDMG: %s\n' "$app" "$disk_image"
