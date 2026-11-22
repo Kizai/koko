@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use iroh::EndpointAddr;
-use koko_p2p::pairing::{discover_hosts, lan_request, request_pairing, resolve_invite};
+use koko_p2p::pairing::{
+    PairingOptions, discover_hosts, lan_request, request_pairing_with_options, resolve_invite,
+};
 use koko_p2p::remote::{RemoteClient, send_command};
 use koko_p2p::{check_host, load_identity, load_or_create_identity};
 use koko_proto::{MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH};
@@ -28,10 +30,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 std::env::var_os("HOME").ok_or("HOME is missing; pass a key file explicitly")?;
             let directory = PathBuf::from(home).join(".koko");
             std::fs::create_dir_all(&directory)?;
-            pair(&directory.join("controller.key"), code).await?;
+            pair(&directory.join("controller.key"), code, Default::default()).await?;
         }
-        [command, file, code] if command == "pair" => {
-            pair(Path::new(file), code).await?;
+        [command, file, code, flags @ ..] if command == "pair" => {
+            let mut options = PairingOptions::default();
+            for flag in flags {
+                match flag.as_str() {
+                    "--prefer-lan" => options.prefer_lan = true,
+                    "--enhanced" => options.enhanced = true,
+                    _ => return Err(format!("unknown pairing option: {flag}").into()),
+                }
+            }
+            pair(Path::new(file), code, options).await?;
         }
         [command] if command == "discover" => {
             let devices: Vec<_> = discover_hosts()
@@ -90,7 +100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair [key-file] <code-or-invite> | discover | remote <key-file> <host-id> <host-ip:port>"
+                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | remote <key-file> <host-id> <host-ip:port>"
                     .into(),
             );
         }
@@ -98,11 +108,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn pair(path: &Path, input: &str) -> Result<(), Box<dyn Error>> {
+async fn pair(path: &Path, input: &str, options: PairingOptions) -> Result<(), Box<dyn Error>> {
     let key = load_or_create_identity(path)?;
     let (code, target) = resolve_invite(input).await?;
     let host = target.id;
-    let address = request_pairing(key, target, code.as_ref()).await?;
+    let address = request_pairing_with_options(key, target, code.as_ref(), options).await?;
     println!(r#"{{"status":"paired","host_id":"{host}","address":"{address}"}}"#);
     Ok(())
 }

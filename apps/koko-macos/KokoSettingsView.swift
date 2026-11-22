@@ -5,15 +5,21 @@ let defaultDownloadDirectory = FileManager.default.homeDirectoryForCurrentUser.a
 
 struct KokoSettingsView: View {
     @ObservedObject var connection: LocalConnection
+    @ObservedObject var updates: ReleaseUpdates
     @AppStorage("defaultFrameRate") private var defaultFrameRate = 60
     @AppStorage("downloadDirectory") private var downloadDirectory = defaultDownloadDirectory
     @AppStorage("forwardPhysicalKeyboard") private var forwardPhysicalKeyboard = true
     @ViewState private var section = Section.general
     @ViewState private var listenPort = ""
     @ViewState private var showForget = false
+    @ViewState private var showPermissions = false
+    @AppStorage("enhancedConnections") private var enhancedConnections = true
+    @AppStorage("preferLAN") private var preferLAN = true
+    @AppStorage("adaptiveStreaming") private var adaptiveStreaming = true
+    @AppStorage("mapWindowsModifiers") private var mapWindowsModifiers = true
 
     private enum Section: String, CaseIterable, Identifiable {
-        case general = "常规", security = "安全", keyboard = "键盘", network = "网络"
+        case general = "常规", security = "安全", keyboard = "键盘", network = "网络", advanced = "高级"
         var id: Self { self }
         var icon: String {
             switch self {
@@ -21,6 +27,7 @@ struct KokoSettingsView: View {
             case .security: "lock"
             case .keyboard: "keyboard"
             case .network: "network"
+            case .advanced: "slider.horizontal.3"
             }
         }
     }
@@ -60,8 +67,32 @@ struct KokoSettingsView: View {
                                 .help(downloadDirectory)
                         }
                     }
-                    LabeledContent("版本", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—")
+                    LabeledContent("版本") {
+                        Text(updates.installedVersion ?? "—")
+                        Button("检查更新") { Task { await updates.check(manual: true) } }
+                            .disabled(updates.state == .checking)
+                    }
+                    switch updates.state {
+                    case .idle:
+                        EmptyView()
+                    case .checking:
+                        Text("正在检查 GitHub Releases…")
+                    case .upToDate:
+                        Text("当前已是最新可用版本。").foregroundStyle(.secondary)
+                    case .available(let release):
+                        LabeledContent("有可用更新 · \(release.version)") {
+                            Link("更新说明", destination: release.pageURL)
+                            Link("下载安装包", destination: release.downloadURL)
+                        }
+                    case .failed(let message):
+                        LabeledContent {
+                            Link("打开发布页", destination: URL(string: "https://github.com/Kizai/koko/releases")!)
+                        } label: {
+                            Text(message).font(.callout)
+                        }
+                    }
                 case .security:
+                    Button("权限设置…") { showPermissions = true }
                     LabeledContent("录屏", value: connection.screenPermission.title)
                     LabeledContent("辅助功能", value: connection.inputPermission.title)
                     LabeledContent("信任的控制端") {
@@ -98,11 +129,17 @@ struct KokoSettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                case .advanced:
+                    advancedToggle("增强连接", "连接未建立时重试握手。", $enhancedConnections)
+                    advancedToggle("流畅度增强", "网络延迟升高时降低自动画质和自适应分辨率。", $adaptiveStreaming)
+                    advancedToggle("局域网优先", "先尝试同一子网的地址，再尝试邀请中的其他地址。", $preferLAN)
+                    advancedToggle("跨系统键位映射", "Windows 控制此 Mac 时，Ctrl 对应 ⌘，Win 对应 Control，Alt 对应 Option。", $mapWindowsModifiers)
                 }
             }
             .formStyle(.grouped)
         }
         .frame(width: 550, height: 356)
+        .sheet(isPresented: $showPermissions, onDismiss: connection.permissionGuideDidDismiss) { PermissionGuide(connection: connection) }
         .onAppear { listenPort = connection.listenPort }
         .onChange(of: connection.listenPort) { listenPort = $0 }
         .confirmationDialog("清除已信任设备？", isPresented: $showForget) {
@@ -110,6 +147,16 @@ struct KokoSettingsView: View {
         } message: {
             Text("当前共享会话会结束，下次连接需要重新确认。")
         }
+    }
+
+    private func advancedToggle(_ title: String, _ hint: String, _ setting: Binding<Bool>) -> some View {
+        Toggle(isOn: setting) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                Text(hint).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
     }
 
     private var canSavePort: Bool {

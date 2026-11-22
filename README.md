@@ -29,14 +29,16 @@ KoKo 让你在另一台 Mac 上查看和操作已授权的桌面。被控端决�
 
 ### 1. 下载并安装
 
-在 [GitHub Releases](https://github.com/Kizai/koko/releases) 打开内测版，下载 `Koko-<版本>.dmg`。两台 Mac 安装同一版本，将 `Koko.app` 拖入「应用程序」后打开。安装预编译包只需要 macOS。
+在 [GitHub Releases](https://github.com/Kizai/koko/releases) 打开内测版，下载 `Koko-<版本>.dmg`。从 0.1.15 起，在两台 Mac 上分别打开同一版本的 DMG，双击其中的 安装图标，跟随 macOS 安装器完成安装。然后从「应用程序」打开 KoKo。以前的 DMG 可将 `Koko.app` 拖入「应用程序」。安装预编译包只需要 macOS。
 
-内测包采用临时签名。覆盖安装后，macOS 可能要求为当前版本重新授予屏幕录制和辅助功能权限。版本号可在右上角「设置 → 常规」查看。[权限与签名说明](./docs/macos-permissions.md)
+从 0.1.16 起，打开 KoKo 或回到主窗口时，应用每天最多自动检查一次 GitHub Releases。有新版 Mac 安装包时，主窗口会显示提醒，可查看更新说明或下载 DMG。也可随时点击右上角「设置 → 常规 → 检查更新」。0.x 内测版会检查预发布版本，只有源码的发布会被跳过。
+
+本地临时签名包覆盖安装后，macOS 可能要求为新包重新授予录屏和辅助功能。正式签名版本通过稳定的应用身份支持权限延续。升级后可先从「设置 → 安全」复查已有授权。[权限与签名说明](./docs/macos-permissions.md)
 
 ### 2. 被控端开启共享
 
-1. 打开 KoKo，在「本机与远程协助」检查权限。**屏幕录制**用于分享画面，**辅助功能**用于接收键鼠。
-2. 按 KoKo 的提示进入「系统设置 → 隐私与安全性」，为应用授权。若系统提示重新打开 KoKo，按提示退出后重开。可点击「测试本机画面」先确认录屏可用。
+1. 首次打开 KoKo，跟随权限引导逐项开启。之后可从「设置 → 安全 → 权限设置」再次打开。**屏幕录制**用于分享画面，**辅助功能**用于接收键鼠。
+2. 按 KoKo 的提示进入「系统设置 → 隐私与安全性」，为应用授权。权限页会自动复查。若系统要求重启，可点「重开 Koko 并复查」回到此页。可点击「测试本机画面」先确认录屏可用。
 3. 打开「本机共享」中的 **允许远程协助**。默认监听 `0.0.0.0:4444/UDP`。两台 Mac 若收到本地网络权限提示，请允许 KoKo 在局域网发现和连接设备。
 
 ### 3. 控制端选择连接方式
@@ -88,7 +90,7 @@ cd koko
 ./scripts/build-macos.sh --allow-ad-hoc
 ```
 
-本地临时包输出到 `target/koko-macos/local/`。有 Apple 签名身份时，设置 `KOKO_SIGN_IDENTITY` 后执行 `./scripts/build-macos.sh`。[构建与签名](./docs/macos.md#构建测试包)
+本地临时包输出到 `target/koko-macos/local/`。公开发布时，配置 Developer ID 签名和公证凭据，执行 `./scripts/build-macos.sh --release`，将生成的同版本 DMG 附到 GitHub Release，应用即可发现更新。[构建与签名](./docs/macos.md#公开分发与升级)
 
 ```bash
 cargo fmt --all -- --check

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -249,16 +249,90 @@ fn discovered_target(service: &ResolvedService) -> Option<EndpointAddr> {
     (!target.is_empty() && service.get_port() != 0).then_some(target)
 }
 
+#[derive(Default)]
+pub struct PairingOptions {
+    pub prefer_lan: bool,
+    pub enhanced: bool,
+}
+
+fn preferred_lan_target(
+    target: &EndpointAddr,
+    subnets: &[(Ipv4Addr, Ipv4Addr)],
+) -> Option<EndpointAddr> {
+    let local = target.ip_addrs().filter(|addr| {
+        let SocketAddr::V4(addr) = addr else {
+            return false;
+        };
+        subnets.iter().any(|(local, mask)| {
+            (addr.ip().to_bits() & mask.to_bits()) == (local.to_bits() & mask.to_bits())
+        })
+    });
+    let preferred = EndpointAddr::from_parts(target.id, local.copied().map(TransportAddr::Ip));
+    (!preferred.is_empty() && preferred != *target).then_some(preferred)
+}
+
+impl PairingOptions {
+    async fn connect(
+        &self,
+        endpoint: &Endpoint,
+        target: EndpointAddr,
+    ) -> Result<iroh::endpoint::Connection, Box<dyn Error>> {
+        if self.prefer_lan
+            && target.addrs.len() > 1
+            && let Ok(interfaces) = if_addrs::get_if_addrs()
+        {
+            let subnets: Vec<_> = interfaces
+                .into_iter()
+                .filter(|interface| {
+                    interface.is_oper_up() && !interface.is_p2p() && !interface.is_loopback()
+                })
+                .filter_map(|interface| match interface.addr {
+                    if_addrs::IfAddr::V4(addr) if !addr.netmask.is_unspecified() => {
+                        Some((addr.ip, addr.netmask))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(local) = preferred_lan_target(&target, &subnets)
+                && let Ok(Ok(connection)) =
+                    timeout(Duration::from_secs(2), endpoint.connect(local, PAIR_ALPN)).await
+            {
+                return Ok(connection);
+            }
+        }
+
+        if self.enhanced
+            && let Ok(Ok(connection)) = timeout(
+                Duration::from_secs(4),
+                endpoint.connect(target.clone(), PAIR_ALPN),
+            )
+            .await
+        {
+            return Ok(connection);
+        }
+        Ok(endpoint.connect(target, PAIR_ALPN).await?)
+    }
+}
+
 pub async fn request_pairing(
     key: SecretKey,
     target: EndpointAddr,
     code: Option<&InviteCode>,
 ) -> Result<SocketAddr, Box<dyn Error>> {
+    request_pairing_with_options(key, target, code, PairingOptions::default()).await
+}
+
+pub async fn request_pairing_with_options(
+    key: SecretKey,
+    target: EndpointAddr,
+    code: Option<&InviteCode>,
+    options: PairingOptions,
+) -> Result<SocketAddr, Box<dyn Error>> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .bind()
         .await?;
-    let connection = endpoint.connect(target, PAIR_ALPN).await?;
+    let connection = options.connect(&endpoint, target).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     send.write_all(code.map_or(CONTROL_REQUEST, |code| &code.0))
         .await?;
@@ -283,4 +357,65 @@ pub async fn request_pairing(
     connection.close(0u32.into(), b"pairing complete");
     endpoint.close().await;
     Ok(address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_preference_uses_the_interface_netmask() {
+        let host = SecretKey::generate().public();
+        let local: SocketAddr = "172.16.7.9:4444".parse().unwrap();
+        let other: SocketAddr = "172.16.8.9:4444".parse().unwrap();
+        let overlay: SocketAddr = "100.64.1.1:4444".parse().unwrap();
+        let target = EndpointAddr::new(host)
+            .with_ip_addr(local)
+            .with_ip_addr(other)
+            .with_ip_addr(overlay);
+        let subnet = [(
+            "172.16.4.100".parse().unwrap(),
+            "255.255.252.0".parse().unwrap(),
+        )];
+        assert_eq!(
+            preferred_lan_target(&target, &subnet),
+            Some(EndpointAddr::new(host).with_ip_addr(local))
+        );
+        assert!(preferred_lan_target(&target, &[]).is_none());
+        assert!(
+            preferred_lan_target(&EndpointAddr::new(host).with_ip_addr(local), &subnet).is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn enhanced_pairing_retries_handshake_but_honors_decline() -> Result<(), Box<dyn Error>> {
+        let host = crate::bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let target = EndpointAddr::new(host.id()).with_ip_addr(host.bound_sockets()[0]);
+        let client = request_pairing_with_options(
+            SecretKey::generate(),
+            target,
+            None,
+            PairingOptions {
+                enhanced: true,
+                ..Default::default()
+            },
+        );
+        let server = async {
+            host.accept().await.unwrap().refuse();
+            let connection = host.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = connection.accept_bi().await.unwrap();
+            assert_eq!(
+                recv.read_to_end(CODE_LENGTH).await.unwrap(),
+                CONTROL_REQUEST
+            );
+            connection.close(1u32.into(), b"pairing declined or expired");
+        };
+        let (result, ()) = timeout(Duration::from_secs(5), async {
+            tokio::join!(client, server)
+        })
+        .await?;
+        let error = format!("{:?}", result.unwrap_err());
+        assert!(error.contains("pairing declined or expired"), "{error}");
+        Ok(())
+    }
 }

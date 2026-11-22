@@ -130,10 +130,12 @@ struct RemoteAction: Codable {
     var quality: Int? = nil
     var fps: Int? = nil
     var events: [RemotePointerEvent]? = nil
+    var sourceOS: String? = nil
     var videoSocket: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events
+        case sourceOS = "source_os"
         case videoSocket = "video_socket"
     }
 }
@@ -357,7 +359,7 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var isCheckingScreenPermission = false
     @Published private(set) var inputPermission = ScreenPermission.unknown
     @Published private(set) var isCheckingInputPermission = false
-    @Published var showsHostPermissionGuide = false
+    private var detectedUpgradePermissionLoss = false
     @Published private(set) var isScanning = false
     @Published private var discoveredHosts: [NearbyHost] = []
     @Published private(set) var deviceNames = UserDefaults.standard.dictionary(forKey: "deviceNames") as? [String: String] ?? [:] {
@@ -409,6 +411,7 @@ final class LocalConnection: ObservableObject {
     private let hostPointer = DesktopInput()
     private var frameChannel: RemoteChannel?
     let videoSurface = VideoSurface()
+    private var videoLatency = StreamLatency()
     private var videoSettings: VideoSettings?
     private var videoReceiver: VideoReceiver?
     private var videoTask: Task<Void, Never>?
@@ -452,19 +455,41 @@ final class LocalConnection: ObservableObject {
         }
     }
 
-    func refreshScreenPermission(request: Bool = false) async {
+    func refreshDesktopPermissions() {
+        let screen = hasScreenCapturePermission(request: false)
+        let input = hasInputPermission(request: false)
+        let screenState: ScreenPermission = screen ? .granted : .required
+        let inputState: ScreenPermission = input ? .granted : .required
+        guard screenPermission != screenState || inputPermission != inputState else { return }
+        if screenPermission != screenState { screenPermission = screenState }
+        if inputPermission != inputState { inputPermission = inputState }
+        if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           DesktopPermissionHistory.record(version: version, screen: screen, input: input, in: .standard) {
+            detectedUpgradePermissionLoss = true
+        }
+    }
+
+    func checkForUpgradePermissionLoss() -> Bool {
+        // The app can become active and run its first preflight before the connection window appears.
+        refreshDesktopPermissions()
+        defer { detectedUpgradePermissionLoss = false }
+        return detectedUpgradePermissionLoss
+    }
+
+    func requestScreenPermission() async {
         guard !isCheckingScreenPermission else { return }
         isCheckingScreenPermission = true
         defer { isCheckingScreenPermission = false }
-
-        screenPermission = hasScreenCapturePermission(request: request) ? .granted : .required
+        _ = await Task.detached { hasScreenCapturePermission(request: true) }.value
+        refreshDesktopPermissions()
     }
 
-    func refreshInputPermission(request: Bool = false) async {
+    func requestInputPermission() async {
         guard !isCheckingInputPermission else { return }
         isCheckingInputPermission = true
         defer { isCheckingInputPermission = false }
-        inputPermission = hasInputPermission(request: request) ? .granted : .required
+        _ = await Task.detached { hasInputPermission(request: true) }.value
+        refreshDesktopPermissions()
     }
 
     func startHosting() async {
@@ -602,7 +627,8 @@ final class LocalConnection: ObservableObject {
                     : RemoteReply(status: "image", image: image)
             case "pointer":
                 guard let display = action.display, let events = action.events else { throw DesktopError.invalidCommand }
-                try hostPointer.apply(events, display: display)
+                let mapKeys = action.sourceOS == "windows" && (UserDefaults.standard.object(forKey: "mapWindowsModifiers") as? Bool ?? true)
+                try hostPointer.apply(events, display: display, mapWindowsModifiers: mapKeys)
             case "click", "key", "text":
                 guard hasInputPermission(request: false) else { throw DesktopError.inputPermissionRequired }
                 switch action.action {
@@ -725,9 +751,11 @@ final class LocalConnection: ObservableObject {
         }
 
         do {
-            let command = try LocalCommand(.controller, arguments: [
-                "pair", keyPath(for: .controller), code,
-            ])
+            let defaults = UserDefaults.standard
+            var arguments = ["pair", keyPath(for: .controller), code]
+            if defaults.object(forKey: "preferLAN") as? Bool ?? true { arguments.append("--prefer-lan") }
+            if defaults.object(forKey: "enhancedConnections") as? Bool ?? true { arguments.append("--enhanced") }
+            let command = try LocalCommand(.controller, arguments: arguments)
             checkProcess = command.process
             let reply = try await command.result()
             let host = try JSONDecoder().decode(PairedHost.self, from: Data(reply.utf8))
@@ -812,9 +840,11 @@ final class LocalConnection: ObservableObject {
                 displayRefresh = .now
             }
             guard let selectedDisplay else { return false }
+            let adaptive = UserDefaults.standard.object(forKey: "adaptiveStreaming") as? Bool ?? true
             if supportsVideo {
-                let edge = frameResolution == .automatic ? max(480, min(4096, (viewportEdge / 128) * 128)) : frameResolution.rawValue
-                let quality = frameQuality == .automatic ? 70 : frameQuality.rawValue
+                let constrained = adaptive && videoLatency.constrained
+                let edge = frameResolution == .automatic ? max(480, min(constrained ? 1280 : 4096, (viewportEdge / 128) * 128)) : frameResolution.rawValue
+                let quality = frameQuality == .automatic ? (constrained ? 45 : 70) : frameQuality.rawValue
                 let settings = VideoSettings(display: selectedDisplay.id, edge: edge, quality: quality, fps: targetFPS)
                 if videoSettings != settings || (videoTask == nil && ContinuousClock.now >= videoRetryAfter) {
                     startVideo(session, settings: settings)
@@ -826,11 +856,12 @@ final class LocalConnection: ObservableObject {
                 }
                 return true
             }
+            let responseTime = adaptive ? captureTime : 0
             let edge = frameResolution == .automatic
-                ? max(480, min(4096, Int(Double(viewportEdge) * (captureTime > 0.35 ? 0.60 : captureTime > 0.20 ? 0.85 : 1))))
+                ? max(480, min(4096, Int(Double(viewportEdge) * (responseTime > 0.35 ? 0.60 : responseTime > 0.20 ? 0.85 : 1))))
                 : frameResolution.rawValue
             let quality = frameQuality == .automatic
-                ? (captureTime > 0.35 ? 45 : captureTime > 0.20 ? 65 : 82)
+                ? (responseTime > 0.35 ? 45 : responseTime > 0.20 ? 65 : 82)
                 : frameQuality.rawValue
             let start = ContinuousClock.now
             let reply = try await channel.send(.init(action: "capture", display: selectedDisplay.id, edge: edge, quality: quality))
@@ -909,6 +940,7 @@ final class LocalConnection: ObservableObject {
                 case .path:
                     if bytes.count == 9 {
                         rtt = bytes.prefix(8).reduce(0) { ($0 << 8) | Int($1) }
+                        if let rtt { videoLatency.observe(rtt) }
                         direct = bytes.last == 1
                     }
                 case .error:
@@ -1027,7 +1059,7 @@ final class LocalConnection: ObservableObject {
                 let batch = pointerQueue.prefix(32).prefix { $0.display == next.display }
                 let events = batch.map(\.event)
                 pointerQueue.removeFirst(events.count)
-                let reply = try await channel.send(.init(action: "pointer", display: next.display, events: events))
+                let reply = try await channel.send(.init(action: "pointer", display: next.display, events: events, sourceOS: "macos"))
                 guard pointerChannel === channel else { return }
                 if reply.status != "ok" {
                     inputNotice = remoteError(reply.code)
@@ -1309,6 +1341,7 @@ final class LocalConnection: ObservableObject {
         videoSurface.clear()
         stopVideo()
         videoSettings = nil
+        videoLatency = StreamLatency()
         supportsClipboard = false
         clipboardTransferID = nil
         clipboardNotice = nil
@@ -1346,6 +1379,30 @@ final class LocalConnection: ObservableObject {
     func cancelCheck() {
         cancelRequested = true
         if let checkProcess, checkProcess.isRunning { checkProcess.terminate() }
+    }
+
+    var permissionRestartRequested = false
+
+    func permissionGuideDidDismiss() {
+        guard permissionRestartRequested else { return }
+        permissionRestartRequested = false
+        // AppKit vetoes termination while the SwiftUI permission sheet is attached.
+        DispatchQueue.main.async {
+            let message: String
+            do {
+                let waiter = try PermissionRelaunch.schedule()
+                NSApp.terminate(nil)
+                // A cancelled quit must not start another copy when the user eventually exits.
+                if waiter.isRunning { waiter.terminate() }
+                message = "退出被取消。请先关闭其他 Koko 弹窗，再重开并复查。"
+            } catch {
+                message = error.localizedDescription
+            }
+            let alert = NSAlert()
+            alert.messageText = "未能重开 Koko"
+            alert.informativeText = message
+            alert.runModal()
+        }
     }
 
     func stopForQuit() {

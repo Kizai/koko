@@ -114,13 +114,30 @@ struct RemotePointerEvent: Codable {
     var `repeat`: Bool? = nil
 }
 
+// The wire format uses Mac virtual key positions. A Windows sender encodes Win as Command and Alt as Option.
+func windowsShortcut(code: CGKeyCode, flags: UInt8) -> (CGKeyCode, UInt8) {
+    let key: Int = switch Int(code) {
+    case kVK_Control: kVK_Command
+    case kVK_RightControl: kVK_RightCommand
+    case kVK_Command: kVK_Control
+    case kVK_RightCommand: kVK_RightControl
+    default: Int(code)
+    }
+    let control = UInt8(CGEventFlags.maskControl.rawValue >> 16)
+    let command = UInt8(CGEventFlags.maskCommand.rawValue >> 16)
+    var mapped = flags & ~(control | command)
+    if flags & control != 0 { mapped |= command }
+    if flags & command != 0 { mapped |= control }
+    return (CGKeyCode(key), mapped)
+}
+
 @MainActor
 final class DesktopInput {
     private var held: [RemoteMouseButton: Int] = [:]
-    private var heldKeys = Set<CGKeyCode>()
+    private var heldKeys: [CGKeyCode: CGKeyCode] = [:]
     private var position: CGPoint?
 
-    func apply(_ events: [RemotePointerEvent], display: CGDirectDisplayID) throws {
+    func apply(_ events: [RemotePointerEvent], display: CGDirectDisplayID, mapWindowsModifiers: Bool = false) throws {
         guard hasInputPermission(request: false) else { throw DesktopError.inputPermissionRequired }
         guard CGDisplayIsActive(display) != 0 else { throw ScreenCaptureError.displayUnavailable }
         let bounds = CGDisplayBounds(display)
@@ -132,9 +149,12 @@ final class DesktopInput {
             if event.kind == .keyDown || event.kind == .keyUp {
                 guard let code = event.code, let flags = event.flags else { throw DesktopError.invalidCommand }
                 let down = event.kind == .keyDown
-                if !down && heldKeys.remove(code) == nil { continue }
-                try postKeyboardEvent(code, down: down, flags: flags, repeating: event.repeat == true)
-                if down { heldKeys.insert(code) }
+                let mapped = mapWindowsModifiers ? windowsShortcut(code: code, flags: flags) : (code, flags)
+                // Release the key actually posted even if the host changed its settings while it was held.
+                let postedCode = heldKeys[code] ?? mapped.0
+                if !down && heldKeys[code] == nil { continue }
+                try postKeyboardEvent(postedCode, down: down, flags: mapped.1, repeating: event.repeat == true)
+                heldKeys[code] = down ? postedCode : nil
                 continue
             }
             guard let x = event.x, let y = event.y else { throw DesktopError.invalidCommand }
@@ -183,7 +203,7 @@ final class DesktopInput {
             }
         }
         held.removeAll()
-        for code in heldKeys {
+        for code in heldKeys.values {
             try? postKeyboardEvent(code, down: false, flags: 0, repeating: false)
         }
         heldKeys.removeAll()

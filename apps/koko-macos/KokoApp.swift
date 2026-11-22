@@ -7,7 +7,7 @@ struct KokoApp: App {
 
     var body: some Scene {
         Window("远程协助", id: "connection") {
-            ConnectionView(connection: delegate.connection)
+            ConnectionView(connection: delegate.connection, updates: delegate.updates)
         }
         .defaultSize(width: 870, height: 640)
         .windowResizability(.contentMinSize)
@@ -21,7 +21,7 @@ struct KokoApp: App {
         .windowStyle(.hiddenTitleBar)
 
         Window("设置", id: "settings") {
-            KokoSettingsView(connection: delegate.connection)
+            KokoSettingsView(connection: delegate.connection, updates: delegate.updates)
         }
         .defaultSize(width: 550, height: 430)
         .windowResizability(.contentSize)
@@ -31,6 +31,7 @@ struct KokoApp: App {
 @MainActor
 private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
     let connection = LocalConnection()
+    let updates = ReleaseUpdates()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
@@ -38,6 +39,11 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
            let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon
         }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        connection.refreshDesktopPermissions()
+        Task { await updates.check(manual: false) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -49,6 +55,7 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
 
 private struct ConnectionView: View {
     @ObservedObject var connection: LocalConnection
+    @ObservedObject var updates: ReleaseUpdates
     @Environment(\.openWindow) private var openWindow
     @StateObject private var screenTest = ScreenTest()
     @StateObject private var inputTest = InputTest()
@@ -57,11 +64,27 @@ private struct ConnectionView: View {
     @ViewState private var renaming: NearbyHost?
     @ViewState private var newDeviceName = ""
     @ViewState private var showRename = false
+    @AppStorage("permissionGuideProgress") private var permissionProgress = PermissionGuide.Progress.introduction
+    @ViewState private var reviewAfterRestart = CommandLine.arguments.contains(PermissionRelaunch.argument)
+    @ViewState private var permissionGuide: PermissionGuide.Context?
 
     var body: some View {
         VStack(spacing: 0) {
             windowHeader
             Divider()
+            if let release = updates.automaticNotice {
+                HStack(spacing: 12) {
+                    Label("KoKo \(release.version) 可更新", systemImage: "arrow.down.circle")
+                    Spacer()
+                    Link("更新说明", destination: release.pageURL)
+                    Link("下载安装包", destination: release.downloadURL)
+                    Button("跳过此版本", action: updates.dismissAutomaticNotice)
+                        .buttonStyle(.borderless)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .background(Color.accentColor.opacity(0.08))
+            }
             HStack(spacing: 0) {
                 sidebar
                 Divider()
@@ -96,23 +119,25 @@ private struct ConnectionView: View {
         }
         .frame(minWidth: 740, minHeight: 560)
         .ignoresSafeArea(.container, edges: .top)
+        .onAppear {
+            let lostPermissions = connection.checkForUpgradePermissionLoss()
+            switch permissionProgress {
+            case .introduction, .configuring: permissionGuide = .firstLaunch
+            case .finished, .skipped:
+                if reviewAfterRestart { permissionGuide = .settings }
+                else if permissionProgress == .finished && lostPermissions { permissionGuide = .upgrade }
+            }
+            reviewAfterRestart = false
+        }
         .task {
             await connection.prepareIdentity(for: .host)
             await connection.prepareIdentity(for: .controller)
-            await connection.refreshScreenPermission()
-            await connection.refreshInputPermission()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task {
-                await connection.refreshScreenPermission()
-                await connection.refreshInputPermission()
-            }
         }
         .onChange(of: connection.session) { session in
             if session != nil { openWindow(id: "remote") }
         }
-        .sheet(isPresented: $connection.showsHostPermissionGuide) {
-            hostPermissionGuide
+        .sheet(item: $permissionGuide, onDismiss: connection.permissionGuideDidDismiss) { context in
+            PermissionGuide(connection: connection, context: context)
         }
         .sheet(item: $tool) { request in
             DeviceToolSheet(request: request)
@@ -352,12 +377,12 @@ private struct ConnectionView: View {
                     set: { sharing in
                         if sharing {
                             Task {
-                                await connection.refreshScreenPermission()
-                                await connection.refreshInputPermission()
+                                if permissionProgress == .skipped { permissionProgress = .finished }
+                                connection.refreshDesktopPermissions()
                                 if connection.screenPermission == .granted && connection.inputPermission == .granted {
                                     await connection.startHosting()
                                 } else {
-                                    connection.showsHostPermissionGuide = true
+                                    permissionGuide = .sharing
                                 }
                             }
                         } else {
@@ -442,7 +467,17 @@ private struct ConnectionView: View {
 
     private var permissionsCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            permissionRows
+            HStack {
+                Label("本机权限", systemImage: "lock.shield").font(.headline)
+                Spacer()
+                Button("管理权限…") { permissionGuide = .settings }
+            }
+            HStack(spacing: 18) {
+                Text("屏幕录制 · \(connection.screenPermission.title)")
+                Text("辅助功能 · \(connection.inputPermission.title)")
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
             HStack {
                 Button("测试本机画面") { screenTest.isPresented = true }
                     .popover(isPresented: $screenTest.isPresented) {
@@ -453,8 +488,6 @@ private struct ConnectionView: View {
                         LocalInputTest(test: inputTest)
                     }
             }
-            Button("文件与文件夹设置") { openPrivacySettings("Privacy_FilesAndFolders") }
-                .help("首次收发受保护目录中的文件时，macOS 会询问是否允许 KoKo 访问该目录。")
             if connection.screenPermission == .required || connection.inputPermission == .required {
                 if Bundle.main.object(forInfoDictionaryKey: "KokoAdHocSigned") as? Bool == true {
                     Text("此测试包使用临时签名。升级后 macOS 可能仍显示旧授权，需要为当前安装版本重新授权。")
@@ -470,102 +503,6 @@ private struct ConnectionView: View {
         }
         .padding(17)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
-    }
-
-    private var hostPermissionGuide: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("准备共享此 Mac").font(.title2.bold())
-            Text("开启录屏后，对方可以看到画面。开启键鼠控制后，对方可以操作此 Mac。")
-                .foregroundStyle(.secondary)
-            permissionRows
-            HStack {
-                Spacer()
-                Button("取消") { connection.showsHostPermissionGuide = false }
-                    .keyboardShortcut(.cancelAction)
-                Button(connection.screenPermission == .granted && connection.inputPermission == .granted
-                       ? "开启共享" : "暂按现有权限共享") {
-                    connection.showsHostPermissionGuide = false
-                    Task { await connection.startHosting() }
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        }
-        .padding(22)
-        .frame(width: 510)
-    }
-
-    @ViewBuilder
-    private var permissionRows: some View {
-        permissionView(
-            "屏幕录制",
-            state: connection.screenPermission,
-            checking: connection.isCheckingScreenPermission,
-            hint: "在「录屏与系统录音」中允许 Koko，并按 macOS 提示退出重开。",
-            requestTitle: "申请录屏权限",
-            settingsPane: "Privacy_ScreenCapture"
-        ) { request in
-            await connection.refreshScreenPermission(request: request)
-            return connection.screenPermission == .granted
-        }
-        Divider()
-        permissionView(
-            "辅助功能 · 键鼠控制",
-            state: connection.inputPermission,
-            checking: connection.isCheckingInputPermission,
-            hint: "先申请，再在系统的「辅助功能」或「设备控制和数据访问」中启用 Koko。列表没有 Koko 时，用「＋」选择「应用程序」里的 Koko。启用后若仍显示未授权，回到这里再申请一次。",
-            requestTitle: "申请键鼠权限",
-            settingsPane: "Privacy_Accessibility"
-        ) { request in
-            await connection.refreshInputPermission(request: request)
-            return connection.inputPermission == .granted
-        }
-    }
-
-    private func permissionView(
-        _ title: String,
-        state: ScreenPermission,
-        checking: Bool,
-        hint: String,
-        requestTitle: String,
-        settingsPane: String,
-        request: @escaping (Bool) async -> Bool
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(title).font(.headline)
-                Spacer()
-                if checking {
-                    Text("正在检查…").foregroundStyle(.secondary)
-                } else {
-                    Text(state.title)
-                        .foregroundStyle(state == .granted ? Color.green : state == .failed ? Color.red : Color.secondary)
-                }
-            }
-            if state != .granted {
-                Text(hint)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                HStack {
-                    Button(requestTitle) {
-                        Task {
-                            if !(await request(true)) { openPrivacySettings(settingsPane) }
-                        }
-                    }
-                    Button("打开系统设置") { openPrivacySettings(settingsPane) }
-                    Button("重新检查") { Task { _ = await request(false) } }
-                }
-                .disabled(checking)
-            }
-        }
-    }
-
-    private func openPrivacySettings(_ pane: String) {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)"),
-           NSWorkspace.shared.open(url) { return }
-        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     private func copyRow(_ value: String, placeholder: String, button: String) -> some View {

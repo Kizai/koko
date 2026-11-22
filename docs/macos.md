@@ -6,7 +6,7 @@
 
 ## 安装与配对
 
-1. 两台 Mac 各自打开同一个版本的 DMG，将 `Koko.app` 拖入「应用程序」。
+1. 退出正在运行的旧版。两台 Mac 各自打开 0.1.15 或更新版本的 DMG，双击安装图标并完成安装，然后从「应用程序」打开 KoKo。首次打开会显示权限引导。
 2. 在要分享的 Mac 上查看录屏和辅助功能权限，再打开「本机共享」里的「允许远程协助」。应用默认绑定 `0.0.0.0:4444/UDP`，可以调整端口。
 3. **授权码连接**。另一台 Mac 在「连接伙伴」输入短码或粘贴组网直连邀请。点击「连接」后打开远控窗口。
 4. **局域网搜索连接**。用侧栏刷新并选中设备，在详情页点「进入桌面」。首次连接由被控端确认。选择「信任并连接」后，同一设备可在本机共享开启时直接连接。选择「仅允许这次」则逐次确认。
@@ -31,6 +31,19 @@ KoKo 的键鼠转发面向已解锁的 macOS 桌面。被控端已开启系统�
 - **端口转发**：将控制端的 `127.0.0.1:本机端口` 转发到被控端的 `127.0.0.1:远端端口`。关闭转发窗口即结束。
 - **设备菜单**：刷新发现、设置本机别名或隐藏设备。可在「设置 → 安全」恢复已隐藏的设备。
 - **设置**：右上角齿轮打开设置。可调整新会话的默认帧率、文件接收位置、实体键盘转发及共享监听端口。
+
+### 高级设置
+
+在「设置 → 高级」可以分别调整以下选项。四项默认开启。
+
+| 选项 | 生效时机与效果 |
+| --- | --- |
+| 增强连接 | 控制端配对建立连接时，可重试失败或过慢的握手。 |
+| 局域网优先 | 同一邀请包含多个候选地址时，优先尝试与本机局域网同子网的地址，失败后可尝试其他地址。 |
+| 流畅度增强 | 控制端根据持续的 QUIC 延迟调整自动画质与自适应分辨率，网络恢复后还原。手动选择的画质和分辨率各自优先。 |
+| 跨系统键位映射 | 被控 Mac 收到标记为 Windows 来源的实体按键时，把 Ctrl 映射到 Command、Win 映射到 Control，Alt 对应 Option。Mac 和未标记来源的控制端沿用原键位。 |
+
+接入 Windows 控制端时，在 `pointer` 请求中设置 `source_os` 为 `windows`。实体按键的 `code` 使用现有协议的 Mac 虚拟键位，`flags` 对应 Core Graphics 修饰位向右移动 16 位；发送端以 Control 表示 Ctrl，以 Command 表示 Win，以 Option 表示 Alt。映射只由被控端执行一次。
 
 ## 权限
 
@@ -82,17 +95,20 @@ Agent 可以直接调用应用内的 CLI。同一局域网使用短码，通过�
 
 ## 构建测试包
 
-在装有 Rust 和 Xcode 命令行工具的 Mac 上，将 Apple 签名证书及配套私钥导入钥匙串。用 `security find-identity -v -p codesigning` 查看可用签名身份，再从仓库根目录运行：
+在装有 Rust 和 Xcode 命令行工具的 Mac 上，用 `security find-identity -v -p codesigning` 查看钥匙串中已有证书及私钥的签名身份。私下开发测试时，各版本沿用同一个 Apple Development 身份。从仓库根目录运行：
 
 ```bash
-KOKO_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" ./scripts/build-macos.sh
+KOKO_SIGN_IDENTITY="Apple Development: YOUR NAME (CERTIFICATE ID)" \
+./scripts/build-macos.sh
 ```
 
 输出为 `target/koko-macos/Koko-<version>.dmg`，包含面向 macOS 13 及以上的 Apple Silicon 和 Intel 二进制。Rust 只用于构建，测试机器打开安装好的应用即可。
 
+若钥匙串里还没有开发身份，可在 Xcode「Settings → Accounts」登录 Apple 账户，选择团队，在「Manage Certificates → ＋」创建 Apple Development 身份。用上面的命令核对身份，再用它构建后续本机测试版本。[Apple 的证书管理说明](https://developer.apple.com/documentation/Xcode/sharing-your-teams-signing-certificates)
+
 内测使用 `0.1.x`。每次发一个新的迭代包时，递增根目录 `Cargo.toml` 的 `workspace.package.version` 最后一位，使用 Cargo 更新锁文件后再打包。应用内版本、CLI 的 `--version` 和 DMG 文件名都来自同一个版本。同一版本重打包使用同一个文件名。脚本校验新 DMG 后清理输出目录里的旧版 Koko DMG。
 
-脚本默认要求 Apple 证书签名，并在生成 DMG 前核验签名。可在 `KOKO_SIGN_IDENTITY` 中传入身份全名或 SHA-1。后续测试包沿用同一个签名团队、签名类型和应用标识，以便 macOS 识别为同一个应用。首次从临时签名切换到证书签名后，为新签名授权一次。
+脚本默认要求 Apple 证书签名，并在生成 DMG 前核验签名。测试构建的 `KOKO_SIGN_IDENTITY` 接受身份全名或 SHA-1。已有 Developer ID Installer 身份时，可通过 `KOKO_INSTALLER_SIGN_IDENTITY` 同时签署安装包。首次从临时签名切换到证书签名后，为新签名授权一次。
 
 构建机暂时没有证书时，可显式生成本地临时测试包：
 
@@ -102,7 +118,20 @@ KOKO_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" ./scripts/buil
 
 在未指定签名身份时，该命令输出至 `target/koko-macos/local/Koko-<version>.dmg`。重建后的临时签名可能触发重新授权。
 
-若 macOS 拦截首次打开，请确认文件来自自己的构建，再按 Apple 的说明处理。面向公开发布时，使用 Developer ID 签名并公证。[Apple 应用打开说明](https://support.apple.com/zh-cn/guide/mac-help/mh40616/mac) · [Apple 分发说明](https://developer.apple.com/macos/distribution/)
+### 公开分发与升级
+
+公开分发使用同一团队的 Developer ID Application 和 Developer ID Installer 证书。构建机需要能运行 `xcrun notarytool`、`xcrun stapler`，并能使用预先存入钥匙串的公证凭据配置。在下面的命令中填入证书全名和已有的配置名称：
+
+```bash
+KOKO_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" \
+KOKO_INSTALLER_SIGN_IDENTITY="Developer ID Installer: YOUR NAME (TEAMID)" \
+KOKO_NOTARY_PROFILE="koko-notary" \
+./scripts/build-macos.sh --release
+```
+
+脚本用加固运行时和安全时间戳签署应用与辅助程序，用 Installer 身份签署 PKG，再用 Application 身份签署 DMG。它把最终的 DMG 提交给 Apple 公证，等待接受后装订并验证票据，通过 Gatekeeper 校验后输出 `target/koko-macos/release/Koko-<version>.dmg`。[Apple 公证流程](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+
+构建升级包时，可额外设置 `KOKO_PREVIOUS_APP=/Applications/Koko.app`，指向用户实际安装的上一版或其独立副本。脚本在打包前检查两版应用是否相互满足对方的指定要求（designated requirement）。首次发包可省略此项。由开发签名切换到 Developer ID 时，即使属于同一团队，默认指定要求也可能互不兼容，需要重新授权。升级后按权限文档复测录屏和键鼠。[权限验收](./macos-permissions.md#双机验收) · [Apple 签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 
 ## 复测
 

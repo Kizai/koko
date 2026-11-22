@@ -11,6 +11,21 @@ struct VideoSettings: Equatable {
     let fps: Int
 }
 
+// Separate entry and recovery thresholds keep a borderline link from restarting the encoder every second.
+struct StreamLatency {
+    private(set) var constrained = false
+    private var consecutive = 0
+
+    mutating func observe(_ milliseconds: Int) {
+        let shouldChange = constrained ? milliseconds < 85 : milliseconds >= 150
+        consecutive = shouldChange ? consecutive + 1 : 0
+        if consecutive >= (constrained ? 5 : 3) {
+            constrained.toggle()
+            consecutive = 0
+        }
+    }
+}
+
 // Each record is a big-endian length followed by a kind byte and its payload.
 enum VideoRecord: UInt8 {
     case format = 1, frame, error, path

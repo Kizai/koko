@@ -5,15 +5,65 @@ import SwiftUI
 struct DesktopRegression {
     @MainActor static func main() async throws {
         _ = NSApplication.shared
+        try checkPermissionUpgrade()
+        try checkPermissionRefresh()
+        try checkAdvancedSettings()
+        try await checkReleaseUpdates()
+        if let version = ProcessInfo.processInfo.environment["KOKO_TEST_LIVE_UPDATES"] {
+            try await checkLiveReleaseUpdates(installedVersion: version)
+        }
         try checkRemoteTitleBar()
         try await checkHelperPipes()
         try await checkDeniedClipboardFile()
-        print("通过顶栏拖动、双击最大化与还原、管道背压、辅助进程退出和文件访问被拒绝测试")
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出和文件访问被拒绝测试")
     }
 
     struct Failure: LocalizedError {
         let errorDescription: String?
         init(_ message: String) { errorDescription = message }
+    }
+
+    private static func checkPermissionUpgrade() throws {
+        let name = "koko.tests.permissions." + UUID().uuidString
+        guard let defaults = UserDefaults(suiteName: name) else { throw Failure("无法隔离测试偏好") }
+        defer { defaults.removePersistentDomain(forName: name) }
+        func lost(_ version: String, screen: Bool = true, input: Bool = true) -> Bool {
+            DesktopPermissionHistory.record(version: version, screen: screen, input: input, in: defaults)
+        }
+        guard !lost("0.1.15"), !lost("0.1.16"),
+              lost("0.1.17", screen: false), !lost("0.1.17", screen: false),
+              lost("0.1.18", screen: false, input: false),
+              !lost("0.1.19", screen: false, input: false)
+        else { throw Failure("仅在升级后丢失已授权能力时应提醒一次") }
+    }
+
+    @MainActor private static func checkPermissionRefresh() throws {
+        let connection = LocalConnection()
+        connection.refreshDesktopPermissions()
+        var changes = 0
+        let observer = connection.objectWillChange.sink { changes += 1 }
+        defer { observer.cancel() }
+        connection.refreshDesktopPermissions()
+        guard changes == 0 else { throw Failure("权限未变化时，复查不应触发界面刷新") }
+    }
+
+    private static func checkAdvancedSettings() throws {
+        var latency = StreamLatency()
+        for sample in [180, 30, 185, 190] { latency.observe(sample) }
+        guard !latency.constrained else { throw Failure("单次延迟波动不应切换画质") }
+        latency.observe(151)
+        guard latency.constrained else { throw Failure("持续高延迟时应降低自动画质") }
+        for sample in [70, 95, 72, 72, 72, 72] { latency.observe(sample) }
+        guard latency.constrained else { throw Failure("网络恢复前应维持低带宽档位") }
+        latency.observe(72)
+        guard !latency.constrained else { throw Failure("延迟持续恢复后应回到正常画质") }
+
+        guard windowsShortcut(code: 8, flags: 4) == (8, 16), // Ctrl+C → ⌘C
+              windowsShortcut(code: 55, flags: 16) == (59, 4),
+              windowsShortcut(code: 62, flags: 4) == (54, 16),
+              windowsShortcut(code: 58, flags: 8) == (58, 8),
+              windowsShortcut(code: 8, flags: 30) == (8, 30)
+        else { throw Failure("Windows 修饰键映射错误") }
     }
 
     @MainActor private static func checkRemoteTitleBar() throws {

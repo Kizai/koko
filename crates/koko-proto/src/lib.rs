@@ -41,6 +41,8 @@ pub enum RemoteCommand {
     Pointer {
         display: u32,
         events: Vec<PointerEvent>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_os: Option<KeyboardPlatform>,
     },
     Click {
         x: u16,
@@ -89,6 +91,15 @@ pub enum MouseButton {
     Middle,
     Back,
     Forward,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyboardPlatform {
+    Macos,
+    Windows,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,7 +270,9 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             valid_capture(*display, *edge, *quality)
                 && matches!(fps, 30 | 60 | 90 | 120 | 144 | 165 | 240)
         }
-        RemoteCommand::Pointer { display, events } => {
+        RemoteCommand::Pointer {
+            display, events, ..
+        } => {
             *display != 0
                 && (1..=32).contains(&events.len())
                 && events.iter().all(PointerEvent::valid)

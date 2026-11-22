@@ -503,7 +503,10 @@ mod tests {
         let respond = async {
             for kind in ["down", "move", "up"] {
                 let request = requests.recv().await.unwrap();
-                let RemoteCommand::Pointer { display, events } = request.command else {
+                let RemoteCommand::Pointer {
+                    display, events, ..
+                } = request.command
+                else {
                     panic!("expected a pointer request");
                 };
                 assert_eq!(display, 2);
@@ -530,6 +533,7 @@ mod tests {
                     .send(&RemoteCommand::Pointer {
                         display: 2,
                         events: vec![event],
+                        source_os: None,
                     })
                     .await?;
                 assert!(matches!(reply, RemoteReply::Ok));
