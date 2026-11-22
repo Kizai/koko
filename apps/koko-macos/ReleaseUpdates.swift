@@ -27,7 +27,9 @@ final class ReleaseUpdates: ObservableObject {
         let version: String
         var id: String { version }
         var pageURL: URL { Self.repository.appendingPathComponent("releases/tag/v\(version)") }
-        var downloadURL: URL { Self.repository.appendingPathComponent("releases/download/v\(version)/Koko-\(version).dmg") }
+        var downloadURL: URL { Self.repository.appendingPathComponent("releases/download/v\(version)/Koko-\(version).zip") }
+
+        var feedURL: URL { downloadURL.deletingLastPathComponent().appendingPathComponent("appcast.xml") }
 
         fileprivate static let repository = URL(string: "https://github.com/Kizai/koko")!
         fileprivate init(_ number: ReleaseVersion) { version = number.string }
@@ -40,6 +42,16 @@ final class ReleaseUpdates: ObservableObject {
     let installedVersion: String?
     @Published private(set) var state: State = .idle
     @Published private(set) var automaticNotice: Release?
+
+    private let installer = UpdateInstaller()
+
+    func install(_ release: Release) {
+        do {
+            try installer.install(version: release.version, feedURL: release.feedURL)
+        } catch {
+            state = .failed("无法开始更新：" + error.localizedDescription)
+        }
+    }
 
     private let defaults: UserDefaults
     private let load: (URLRequest) async throws -> (Data, URLResponse)
@@ -156,10 +168,10 @@ final class ReleaseUpdates: ObservableObject {
                   version > current else { return nil }
             let release = Release(version)
             guard candidate.htmlUrl == release.pageURL.absoluteString,
-                  candidate.assets.contains(where: {
-                      $0.state == "uploaded" && $0.name == release.downloadURL.lastPathComponent
-                      && $0.browserDownloadUrl == release.downloadURL.absoluteString
-                  }) else { return nil }
+                  [release.downloadURL, release.feedURL].allSatisfy({ url in candidate.assets.contains(where: {
+                      $0.state == "uploaded" && $0.name == url.lastPathComponent
+                      && $0.browserDownloadUrl == url.absoluteString
+                  }) }) else { return nil }
             return version
         }.max()
         return newest.map(Release.init)
@@ -175,11 +187,18 @@ final class ReleaseUpdates: ObservableObject {
 
         for version in feed.versions.sorted(by: >) where version > current {
             let release = Release(version)
-            var request = URLRequest(url: release.downloadURL)
-            request.httpMethod = "HEAD"
-            let (_, status) = try await fetch(request)
-            if status == 200 { return release }
-            if status != 404 { throw CheckError("无法确认 Mac 安装包，HTTP \(status)。") }
+            var complete = true
+            for url in [release.feedURL, release.downloadURL] {
+                var request = URLRequest(url: url)
+                request.httpMethod = "HEAD"
+                let (_, status) = try await fetch(request)
+                if status == 404 {
+                    complete = false
+                    break
+                }
+                guard status == 200 else { throw CheckError("无法确认更新附件，HTTP \(status)。") }
+            }
+            if complete { return release }
         }
         return nil
     }

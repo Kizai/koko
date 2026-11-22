@@ -77,7 +77,7 @@ private struct ConnectionView: View {
                     Label("KoKo \(release.version) 可更新", systemImage: "arrow.down.circle")
                     Spacer()
                     Link("更新说明", destination: release.pageURL)
-                    Link("下载安装包", destination: release.downloadURL)
+                    Button("下载并安装") { updates.install(release) }
                     Button("跳过此版本", action: updates.dismissAutomaticNotice)
                         .buttonStyle(.borderless)
                 }

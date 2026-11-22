@@ -7,16 +7,16 @@ extension DesktopRegression {
         defer { defaults.removePersistentDomain(forName: suite) }
         let repository = "https://github.com/Kizai/koko"
         func assetRelease(_ version: String, _ preview: Bool = true, draft: Bool = false,
-                          uploaded: Bool = true, canonical: Bool = true) -> [String: Any] {
-            let filename = "Koko-\(version).dmg"
+                          uploaded: Bool = true, canonical: Bool = true, includesFeed: Bool = true) -> [String: Any] {
+            let files = ["Koko-\(version).zip"] + (includesFeed ? ["appcast.xml"] : [])
             return ["tag_name": "v\(version)", "prerelease": preview, "draft": draft,
                     "html_url": "\(repository)/releases/tag/v\(version)",
-                    "assets": [["name": filename, "state": uploaded ? "uploaded" : "open",
-                                "browser_download_url": canonical ? "\(repository)/releases/download/v\(version)/\(filename)" : "https://example.org/\(filename)"]]]
+                    "assets": files.map { filename in ["name": filename, "state": uploaded ? "uploaded" : "open",
+                                "browser_download_url": canonical ? "\(repository)/releases/download/v\(version)/\(filename)" : "https://example.org/\(filename)"] }]
         }
         let records = [assetRelease("0.1.9"), assetRelease("0.1.11"), assetRelease("0.1.10"),
                        assetRelease("0.2.0", draft: true), assetRelease("0.3.0", uploaded: false),
-                       assetRelease("0.4.0", canonical: false), assetRelease("0.1.011"), assetRelease("beta")]
+                       assetRelease("0.4.0", canonical: false), assetRelease("0.9.0", includesFeed: false), assetRelease("0.1.011"), assetRelease("beta")]
         var payload = try JSONSerialization.data(withJSONObject: records)
         var apiStatus = 200
         var requests: [URLRequest] = []
@@ -47,7 +47,7 @@ extension DesktopRegression {
                 status = 200
                 data = Data(feed.utf8)
             case "github.com" where request.httpMethod == "HEAD":
-                status = url.lastPathComponent == "Koko-0.1.10.dmg" ? 200 : 404
+                status = url.deletingLastPathComponent().lastPathComponent == "v0.1.10" ? 200 : 404
                 data = Data()
             default: throw Failure("意外的网络请求")
             }
@@ -61,7 +61,8 @@ extension DesktopRegression {
         await checker.check(manual: true)
         await first.value
         guard requests.count == 1, case .available(let release) = checker.state, release.version == "0.1.11",
-              release.downloadURL.absoluteString == "\(repository)/releases/download/v0.1.11/Koko-0.1.11.dmg",
+              release.downloadURL.absoluteString == "\(repository)/releases/download/v0.1.11/Koko-0.1.11.zip",
+              release.feedURL.absoluteString == "\(repository)/releases/download/v0.1.11/appcast.xml",
               checker.automaticNotice == nil else { throw Failure("并发手动和自动检查应共用请求并得到最新可用安装包") }
 
         let restored = ReleaseUpdates(installedVersion: "0.1.8", defaults: defaults, load: load)
@@ -84,7 +85,7 @@ extension DesktopRegression {
         apiStatus = 403
         await dismissed.check(manual: true)
         guard case .available(let fallback) = dismissed.state, fallback.version == "0.1.10",
-              requests.suffix(2).compactMap({ $0.url?.lastPathComponent }) == ["Koko-0.1.14.dmg", "Koko-0.1.10.dmg"] else {
+              requests.suffix(3).compactMap({ $0.url?.lastPathComponent }) == ["appcast.xml", "appcast.xml", "Koko-0.1.10.zip"] else {
             throw Failure("限流时应通过订阅跳过没有安装包的版本")
         }
         let stable = ReleaseUpdates(installedVersion: "1.0.0", defaults: defaults, load: load)

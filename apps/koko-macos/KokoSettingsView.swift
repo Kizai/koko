@@ -82,7 +82,7 @@ struct KokoSettingsView: View {
                     case .available(let release):
                         LabeledContent("有可用更新 · \(release.version)") {
                             Link("更新说明", destination: release.pageURL)
-                            Link("下载安装包", destination: release.downloadURL)
+                            Button("下载并安装") { updates.install(release) }
                         }
                     case .failed(let message):
                         LabeledContent {

@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "koko-agent"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "iroh",
  "koko-p2p",
@@ -1395,11 +1395,11 @@ dependencies = [
 
 [[package]]
 name = "koko-capture"
-version = "0.1.19"
+version = "0.1.20"
 
 [[package]]
 name = "koko-daemon"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "base64 0.22.1",
  "iroh",
@@ -1413,11 +1413,11 @@ dependencies = [
 
 [[package]]
 name = "koko-input"
-version = "0.1.19"
+version = "0.1.20"
 
 [[package]]
 name = "koko-p2p"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "blake3",
  "if-addrs",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "koko-proto"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "serde",
 ]

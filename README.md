@@ -29,9 +29,9 @@ KoKo 让你在另一台 Mac 上查看和操作已授权的桌面。被控端决�
 
 ### 1. 下载并安装
 
-在 [GitHub Releases](https://github.com/Kizai/koko/releases) 打开内测版，下载 `Koko-<版本>.dmg`。从 0.1.15 起，在两台 Mac 上分别打开同一版本的 DMG，双击其中的 安装图标，跟随 macOS 安装器完成安装。然后从「应用程序」打开 KoKo。以前的 DMG 可将 `Koko.app` 拖入「应用程序」。安装预编译包只需要 macOS。
+在 [GitHub Releases](https://github.com/Kizai/koko/releases) 打开内测版，下载 `Koko-<版本>.dmg`。从 0.1.15 起，在两台 Mac 上分别打开同一版本的 DMG，双击其中的安装图标，跟随 macOS 安装器完成安装。然后从「应用程序」打开 KoKo。以前的 DMG 可将 `Koko.app` 拖入「应用程序」。安装预编译包只需要 macOS。
 
-从 0.1.16 起，打开 KoKo 或回到主窗口时，应用每天最多自动检查一次 GitHub Releases。有新版 Mac 安装包时，主窗口会显示提醒，可查看更新说明或下载 DMG。也可随时点击右上角「设置 → 常规 → 检查更新」。0.x 内测版会检查预发布版本，只有源码的发布会被跳过。
+从 0.1.16 起，打开 KoKo 或回到主窗口时，应用每天最多自动检查一次 GitHub Releases。有新版 Mac 安装包时，主窗口会显示提醒。从 0.1.20 起，点「下载并安装」即可在应用内查看下载进度，校验完成后点「安装并重新启动」。0.1.16–0.1.19 用户先用 DMG 升级一次。也可随时点击右上角「设置 → 常规 → 检查更新」。0.x 内测版会检查预发布版本，只有源码的发布会被跳过。
 
 本地临时签名包覆盖安装后，macOS 可能要求为新包重新授予录屏和辅助功能。正式签名版本通过稳定的应用身份支持权限延续。升级后可先从「设置 → 安全」复查已有授权。[权限与签名说明](./docs/macos-permissions.md)
 
@@ -90,7 +90,7 @@ cd koko
 ./scripts/build-macos.sh --allow-ad-hoc
 ```
 
-本地临时包输出到 `target/koko-macos/local/`。公开发布时，配置 Developer ID 签名和公证凭据，执行 `./scripts/build-macos.sh --release`，将生成的同版本 DMG 附到 GitHub Release，应用即可发现更新。[构建与签名](./docs/macos.md#公开分发与升级)
+本地临时包输出到 `target/koko-macos/local/`。公开发布时，配置 Developer ID 签名和公证凭据，执行 `./scripts/build-macos.sh --release`，将同版本的 DMG、更新 ZIP 和 appcast.xml 附到 GitHub Release。[构建与签名](./docs/macos.md#公开分发与升级)
 
 ```bash
 cargo fmt --all -- --check

@@ -26,7 +26,7 @@ KoKo connects two authorized Macs over a local or routed network. The host decid
 3. On the controller, refresh LAN devices and choose the host, or enter its one-time code under **Connect to a Partner**. Use the host's direct invitation when your routed network does not forward LAN discovery.
 4. On the host, approve the first LAN request. Choose **Trust and Connect** to allow that controller to reconnect while sharing is enabled.
 
-Starting with 0.1.16, KoKo checks GitHub Releases when the app becomes active, up to once a day. Open **Settings → General → Check for Updates** to check immediately. The notice links to the release notes and its Mac installer. Local ad-hoc builds may require granting macOS permissions again after an upgrade. [Permissions and signing](./macos-permissions.md)
+Starting with 0.1.16, KoKo checks GitHub Releases when the app becomes active, up to once a day. Open **Settings → General → Check for Updates** to check immediately. Starting with 0.1.20, choose **Download and Install** to see download progress, then **Install and Relaunch**. Older clients can install the DMG once to enable this flow. Local ad-hoc builds may require granting macOS permissions again after an upgrade. [Permissions and signing](./macos-permissions.md)
 
 For SSH tools, enable Remote Login for the intended host account. File transfers and forwarding use SSH keys and a verified host key. [macOS setup and troubleshooting](./macos.md)
 

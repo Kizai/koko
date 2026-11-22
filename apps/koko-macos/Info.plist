@@ -32,5 +32,13 @@
     <string>KoKo 在你复制或接收文件时，需要访问下载文件夹中的相应文件。</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Koko 使用录屏权限，供你向已授权的设备共享主显示器画面。</string>
+    <key>SUPublicEDKey</key>
+    <string>3rV72SqXAEZgFl63e79k8HwHTA2KN7dTMzI1B3TRirQ=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <false/>
+    <key>SUAllowsAutomaticUpdates</key>
+    <false/>
+    <key>SUVerifyUpdateBeforeExtraction</key>
+    <true/>
 </dict>
 </plist>

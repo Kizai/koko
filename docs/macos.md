@@ -133,6 +133,14 @@ KOKO_NOTARY_PROFILE="koko-notary" \
 
 构建升级包时，可额外设置 `KOKO_PREVIOUS_APP=/Applications/Koko.app`，指向用户实际安装的上一版或其独立副本。脚本在打包前检查两版应用是否相互满足对方的指定要求（designated requirement）。首次发包可省略此项。由开发签名切换到 Developer ID 时，即使属于同一团队，默认指定要求也可能互不兼容，需要重新授权。升级后按权限文档复测录屏和键鼠。[权限验收](./macos-permissions.md#双机验收) · [Apple 签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 
+### 发布应用内更新
+
+首次安装继续使用 DMG。0.1.20 起的应用会从所选 GitHub Release 加载该版本的 `appcast.xml`，显示下载进度并在解压前校验 ZIP 的 Ed25519 签名。用户可以取消下载，准备就绪后点「安装并重新启动」。重启会结束当前会话。macOS 在安装位置需要更高权限时会提示授权。
+
+构建脚本从 Sparkle 官方发行页下载固定版本并校验 SHA-256。公开签名构建默认生成更新附件。内测发布可执行 `KOKO_UPDATE_ASSETS=1 ./scripts/build-macos.sh --allow-ad-hoc`。把 DMG 与同目录下 `updates/<版本>/` 中的 `Koko-<版本>.zip` 和 `appcast.xml` 一起上传到 `v<版本>` 的 GitHub Release。
+
+KoKo 的更新私钥保存在发布机登录钥匙串的 `io.github.kizai.koko.updates` 账户条目中，客户端的 `SUPublicEDKey` 固定了对应公钥。更换发布机时使用 Sparkle 的 `generate_keys` 安全迁移同一密钥。自行构建分支并独立发布时应使用自己的发布仓库与密钥。[Sparkle 发布说明](https://sparkle-project.org/documentation/publishing/)
+
 ## 复测
 
 - **重启**：退出被控端后重新打开，启动远程协助。控制端用新连接码发起请求。

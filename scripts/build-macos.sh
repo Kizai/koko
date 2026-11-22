@@ -58,6 +58,8 @@ if [[ "$release" == true ]]; then
     trap 'rm -rf "$build_dir"' EXIT
 fi
 app="$build_dir/Koko.app"
+sparkle="$("$repo_root/scripts/macos-installer/sparkle.sh")"
+frameworks="$sparkle/Sparkle.xcframework/macos-arm64_x86_64"
 launcher_sources=("$repo_root"/apps/koko-macos/*.swift)
 
 previous_app="${KOKO_PREVIOUS_APP:-}"
@@ -82,6 +84,7 @@ for architecture in arm64 x86_64; do
         --target "$rust_architecture-apple-darwin" -p koko-daemon -p koko-agent
     xcrun swiftc -parse-as-library -swift-version 6 -O \
         -target "$architecture-apple-macosx$MACOSX_DEPLOYMENT_TARGET" \
+        -F "$frameworks" -framework Sparkle -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
         "${launcher_sources[@]}" -o "$build_dir/Koko-$architecture"
     xcrun swiftc -parse-as-library -swift-version 6 -O \
         -target "$architecture-apple-macosx$MACOSX_DEPLOYMENT_TARGET" \
@@ -120,6 +123,15 @@ done
 rm -f "$app/Contents/Resources/KoKo.icns"
 iconutil --convert icns --output "$app/Contents/Resources/KoKoMark.icns" "$iconset"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
+ditto "$sparkle/LICENSE" "$app/Contents/Resources/Sparkle-LICENSE"
+framework="$app/Contents/Frameworks/Sparkle.framework"
+ditto "$frameworks/Sparkle.framework" "$framework"
+if [[ "$ad_hoc" != true ]]; then
+    components="$framework/Versions/B"
+    for component in "$components"/XPCServices/*.xpc "$components"/Autoupdate "$components"/Updater.app "$framework"; do
+        codesign "${signing_options[@]}" --preserve-metadata=entitlements "$component"
+    done
+fi
 codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"
 if [[ "$release" == true ]]; then
@@ -144,6 +156,9 @@ if [[ -n "$previous_app" ]]; then
 fi
 
 "$repo_root/scripts/macos-installer/package.sh" "$app" "$version" "$disk_image" "$release"
+if [[ "$release" == true || "${KOKO_UPDATE_ASSETS:-0}" == 1 ]]; then
+    "$repo_root/scripts/macos-installer/update-archive.sh" "$app" "$(dirname "$disk_image")/updates/$version" "$sparkle"
+fi
 if [[ "$release" == true ]]; then
     printf 'Notarized DMG: %s\n' "$disk_image"
     exit 0
