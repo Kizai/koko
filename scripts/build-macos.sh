@@ -4,32 +4,36 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
+allow_ad_hoc=false
+if [[ "$#" -eq 1 && "$1" == "--allow-ad-hoc" ]]; then
+    allow_ad_hoc=true
+elif [[ "$#" -eq 1 && "$1" == "--require-apple-signing" ]]; then
+    :
+elif [[ "$#" -ne 0 ]]; then
+    printf 'Usage: %s [--allow-ad-hoc | --require-apple-signing]\n' "$0" >&2
+    exit 2
+fi
+
+signing_identity="${KOKO_SIGN_IDENTITY:--}"
+build_dir="$repo_root/target/koko-macos"
+ad_hoc=false
+if [[ "$signing_identity" == "-" ]]; then
+    if [[ "$allow_ad_hoc" != true ]]; then
+        printf 'Set KOKO_SIGN_IDENTITY to an Apple code-signing identity in the build Mac keychain.\nFor a local test build, explicitly pass --allow-ad-hoc.\n' >&2
+        exit 1
+    fi
+    ad_hoc=true
+    build_dir="$build_dir/local"
+    printf 'Ad hoc test build. macOS permissions may need to be granted again after upgrading.\n' >&2
+fi
+signing_options=(--force --sign "$signing_identity")
+
 export MACOSX_DEPLOYMENT_TARGET=13.0
 version="$(cargo metadata --locked --no-deps --format-version 1 | plutil -extract packages.0.version raw -)"
-build_dir="$repo_root/target/koko-macos"
 disk_image="$build_dir/Koko-$version.dmg"
 image_dir="$build_dir/image"
 app="$image_dir/Koko.app"
 launcher_sources=("$repo_root"/apps/koko-macos/*.swift)
-signing_identity="${KOKO_SIGN_IDENTITY:--}"
-require_apple_signing=false
-if [[ "$#" -eq 1 && "$1" == "--require-apple-signing" ]]; then
-    require_apple_signing=true
-elif [[ "$#" -ne 0 ]]; then
-    printf 'Usage: %s [--require-apple-signing]\n' "$0" >&2
-    exit 2
-fi
-
-ad_hoc=false
-if [[ "$signing_identity" == "-" ]]; then
-    if [[ "$require_apple_signing" == true ]]; then
-        printf 'Set KOKO_SIGN_IDENTITY to an Apple code-signing identity in the build Mac keychain.\n' >&2
-        exit 1
-    fi
-    ad_hoc=true
-    printf 'Ad hoc test build. macOS permissions may need to be granted again after upgrading.\n' >&2
-fi
-signing_options=(--force --sign "$signing_identity")
 
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources"
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
@@ -71,10 +75,12 @@ ditto apps/koko-macos/Info.plist "$app/Contents/Info.plist"
 plutil -insert CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 plutil -insert CFBundleVersion -string "$version" "$app/Contents/Info.plist"
 plutil -insert KokoAdHocSigned -bool "$ad_hoc" "$app/Contents/Info.plist"
+xcrun swift apps/koko-macos/build/AppIcon.swift "$build_dir/KoKo.iconset"
+iconutil --convert icns --output "$app/Contents/Resources/KoKo.icns" "$build_dir/KoKo.iconset"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
 codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"
-if [[ "$require_apple_signing" == true ]]; then
+if [[ "$ad_hoc" != true ]]; then
     codesign --verify -R '=anchor apple generic' "$app"
 fi
 

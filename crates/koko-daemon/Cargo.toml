@@ -10,10 +10,8 @@ iroh.workspace = true
 koko-p2p.workspace = true
 koko-proto.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["signal", "sync", "time"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "signal", "sync", "time"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 koko-capture.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

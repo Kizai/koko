@@ -82,17 +82,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::signal::ctrl_c().await?;
             router.shutdown().await?;
         }
+        [command, file, bind, option, name] if command == "serve-pair" && option == "--app-desktop" => {
+            let path = Path::new(file);
+            let identity = load_or_create_identity(path)?;
+            pairing::serve(identity, bind.parse()?, Some((path, name))).await?;
+        }
         [command, file, bind, option] if command == "serve-pair" && option == "--app-desktop" => {
-            let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, bind.parse()?, true).await?;
+            let path = Path::new(file);
+            let identity = load_or_create_identity(path)?;
+            pairing::serve(identity, bind.parse()?, Some((path, ""))).await?;
         }
         [command, file, bind] if command == "serve-pair" => {
             let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, bind.parse()?, false).await?;
+            pairing::serve(identity, bind.parse()?, None).await?;
         }
         [command, file] if command == "serve-pair" => {
             let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, ([0, 0, 0, 0], 4444).into(), false).await?;
+            pairing::serve(identity, ([0, 0, 0, 0], 4444).into(), None).await?;
         }
         _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port] | screen-permission <check|request>".into()),
     }

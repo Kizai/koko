@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use iroh::EndpointAddr;
 use koko_p2p::pairing::{discover_hosts, lan_request, request_pairing, resolve_invite};
 use koko_p2p::remote::{RemoteClient, send_command};
 use koko_p2p::{check_host, load_identity, load_or_create_identity};
-use koko_proto::{MAX_REMOTE_REQUEST, RemoteCommand};
+use koko_proto::{MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -36,10 +37,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let devices: Vec<_> = discover_hosts()
                 .await?
                 .into_iter()
-                .map(|target| {
+                .map(|(target, name)| {
                     serde_json::json!({
                         "id": target.id.to_string(),
-                        "label": format!("Koko {}", target.id.fmt_short()),
+                        "label": name.unwrap_or_else(|| format!("Koko {}", target.id.fmt_short())),
                         "request": lan_request(&target),
                     })
                 })
@@ -50,6 +51,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let key = load_identity(Path::new(file))?;
             let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
             stream_commands(key, target).await?;
+        }
+        [command, file, host, address, request] if command == "remote-video" => {
+            let key = load_identity(Path::new(file))?;
+            let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
+            let request = serde_json::from_str(request)?;
+            if !matches!(request, RemoteCommand::Video { .. }) {
+                return Err("expected a video subscription".into());
+            }
+            let (closed, input_closed) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let _ = io::copy(&mut io::stdin(), &mut io::sink());
+                let _ = closed.send(());
+            });
+            let client = RemoteClient::connect(key, target).await?;
+            let result = tokio::select! {
+                _ = input_closed => Ok(()),
+                result = stream_video(&client, &request) => result,
+            };
+            client.close().await;
+            result?;
         }
         [command, file, host, address] if command == "remote" => {
             let key = load_identity(Path::new(file))?;
@@ -97,13 +118,54 @@ async fn stream_commands(key: iroh::SecretKey, target: EndpointAddr) -> Result<(
         if client.is_none() {
             client = Some(RemoteClient::connect(key.clone(), target.clone()).await?);
         }
-        let reply = client.as_ref().unwrap().send(&command).await?;
+        let client = client.as_ref().unwrap();
+        let reply = client.send(&command).await?;
+        let mut reply = serde_json::to_value(reply)?;
+        if matches!(command, RemoteCommand::Capture { .. })
+            && let Some((rtt, direct)) = client.selected_path()
+        {
+            reply["rtt_ms"] = rtt.into();
+            reply["direct"] = direct.into();
+        }
         serde_json::to_writer(&mut output, &reply)?;
         writeln!(output)?;
         output.flush()?;
     }
     if let Some(client) = client {
         client.close().await;
+    }
+    Ok(())
+}
+
+async fn stream_video(
+    client: &RemoteClient,
+    request: &RemoteCommand,
+) -> Result<(), Box<dyn Error>> {
+    let mut recv = client.open_command(request).await?;
+    let mut output = io::BufWriter::new(io::stdout().lock());
+    let mut packet = Vec::new();
+    let mut last_stats = None::<Instant>;
+    let mut length = [0; 4];
+    while recv.read(&mut length[..1]).await?.is_some() {
+        recv.read_exact(&mut length[1..]).await?;
+        let size = u32::from_be_bytes(length) as usize;
+        if !(1..=MAX_VIDEO_PACKET).contains(&size) {
+            return Err("invalid video packet size".into());
+        }
+        packet.resize(size, 0);
+        recv.read_exact(&mut packet).await?;
+        if last_stats.is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
+            && let Some((rtt, direct)) = client.selected_path()
+        {
+            output.write_all(&10u32.to_be_bytes())?;
+            output.write_all(&[VIDEO_PATH])?;
+            output.write_all(&rtt.to_be_bytes())?;
+            output.write_all(&[u8::from(direct)])?;
+            last_stats = Some(Instant::now());
+        }
+        output.write_all(&length)?;
+        output.write_all(&packet)?;
+        output.flush()?;
     }
     Ok(())
 }

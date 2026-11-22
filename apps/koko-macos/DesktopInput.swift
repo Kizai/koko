@@ -96,7 +96,11 @@ enum RemoteMouseButton: String, Codable {
 }
 
 struct RemotePointerEvent: Codable {
-    enum Kind: String, Codable { case move, down, up, scroll, release }
+    enum Kind: String, Codable {
+        case move, down, up, scroll, release
+        case keyDown = "key_down"
+        case keyUp = "key_up"
+    }
 
     let kind: Kind
     var x: Int? = nil
@@ -105,11 +109,15 @@ struct RemotePointerEvent: Codable {
     var clicks: Int? = nil
     var dx: Int? = nil
     var dy: Int? = nil
+    var code: UInt16? = nil
+    var flags: UInt8? = nil
+    var `repeat`: Bool? = nil
 }
 
 @MainActor
-final class DesktopPointer {
+final class DesktopInput {
     private var held: [RemoteMouseButton: Int] = [:]
+    private var heldKeys = Set<CGKeyCode>()
     private var position: CGPoint?
 
     func apply(_ events: [RemotePointerEvent], display: CGDirectDisplayID) throws {
@@ -119,6 +127,14 @@ final class DesktopPointer {
         for event in events {
             if event.kind == .release {
                 release()
+                continue
+            }
+            if event.kind == .keyDown || event.kind == .keyUp {
+                guard let code = event.code, let flags = event.flags else { throw DesktopError.invalidCommand }
+                let down = event.kind == .keyDown
+                if !down && heldKeys.remove(code) == nil { continue }
+                try postKeyboardEvent(code, down: down, flags: flags, repeating: event.repeat == true)
+                if down { heldKeys.insert(code) }
                 continue
             }
             guard let x = event.x, let y = event.y else { throw DesktopError.invalidCommand }
@@ -153,7 +169,7 @@ final class DesktopPointer {
                 else { throw DesktopError.inputFailed }
                 scroll.location = point
                 scroll.post(tap: .cghidEventTap)
-            case .release:
+            case .release, .keyDown, .keyUp:
                 break
             }
             position = point
@@ -167,6 +183,19 @@ final class DesktopPointer {
             }
         }
         held.removeAll()
+        for code in heldKeys {
+            try? postKeyboardEvent(code, down: false, flags: 0, repeating: false)
+        }
+        heldKeys.removeAll()
+    }
+
+    private func postKeyboardEvent(_ code: CGKeyCode, down: Bool, flags: UInt8, repeating: Bool) throws {
+        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else {
+            throw DesktopError.inputFailed
+        }
+        event.flags = CGEventFlags(rawValue: UInt64(flags) << 16)
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: repeating ? 1 : 0)
+        event.post(tap: .cghidEventTap)
     }
 
     private func post(_ type: CGEventType, button: RemoteMouseButton, point: CGPoint, clicks: Int = 0) throws {

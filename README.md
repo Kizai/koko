@@ -8,32 +8,35 @@ Koko is a Rust-based, peer-to-peer remote desktop for people and AI agents. Conn
 
 ## Project status
 
-The macOS test app currently supports two ways to start a session. Use a one-time authorization code issued by the host, or discover a Mac on the LAN and ask its owner to approve. A direct invite carries the authorized code and network addresses for routed networks where LAN discovery is unavailable.
+The macOS test app currently supports two ways to start a session. Use a one-time authorization code issued by the host, or discover a Mac on the LAN and connect. The host can remember a controller after approving it once. A direct invite carries the authorized code and network addresses for routed networks where LAN discovery is unavailable.
 
 | Available now | Roadmap |
 | --- | --- |
 | Local sharing and remote connections in one macOS app, with one-time authorization codes and LAN discovery | Read-only MCP integration and internet direct connection and relay tests |
-| Multi-display viewing, adaptive capture resolution and quality, pointer movement, clicks, dragging, and scrolling | Video streaming, audio, and full keyboard forwarding |
-| Versioned development DMGs for Apple Silicon and Intel, targeting macOS 13 and later | Additional platforms and live observation with local takeover |
+| Multi-display H.264 video over QUIC, capture targets up to 240 FPS, and mouse and keyboard forwarding | Audio and more keyboard layouts |
+| LAN device actions for view-only sessions, SSH terminals, SFTP transfers, and loopback port forwarding | Additional platforms and live observation with local takeover |
+| Versioned development DMGs for Apple Silicon and Intel, targeting macOS 13 and later | Signed distribution |
 
-The remote window fits the selected display to the available space. Its Control Center offers transmission resolution, JPEG quality, full screen, shortcuts, and text entry. [macOS testing guide](./docs/macos.md)
+The remote window fits the selected display to the available space. The top bar shows received frames per second and connection statistics. The Control Center sets the target frame rate, transmission resolution, and video quality. [macOS testing guide](./docs/macos.md)
 
 ## Try it on two Macs
 
-Build the test package from a Mac with [Rust](https://rust-lang.org/install) and Xcode Command Line Tools. From the repository root, run:
+Build the test package from a Mac with [Rust](https://rust-lang.org/install), Xcode Command Line Tools, and an Apple code-signing identity in the keychain. From the repository root, pass the signing identity name or fingerprint:
 
 ```bash
-./scripts/build-macos.sh
+KOKO_SIGN_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)" ./scripts/build-macos.sh
 ```
 
 The output is `target/koko-macos/Koko-<version>.dmg`. Open the same image on both Macs and drag `Koko.app` into Applications. The app displays its version next to its name.
 
 1. On the Mac to be shared, enable screen recording and Accessibility in Koko's permissions panel, then turn on **Allow Remote Assistance** (`允许远程协助`). The default address is `0.0.0.0:4444/UDP`.
 2. On the other Mac, use **Connect to a Partner** (`连接伙伴`). Enter the short code on the same LAN or paste the host's direct invite over a routed or mesh network. The code gives the connecting device view and input access for one session and expires after five minutes or one use.
-3. For code-free LAN connections, refresh the sidebar and select the host. The host receives an approval request when you select it.
+3. For code-free LAN connections, select the host in the sidebar and choose **Enter Desktop** (`进入桌面`). The host can allow the connection once or remember that controller for future sessions while sharing is enabled.
 4. Operate the mouse within the remote image and use the display tabs to switch screens. Open **Control Center** (`控制中心`) for shortcuts, text entry, and ending the session.
 
 The host can turn off **Allow Remote Assistance** (`允许远程协助`) to revoke access and close the listener. [Installation, permissions, and key mappings](./docs/macos.md)
+
+The LAN device card also opens macOS Terminal and offers file transfers and localhost port forwarding. These actions use the host’s Remote Login account. Transfers and forwarding use an SSH key and a verified host key. [Device tools and settings](./docs/macos.md#设备工具与设置)
 
 ## Device access
 
@@ -52,7 +55,7 @@ OS permissions stay under the host user's control. Screen recording allows previ
 - `koko-daemon` authorizes sessions and delegates desktop operations to the macOS app or the standalone CLI helper.
 - `koko-agent` exposes the controller functions used by the SwiftUI app and scripts.
 
-The macOS implementation uses ScreenCaptureKit for snapshots and Core Graphics for keyboard and mouse events. [Architecture and roadmap](./docs/architecture.md)
+The macOS implementation uses ScreenCaptureKit for capture, VideoToolbox for H.264 encoding, and Core Graphics for keyboard and mouse events. [Architecture and roadmap](./docs/architecture.md)
 
 ## Development
 

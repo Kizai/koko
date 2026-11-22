@@ -1,8 +1,11 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 
 struct RemoteControlView: View {
     @ObservedObject var connection: LocalConnection
+    @ViewState private var toolbarHeight = WindowButtonAlignment.defaultHeight
+    @AppStorage("forwardPhysicalKeyboard") private var forwardPhysicalKeyboard = true
 
     private let keys = [
         ("Esc", "escape"), ("Tab", "tab"), ("回车", "enter"), ("删除", "backspace"),
@@ -17,11 +20,14 @@ struct RemoteControlView: View {
                 Color(red: 0.08, green: 0.10, blue: 0.14)
                 RemoteCanvas(
                     image: connection.remoteFrame,
-                    display: connection.selectedDisplay?.id,
+                    videoSize: connection.remoteVideoSize,
+                    videoSurface: connection.videoSurface,
+                    display: connection.isViewOnly ? nil : connection.frameDisplayID,
+                    acceptsKeyboard: forwardPhysicalKeyboard,
                     pointer: connection.queuePointer,
                     resize: connection.setViewportEdge
                 )
-                if connection.remoteFrame == nil {
+                if connection.displayedSize == nil {
                     Label(
                         connection.screenNotice?.message ?? "正在等待远端画面…",
                         systemImage: connection.screenNotice == nil ? "display" : "exclamationmark.triangle"
@@ -30,6 +36,10 @@ struct RemoteControlView: View {
                     .multilineTextAlignment(.center)
                     .padding(24)
                     .allowsHitTesting(false)
+                } else if let notice = connection.screenNotice {
+                    screenStatus(notice.message, icon: "exclamationmark.triangle")
+                } else if connection.frameDisplayID == nil, let screen = connection.selectedDisplay {
+                    screenStatus("正在切换到 \(screen.name)", icon: "display")
                 }
             }
             if let notice = connection.inputNotice {
@@ -42,6 +52,7 @@ struct RemoteControlView: View {
             }
         }
         .frame(minWidth: 670, idealWidth: 1060, minHeight: 410, idealHeight: 650)
+        .ignoresSafeArea(.container, edges: .top)
         .task { await connection.watchRemoteScreen() }
         .sheet(isPresented: $connection.showTextControls) {
             VStack(alignment: .leading, spacing: 12) {
@@ -62,81 +73,235 @@ struct RemoteControlView: View {
         }
     }
 
+    private func screenStatus(_ text: String, icon: String) -> some View {
+        Label(text, systemImage: icon)
+            .font(.callout)
+            .padding(.vertical, 6)
+            .padding(.horizontal, 10)
+            .background(.regularMaterial, in: Capsule())
+            .padding(12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            .allowsHitTesting(false)
+    }
+
     private var toolbar: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(connection.remoteHostName.isEmpty ? "远程 Mac" : connection.remoteHostName)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                Label("远程会话", systemImage: "link")
+        let tabs = HStack(spacing: 4) {
+            ForEach(Array(connection.displays.enumerated()), id: \.element.id) { index, display in
+                let selected = display.id == connection.selectedDisplay?.id
+                Button {
+                    connection.selectDisplay(display)
+                } label: {
+                    Label("\(index + 1) \(display.name)", systemImage: "display")
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .foregroundStyle(selected ? Color.accentColor : .secondary)
+                        .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help("\(display.name) · \(display.width) × \(display.height)")
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        return HStack(spacing: 9) {
+            Text(connection.session.flatMap { connection.deviceNames[$0.hostID] }
+                 ?? (connection.remoteHostName.isEmpty ? "远程 Mac" : connection.remoteHostName))
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: 184, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+            Divider().frame(height: 18)
+            ViewThatFits(in: .horizontal) {
+                tabs.fixedSize(horizontal: true, vertical: false)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    tabs
+                }
+            }
+            displayControls
+            networkControls
+            Spacer(minLength: 0)
+            if connection.isViewOnly {
+                Label("观看模式", systemImage: "eye")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-            .frame(minWidth: 104, idealWidth: 164, maxWidth: 200, alignment: .leading)
-            Divider().frame(height: 25)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(Array(connection.displays.enumerated()), id: \.element.id) { index, display in
-                        let selected = display.id == connection.selectedDisplay?.id
-                        Button {
-                            connection.selectDisplay(display)
-                        } label: {
-                            Label("\(index + 1)  \(display.name)", systemImage: "display")
-                                .lineLimit(1)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .foregroundStyle(selected ? Color.accentColor : .secondary)
-                                .background(selected ? Color.accentColor.opacity(0.12) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                        }
-                        .buttonStyle(.plain)
-                        .help("\(display.name) · \(display.width) × \(display.height)")
-                        .accessibilityAddTraits(selected ? .isSelected : [])
-                    }
-                }
+                    .fixedSize()
             }
             controlCenter.fixedSize()
         }
-        .padding(.horizontal, 14)
-        .frame(height: 55)
+        .padding(.leading, WindowButtonAlignment.leadingInset)
+        .padding(.trailing, 12)
+        .frame(height: toolbarHeight)
+        .background(WindowButtonAlignment(height: $toolbarHeight))
         .background(.regularMaterial)
     }
 
-    private var controlCenter: some View {
-        Menu {
-            if let image = connection.remoteFrame {
-                Text("当前画面 \(Int(image.size.width)) × \(Int(image.size.height))")
-            }
-            Picker("传输分辨率", selection: $connection.frameResolution) {
-                ForEach(FrameResolution.allCases) { resolution in
-                    Text(resolution.title(for: connection.selectedDisplay)).tag(resolution)
-                }
-            }
-            Picker("画质", selection: $connection.frameQuality) {
-                ForEach(FrameQuality.allCases) { quality in Text(quality.title).tag(quality) }
-            }
-            Divider()
-            Menu("快捷键") {
-                ForEach(keys.indices, id: \.self) { index in
-                    Button(keys[index].0) {
-                        Task { await connection.sendInput(.init(action: "key", key: keys[index].1)) }
+    private var displayControls: some View {
+        Button { connection.showDisplayControls.toggle() } label: {
+            Image(systemName: "plus")
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("显示器列表")
+        .help("管理显示器")
+        .popover(isPresented: $connection.showDisplayControls, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("可用显示器").font(.headline)
+                ForEach(connection.displays) { display in
+                    choice(display.name, selected: display.id == connection.selectedDisplay?.id) {
+                        connection.selectDisplay(display)
+                        connection.showDisplayControls = false
                     }
                 }
+                Divider()
+                Button("重新检测显示器") {
+                    connection.refreshDisplays()
+                }
             }
-            Button("发送文本…") { connection.showTextControls = true }
-            Button("切换全屏") { NSApp.keyWindow?.toggleFullScreen(nil) }
-            Divider()
-            Button("结束远控", role: .destructive) { connection.disconnect() }
-        } label: {
+            .padding(14)
+            .frame(width: 236)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private var networkControls: some View {
+        let rtt = connection.networkStats?.rttMS
+        return Button { connection.showNetworkStats.toggle() } label: {
+            Label(rtt.map { "\($0) ms" } ?? "网络", systemImage: "waveform.path")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(rtt.map { $0 < 100 ? Color.green : Color.orange } ?? .secondary)
+                .fixedSize()
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("会话网络状态")
+        .help("查看延迟与画面传输")
+        .popover(isPresented: $connection.showNetworkStats, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("会话网络").font(.headline)
+                networkRow("网络延迟", rtt.map { "\($0) ms" } ?? "—")
+                networkRow(connection.networkStats?.isVideo == true ? "首帧耗时" : "帧请求耗时",
+                           connection.networkStats.map { "\($0.frameMS) ms" } ?? "—")
+                networkRow("接收帧率", connection.networkStats?.framesPerSecond.map { String(format: "%.1f fps", $0) } ?? "—")
+                networkRow("画面数据速率", connection.networkStats?.kilobitsPerSecond.map { String(format: "%.0f Kbps", $0) } ?? "—")
+                Divider()
+                networkRow("连接路径", connection.networkStats?.direct.map { $0 ? "QUIC 直连" : "QUIC 中继" } ?? "—")
+                networkRow("被控端地址", connection.session?.address ?? "—")
+            }
+            .padding(16)
+            .frame(width: 274)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private func networkRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospacedDigit().textSelection(.enabled)
+        }
+        .font(.callout)
+    }
+
+    private var controlCenter: some View {
+        Button { connection.showControlCenter.toggle() } label: {
             Label("控制中心", systemImage: "slider.horizontal.3")
         }
-        .menuStyle(.borderlessButton)
+        .buttonStyle(.borderless)
+        .popover(isPresented: $connection.showControlCenter, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("画面设置").font(.headline)
+                    Spacer()
+                    if let size = connection.displayedSize {
+                        Text("\(Int(size.width)) × \(Int(size.height))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("传输分辨率").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(FrameResolution.allCases) { resolution in
+                    choice(resolution.title(for: connection.selectedDisplay), selected: resolution == connection.frameResolution) {
+                        connection.frameResolution = resolution
+                    }
+                }
+                Divider()
+                Text("画质").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(FrameQuality.allCases) { quality in
+                    choice(quality.title, selected: quality == connection.frameQuality) {
+                        connection.frameQuality = quality
+                    }
+                }
+                Divider()
+                Picker("目标帧率", selection: $connection.targetFPS) {
+                    ForEach(LocalConnection.frameRates, id: \.self) { fps in
+                        Text("\(fps) FPS").tag(fps)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(!connection.supportsVideo)
+                Divider()
+                HStack {
+                    Menu("快捷键") {
+                        ForEach(keys.indices, id: \.self) { index in
+                            Button(keys[index].0) {
+                                Task { await connection.sendInput(.init(action: "key", key: keys[index].1)) }
+                            }
+                        }
+                    }
+                    .fixedSize()
+                    .disabled(connection.isViewOnly)
+                    Button("发送文本") {
+                        connection.showControlCenter = false
+                        connection.showTextControls = true
+                    }
+                    .disabled(connection.isViewOnly)
+                    Button("全屏") {
+                        connection.showControlCenter = false
+                        NSApp.keyWindow?.toggleFullScreen(nil)
+                    }
+                    Spacer()
+                    Button("结束", role: .destructive) { connection.disconnect() }
+                }
+                if let ip = connection.session?.address.split(separator: ":").first,
+                   let url = URL(string: "vnc://\(ip)"),
+                   let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.ScreenSharing") {
+                    Button("在 macOS 屏幕共享中打开") {
+                        connection.showControlCenter = false
+                        NSWorkspace.shared.open(
+                            [url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil
+                        )
+                    }
+                    .help("被控 Mac 已开启系统屏幕共享时，可在系统应用中用允许访问的账户登录。")
+                }
+            }
+            .padding(14)
+            .frame(width: 312)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private func choice(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer(minLength: 12)
+                if selected { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(selected ? Color.accentColor.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
 private struct RemoteCanvas: NSViewRepresentable {
     let image: NSImage?
+    let videoSize: CGSize?
+    let videoSurface: VideoSurface
     let display: UInt32?
+    let acceptsKeyboard: Bool
     let pointer: (RemotePointerEvent, UInt32) -> Void
     let resize: (Int) -> Void
 
@@ -144,11 +309,17 @@ private struct RemoteCanvas: NSViewRepresentable {
         let canvas = CanvasView()
         canvas.onPointer = pointer
         canvas.onResize = resize
+        canvas.wantsLayer = true
+        videoSurface.layer.videoGravity = .resizeAspect
+        canvas.layer?.addSublayer(videoSurface.layer)
+        canvas.videoLayer = videoSurface.layer
         return canvas
     }
 
     func updateNSView(_ view: CanvasView, context: Context) {
         view.displayID = display
+        view.acceptsKeyboard = acceptsKeyboard
+        view.videoSize = videoSize
         view.image = image
         view.needsDisplay = true
     }
@@ -157,20 +328,35 @@ private struct RemoteCanvas: NSViewRepresentable {
 @MainActor
 private final class CanvasView: NSView {
     var image: NSImage?
+    var videoLayer: AVSampleBufferDisplayLayer?
+    var acceptsKeyboard = true
+    var videoSize: CGSize? {
+        didSet {
+            if videoSize != oldValue {
+                videoLayer?.isHidden = videoSize == nil
+                needsLayout = true
+            }
+        }
+    }
     var displayID: UInt32? {
         didSet {
-            if oldValue != displayID { pressed.removeAll() }
+            if oldValue != displayID {
+                pressed.removeAll()
+                pressedKeys.removeAll()
+            }
         }
     }
     var onPointer: ((RemotePointerEvent, UInt32) -> Void)?
     var onResize: ((Int) -> Void)?
     private var pressed = Set<RemoteMouseButton>()
+    private var pressedKeys = Set<UInt16>()
     private var tracking: NSTrackingArea?
 
     override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
 
     private var imageRect: CGRect {
-        guard let size = image?.size, size.width > 0, size.height > 0 else { return .zero }
+        guard let size = videoSize ?? image?.size, size.width > 0, size.height > 0 else { return .zero }
         let scale = min(bounds.width / size.width, bounds.height / size.height)
         let width = size.width * scale
         let height = size.height * scale
@@ -178,11 +364,17 @@ private final class CanvasView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        image?.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        if videoSize == nil {
+            image?.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
     }
 
     override func layout() {
         super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoLayer?.frame = bounds
+        CATransaction.commit()
         let pixels = convertToBacking(bounds).size
         let fitted = imageRect
         guard fitted.width > 0 && fitted.height > 0 else {
@@ -210,9 +402,41 @@ private final class CanvasView: NSView {
     }
 
     @objc private func windowResigned() {
-        guard !pressed.isEmpty, let displayID else { return }
+        guard !pressed.isEmpty || !pressedKeys.isEmpty, let displayID else { return }
         pressed.removeAll()
+        pressedKeys.removeAll()
         onPointer?(.init(kind: .release), displayID)
+    }
+
+    override func resignFirstResponder() -> Bool {
+        windowResigned()
+        return super.resignFirstResponder()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if !forwardKey(event, down: true) { super.keyDown(with: event) }
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if !forwardKey(event, down: false) { super.keyUp(with: event) }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard window?.firstResponder === self, event.type == .keyDown,
+              event.modifierFlags.contains(.command) else { return super.performKeyEquivalent(with: event) }
+        if ["q", "w"].contains(event.charactersIgnoringModifiers?.lowercased() ?? "") {
+            return super.performKeyEquivalent(with: event)
+        }
+        return forwardKey(event, down: true) || super.performKeyEquivalent(with: event)
+    }
+
+    private func forwardKey(_ event: NSEvent, down: Bool) -> Bool {
+        guard acceptsKeyboard, videoSize != nil, let displayID, event.keyCode < 128 else { return false }
+        let code = event.keyCode
+        if down { pressedKeys.insert(code) } else if pressedKeys.remove(code) == nil { return false }
+        let flags = UInt8(truncatingIfNeeded: event.modifierFlags.rawValue >> 16) & 0xbf
+        onPointer?(.init(kind: down ? .keyDown : .keyUp, code: code, flags: flags, repeat: down ? event.isARepeat : nil), displayID)
+        return true
     }
 
     override func updateTrackingAreas() {
@@ -272,6 +496,7 @@ private final class CanvasView: NSView {
         switch kind {
         case .down:
             guard let button else { return }
+            window?.makeFirstResponder(self)
             pressed.insert(button)
             action.button = button
             action.clicks = min(3, max(1, event.clickCount))

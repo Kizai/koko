@@ -29,7 +29,9 @@ private final class FrameOutput: NSObject, SCStreamOutput, @unchecked Sendable {
     }
 }
 
-func captureScreen(displayID: CGDirectDisplayID? = nil, edge: Int = 1600, quality: Int? = nil) async throws -> Data {
+func screenCaptureSource(
+    displayID: CGDirectDisplayID?, edge: Int
+) async throws -> (SCContentFilter, SCStreamConfiguration) {
     guard CGPreflightScreenCaptureAccess() else { throw ScreenCaptureError.permissionRequired }
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
     let screen = displayID ?? CGMainDisplayID()
@@ -47,7 +49,14 @@ func captureScreen(displayID: CGDirectDisplayID? = nil, edge: Int = 1600, qualit
     config.height = max(1, Int(Double(height) * scale))
     config.pixelFormat = kCVPixelFormatType_32BGRA
     config.capturesAudio = false
-    config.showsCursor = true
+    return (filter, config)
+}
+
+func captureScreen(
+    displayID: CGDirectDisplayID? = nil, edge: Int = 1600, quality: Int? = nil, showsCursor: Bool = true
+) async throws -> Data {
+    let (filter, config) = try await screenCaptureSource(displayID: displayID, edge: edge)
+    config.showsCursor = showsCursor
 
     let image: CGImage
     if #available(macOS 14, *) {

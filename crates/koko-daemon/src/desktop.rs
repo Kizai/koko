@@ -1,19 +1,25 @@
 use std::collections::HashMap;
 use std::time::Duration;
+#[cfg(unix)]
+use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use iroh::{
     EndpointId,
-    endpoint::Connection,
+    endpoint::{Connection, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
 use koko_proto::{
-    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, RemoteCommand, RemoteReply, valid_remote_command,
+    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, RemoteCommand, RemoteReply, VIDEO_ERROR,
+    valid_remote_command,
 };
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
 
 pub(crate) struct DesktopRequest {
     command: RemoteCommand,
     reply: oneshot::Sender<RemoteReply>,
+    video_socket: Option<String>,
 }
 
 #[derive(Debug)]
@@ -32,9 +38,20 @@ impl AppDesktop {
     }
 
     async fn run(&self, command: RemoteCommand) -> RemoteReply {
+        self.request(command, None).await
+    }
+
+    async fn request(&self, command: RemoteCommand, video_socket: Option<String>) -> RemoteReply {
         let (reply, response) = oneshot::channel();
         match tokio::time::timeout(Duration::from_secs(9), async {
-            self.0.send(DesktopRequest { command, reply }).await.ok()?;
+            self.0
+                .send(DesktopRequest {
+                    command,
+                    reply,
+                    video_socket,
+                })
+                .await
+                .ok()?;
             response.await.ok()
         })
         .await
@@ -52,8 +69,11 @@ impl AppDesktopRequests {
             return;
         }
         self.number += 1;
-        let command =
-            serde_json::to_string(&request.command).expect("desktop command is serializable");
+        let mut command =
+            serde_json::to_value(&request.command).expect("desktop command is serializable");
+        if let Some(socket) = request.video_socket {
+            command["video_socket"] = socket.into();
+        }
         println!("Desktop request: {} {command}", self.number);
         self.pending.insert(self.number, request.reply);
     }
@@ -82,6 +102,8 @@ pub(crate) struct RemoteHost {
     pub(crate) allowed_peer: watch::Sender<Option<EndpointId>>,
     pub(crate) app_desktop: Option<AppDesktop>,
     pub(crate) pointer: Mutex<()>,
+    #[cfg(unix)]
+    pub(crate) video: Mutex<()>,
 }
 
 impl ProtocolHandler for RemoteHost {
@@ -101,7 +123,8 @@ impl RemoteHost {
         connection: &Connection,
         pointer: &mut Option<MutexGuard<'a, ()>>,
     ) -> Result<(), AcceptError> {
-        if *self.allowed_peer.borrow() != Some(connection.remote_id()) {
+        let authorization = self.allowed_peer.subscribe();
+        if *authorization.borrow() != Some(connection.remote_id()) {
             connection.close(1u32.into(), b"peer not authorized");
             return Ok(());
         }
@@ -110,15 +133,37 @@ impl RemoteHost {
                 .read_to_end(MAX_REMOTE_REQUEST)
                 .await
                 .map_err(AcceptError::from_err)?;
-            if *self.allowed_peer.borrow() != Some(connection.remote_id()) {
+            if authorization.has_changed().unwrap_or(true)
+                || *authorization.borrow() != Some(connection.remote_id())
+            {
                 connection.close(1u32.into(), b"peer not authorized");
                 return Ok(());
             }
             let command = serde_json::from_slice::<RemoteCommand>(&bytes);
             let reply = match command {
+                Ok(command @ RemoteCommand::Video { .. }) => {
+                    let mut authorization = authorization.clone();
+                    tokio::select! {
+                        biased;
+                        _ = authorization.changed() => {
+                            connection.close(1u32.into(), b"peer not authorized");
+                            return Ok(());
+                        }
+                        _ = send.stopped() => return Ok(()),
+                        result = self.serve_video(command, &mut send) => result?,
+                    }
+                    send.finish()?;
+                    continue;
+                }
                 Ok(RemoteCommand::Disconnect) => {
-                    self.allowed_peer.send_replace(None);
-                    println!("Session closed");
+                    self.allowed_peer.send_if_modified(|peer| {
+                        if *peer != Some(connection.remote_id()) {
+                            return false;
+                        }
+                        println!("Session closed");
+                        *peer = None;
+                        true
+                    });
                     RemoteReply::Ok
                 }
                 Ok(command) if valid_remote_command(&command) => {
@@ -146,6 +191,64 @@ impl RemoteHost {
         }
         Ok(())
     }
+
+    #[cfg(unix)]
+    async fn serve_video(
+        &self,
+        command: RemoteCommand,
+        send: &mut SendStream,
+    ) -> Result<(), AcceptError> {
+        if !valid_remote_command(&command) {
+            return send_video_error(send, "invalid_command").await;
+        }
+        let Some(app) = &self.app_desktop else {
+            return send_video_error(send, "desktop_unavailable").await;
+        };
+        let Ok(_active) = self.video.try_lock() else {
+            return send_video_error(send, "video_busy").await;
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("kv")
+            .permissions(Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(AcceptError::from_err)?;
+        let path = directory.path().join("v");
+        let listener = UnixListener::bind(&path).map_err(AcceptError::from_err)?;
+        if let RemoteReply::Error { code } = app
+            .request(command, Some(path.to_string_lossy().into_owned()))
+            .await
+        {
+            return send_video_error(send, &code).await;
+        }
+        let (mut source, _) = tokio::time::timeout(Duration::from_secs(9), listener.accept())
+            .await
+            .map_err(AcceptError::from_err)?
+            .map_err(AcceptError::from_err)?;
+        tokio::io::copy(&mut source, send)
+            .await
+            .map_err(AcceptError::from_err)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn serve_video(
+        &self,
+        _command: RemoteCommand,
+        send: &mut SendStream,
+    ) -> Result<(), AcceptError> {
+        send_video_error(send, "desktop_unavailable").await
+    }
+}
+
+async fn send_video_error(send: &mut SendStream, code: &str) -> Result<(), AcceptError> {
+    let size = (code.len() as u32 + 1).to_be_bytes();
+    send.write_all(&size).await.map_err(AcceptError::from_err)?;
+    send.write_all(&[VIDEO_ERROR])
+        .await
+        .map_err(AcceptError::from_err)?;
+    send.write_all(code.as_bytes())
+        .await
+        .map_err(AcceptError::from_err)
 }
 
 #[cfg(target_os = "macos")]
@@ -166,7 +269,10 @@ fn execute(command: RemoteCommand) -> RemoteReply {
     let result = match command {
         RemoteCommand::Disconnect => unreachable!("disconnect is handled by the session"),
         RemoteCommand::Screenshot => native(&["screenshot"], None),
-        RemoteCommand::Capture { .. } | RemoteCommand::Displays | RemoteCommand::Pointer { .. } => {
+        RemoteCommand::Capture { .. }
+        | RemoteCommand::Displays
+        | RemoteCommand::Pointer { .. }
+        | RemoteCommand::Video { .. } => {
             return RemoteReply::error("desktop_unavailable");
         }
         RemoteCommand::Click { x, y } => native(&["click", &x.to_string(), &y.to_string()], None),
@@ -265,6 +371,8 @@ mod tests {
                     allowed_peer,
                     app_desktop: Some(app_desktop),
                     pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
                 },
             )
             .spawn();
@@ -317,6 +425,8 @@ mod tests {
                     allowed_peer,
                     app_desktop: Some(app_desktop),
                     pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
                 },
             )
             .spawn();

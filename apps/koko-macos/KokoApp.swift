@@ -6,17 +6,25 @@ struct KokoApp: App {
     @NSApplicationDelegateAdaptor(KokoAppDelegate.self) private var delegate
 
     var body: some Scene {
-        Window("Koko", id: "connection") {
+        Window("远程协助", id: "connection") {
             ConnectionView(connection: delegate.connection)
         }
         .defaultSize(width: 870, height: 640)
         .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
 
-        Window("Koko 远程控制", id: "remote") {
+        Window("远程控制", id: "remote") {
             RemoteSessionWindow(connection: delegate.connection)
         }
         .defaultSize(width: 1080, height: 700)
         .windowResizability(.contentMinSize)
+        .windowStyle(.hiddenTitleBar)
+
+        Window("设置", id: "settings") {
+            KokoSettingsView(connection: delegate.connection)
+        }
+        .defaultSize(width: 550, height: 430)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -36,39 +44,50 @@ private struct ConnectionView: View {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var screenTest = ScreenTest()
     @StateObject private var inputTest = InputTest()
+    @ViewState private var headerHeight = WindowButtonAlignment.defaultHeight
+    @ViewState private var tool: DeviceToolRequest?
+    @ViewState private var renaming: NearbyHost?
+    @ViewState private var newDeviceName = ""
+    @ViewState private var showRename = false
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
+        VStack(spacing: 0) {
+            windowHeader
             Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Text("远程协助")
-                        .font(.system(size: 27, weight: .semibold))
-                        .padding(.bottom, 3)
-                    if connection.session != nil {
-                        HStack {
-                            Label(connection.remoteHostName.isEmpty ? "已连接远程设备" : connection.remoteHostName,
-                                  systemImage: "display.and.arrow.down")
-                                .font(.headline)
-                            Spacer()
-                            Button("打开远控窗口") { openWindow(id: "remote") }
-                                .buttonStyle(.borderedProminent)
-                            Button("断开") { connection.disconnect() }
+            HStack(spacing: 0) {
+                sidebar
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        if let device = connection.selectedNearbyHost {
+                            nearbyDeviceCard(device)
+                        } else {
+                            if connection.session != nil {
+                                HStack {
+                                    Label(connection.remoteHostName.isEmpty ? "已连接远程设备" : connection.remoteHostName,
+                                          systemImage: "display.and.arrow.down")
+                                        .font(.headline)
+                                    Spacer()
+                                    Button("打开远控窗口") { openWindow(id: "remote") }
+                                        .buttonStyle(.borderedProminent)
+                                    Button("断开") { connection.disconnect() }
+                                }
+                                .padding(16)
+                                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                            }
+                            sharingCard
+                            controllerCard
+                            permissionsCard
                         }
-                        .padding(16)
-                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                     }
-                    sharingCard
-                    controllerCard
-                    permissionsCard
+                    .frame(maxWidth: 720)
+                    .padding(25)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: 720)
-                .padding(25)
-                .frame(maxWidth: .infinity)
             }
         }
         .frame(minWidth: 740, minHeight: 560)
+        .ignoresSafeArea(.container, edges: .top)
         .task {
             await connection.prepareIdentity(for: .host)
             await connection.prepareIdentity(for: .controller)
@@ -87,22 +106,87 @@ private struct ConnectionView: View {
         .sheet(isPresented: $connection.showsHostPermissionGuide) {
             hostPermissionGuide
         }
+        .sheet(item: $tool) { request in
+            DeviceToolSheet(request: request)
+        }
+        .alert("重命名设备", isPresented: $showRename) {
+            TextField("本地设备名称", text: $newDeviceName)
+            Button("保存") {
+                if let renaming { connection.rename(renaming, to: newDeviceName) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("名称只显示在这台 Mac 上。留空会恢复设备原名。")
+        }
+        .confirmationDialog("清除已信任设备？", isPresented: $connection.confirmForgetTrusted) {
+            Button("清除信任", role: .destructive) { connection.forgetTrustedDevices() }
+        } message: {
+            Text("下次连接将重新请求确认。当前共享中的会话也会结束。")
+        }
+    }
+
+    private var windowHeader: some View {
+        HStack(spacing: 8) {
+            if let host = connection.selectedNearbyHost {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 6))
+                    .foregroundStyle(.green)
+                    .accessibilityLabel("局域网已发现")
+                Text(connection.name(for: host)).font(.callout.weight(.semibold)).lineLimit(1)
+                Menu {
+                    Button("刷新设备", systemImage: "arrow.clockwise") {
+                        Task { await connection.scanLAN() }
+                    }
+                    Button("重命名", systemImage: "pencil") {
+                        renaming = host
+                        newDeviceName = connection.name(for: host)
+                        showRename = true
+                    }
+                    Button("从列表隐藏", systemImage: "eye.slash") { connection.hide(host) }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("设备操作")
+            } else {
+                Text("远程协助").font(.callout.weight(.semibold))
+            }
+            Spacer()
+            Button {
+                openWindow(id: "settings")
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 15, weight: .medium))
+                    .frame(width: 30, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(",", modifiers: .command)
+            .accessibilityLabel("设置")
+            .help("设置")
+        }
+        .padding(.leading, WindowButtonAlignment.leadingInset)
+        .padding(.trailing, 12)
+        .frame(height: headerHeight)
+        .background(WindowButtonAlignment(height: $headerHeight))
+        .background(.regularMaterial)
     }
 
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 9) {
-                Image(systemName: "link.circle.fill")
-                    .font(.system(size: 25))
-                    .foregroundStyle(Color.accentColor)
-                    .accessibilityHidden(true)
-                Text("Koko").font(.title3.bold())
-                Spacer(minLength: 5)
-                if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
-                    Text(version).font(.caption.monospaced()).foregroundStyle(.secondary)
-                }
+            Button {
+                connection.selectedNearbyHostID = nil
+            } label: {
+                Label("本机与远程协助", systemImage: "macwindow")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(connection.selectedNearbyHost == nil ? Color.primary.opacity(0.07) : .clear,
+                                in: RoundedRectangle(cornerRadius: 6))
+                    .contentShape(Rectangle())
             }
-            .padding(.bottom, 12)
+            .buttonStyle(.plain)
             HStack {
                 Text("局域网设备").font(.headline)
                 Spacer()
@@ -128,16 +212,18 @@ private struct ConnectionView: View {
                 VStack(alignment: .leading, spacing: 5) {
                     ForEach(connection.nearbyHosts) { host in
                         Button {
-                            Task { await connection.verify(code: host.request) }
+                            connection.selectedNearbyHostID = host.id
                         } label: {
-                            Label(host.label, systemImage: "desktopcomputer")
+                            Label(connection.name(for: host), systemImage: "desktopcomputer")
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(7)
+                                .padding(8)
+                                .background(connection.selectedNearbyHostID == host.id ? Color.accentColor.opacity(0.13) : .clear,
+                                            in: RoundedRectangle(cornerRadius: 6))
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(connection.controllerID.isEmpty || connection.isChecking || connection.session != nil)
-                        .help("请求远程控制")
+                        .help("查看设备")
                     }
                 }
             }
@@ -146,6 +232,104 @@ private struct ConnectionView: View {
         .frame(width: 205)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(.regularMaterial)
+    }
+
+    private func nearbyDeviceCard(_ host: NearbyHost) -> some View {
+        let hasSession = connection.session?.hostID == host.id
+        let canOpenDesktop = !connection.isChecking && (hasSession || (!connection.controllerID.isEmpty && connection.session == nil))
+        let preferredAddress = hasSession ? connection.session?.address : nil
+        return VStack(alignment: .leading, spacing: 16) {
+            VStack(spacing: 0) {
+                ZStack(alignment: .bottomLeading) {
+                    DeviceCardBackdrop()
+                    VStack(alignment: .leading, spacing: 11) {
+                        if connection.isChecking {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Button("取消连接") { connection.cancelCheck() }
+                            }
+                            .environment(\.colorScheme, .dark)
+                        } else {
+                            Text("远程桌面")
+                                .font(.system(size: 31, weight: .semibold))
+                                .foregroundStyle(.white)
+                            Button {
+                                openDesktop(host, viewOnly: false)
+                            } label: {
+                                Label(hasSession && !connection.isViewOnly ? "打开远控窗口" : "进入桌面",
+                                      systemImage: "arrow.up.right")
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(Color(red: 0.035, green: 0.12, blue: 0.14))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .background(Color(red: 0.60, green: 0.93, blue: 0.85), in: RoundedRectangle(cornerRadius: 7))
+                            }
+                            .buttonStyle(.plain)
+                            .opacity(canOpenDesktop ? 1 : 0.5)
+                            .disabled(!canOpenDesktop)
+                        }
+                    }
+                    .padding(23)
+                }
+                .frame(height: 210)
+
+                HStack(spacing: 0) {
+                    deviceAction("文件传输", icon: "folder.badge.plus") {
+                        tool = DeviceToolRequest(.files, host: host, name: connection.name(for: host), preferredAddress: preferredAddress)
+                    }
+                    Divider()
+                    deviceAction("观看模式", icon: "eye", enabled: canOpenDesktop) {
+                        openDesktop(host, viewOnly: true)
+                    }
+                    Divider()
+                    deviceAction("终端", icon: "terminal") {
+                        tool = DeviceToolRequest(.terminal, host: host, name: connection.name(for: host), preferredAddress: preferredAddress)
+                    }
+                    Divider()
+                    deviceAction("端口转发", icon: "point.3.connected.trianglepath.dotted") {
+                        tool = DeviceToolRequest(.forwarding, host: host, name: connection.name(for: host), preferredAddress: preferredAddress)
+                    }
+                }
+                .frame(height: 48)
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 11))
+            .overlay {
+                RoundedRectangle(cornerRadius: 11).strokeBorder(.quaternary)
+                    .allowsHitTesting(false)
+            }
+
+            if hasSession {
+                HStack {
+                    Label(connection.isViewOnly ? "观看模式已连接" : "远控已连接", systemImage: "checkmark.circle")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("断开连接") { connection.disconnect() }
+                }
+            }
+            notice(connection.controllerNotice)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func deviceAction(_ title: String, icon: String, enabled: Bool = true, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.callout.weight(.medium))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
+    private func openDesktop(_ host: NearbyHost, viewOnly: Bool) {
+        if connection.session?.hostID == host.id {
+            connection.switchSessionMode(viewOnly: viewOnly)
+            openWindow(id: "remote")
+        } else {
+            Task { await connection.verify(code: host.request, viewOnly: viewOnly) }
+        }
     }
 
     private var sharingCard: some View {
@@ -198,12 +382,24 @@ private struct ConnectionView: View {
                     .help("可粘贴到 Koko 或传给 koko-agent pair")
             }
             if let request = connection.pendingPair {
-                HStack {
+                VStack(alignment: .leading, spacing: 7) {
                     Text("设备 \(request.fingerprint) 请求查看和控制此 Mac")
-                    Spacer()
-                    Button("拒绝") { connection.respondToPairing(request, allow: false) }
-                    Button("允许") { connection.respondToPairing(request, allow: true) }
-                        .buttonStyle(.borderedProminent)
+                    Text("信任后，此设备在本机共享开启时可直接连接。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("拒绝") { connection.respondToPairing(request, allow: false) }
+                        Button("仅允许这次") { connection.respondToPairing(request, allow: true) }
+                        Button("信任并连接") { connection.respondToPairing(request, allow: true, remember: true) }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+            }
+            if connection.trustedDeviceCount > 0 {
+                HStack {
+                    Text("已信任 \(connection.trustedDeviceCount) 台设备")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("清除信任…") { connection.confirmForgetTrusted = true }
+                        .buttonStyle(.link)
                 }
             }
             notice(connection.hostNotice)
@@ -329,12 +525,8 @@ private struct ConnectionView: View {
                 if checking {
                     Text("正在检查…").foregroundStyle(.secondary)
                 } else {
-                    switch state {
-                    case .unknown: Text("待检查").foregroundStyle(.secondary)
-                    case .required: Text("未授权").foregroundStyle(.secondary)
-                    case .granted: Text("已授权").foregroundStyle(.green)
-                    case .failed: Text("检查失败").foregroundStyle(.red)
-                    }
+                    Text(state.title)
+                        .foregroundStyle(state == .granted ? Color.green : state == .failed ? Color.red : Color.secondary)
                 }
             }
             if state != .granted {

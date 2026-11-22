@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleDisplayName</key>
     <string>Koko</string>
+    <key>CFBundleIconFile</key>
+    <string>KoKo.icns</string>
     <key>CFBundleExecutable</key>
     <string>Koko</string>
     <key>CFBundleIdentifier</key>

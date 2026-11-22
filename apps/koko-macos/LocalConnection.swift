@@ -18,6 +18,15 @@ struct ConnectionNotice {
 
 enum ScreenPermission {
     case unknown, required, granted, failed
+
+    var title: String {
+        switch self {
+        case .unknown: "待检查"
+        case .required: "未授权"
+        case .granted: "已授权"
+        case .failed: "检查失败"
+        }
+    }
 }
 
 struct PendingPair {
@@ -62,7 +71,12 @@ enum FrameResolution: Int, CaseIterable, Identifiable {
         switch self {
         case .automatic: "自适应"
         case .original: "原始尺寸（最大 4096 px）"
-        default: display?.dimensions(edge: rawValue) ?? "\(rawValue) px（长边）"
+        default:
+            if let display, rawValue <= max(display.width, display.height) {
+                display.dimensions(edge: rawValue)
+            } else {
+                "\(rawValue) px（长边上限）"
+            }
         }
     }
 }
@@ -91,7 +105,23 @@ struct RemoteAction: Codable {
     var display: UInt32? = nil
     var edge: Int? = nil
     var quality: Int? = nil
+    var fps: Int? = nil
     var events: [RemotePointerEvent]? = nil
+    var videoSocket: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case action, x, y, key, text, display, edge, quality, fps, events
+        case videoSocket = "video_socket"
+    }
+}
+
+struct RemoteNetworkStats {
+    let rttMS: Int?
+    let frameMS: Int
+    var framesPerSecond: Double?
+    var kilobitsPerSecond: Double?
+    let direct: Bool?
+    var isVideo = false
 }
 
 private struct RemoteReply: Codable {
@@ -101,9 +131,13 @@ private struct RemoteReply: Codable {
     var image: String? = nil
     var hostName: String? = nil
     var displays: [RemoteDisplay]? = nil
+    var rttMS: Int? = nil
+    var direct: Bool? = nil
+    var video: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case status, png, code, image, displays
+        case status, png, code, image, displays, direct, video
+        case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
 }
@@ -113,7 +147,7 @@ private struct CommandError: LocalizedError {
 }
 
 @MainActor
-private struct LocalCommand {
+struct LocalCommand {
     let process = Process()
     private let output = Pipe()
     private let input: Pipe?
@@ -121,13 +155,17 @@ private struct LocalCommand {
     private let completion: AsyncStream<Int32>
 
     init(_ role: DeviceRole, arguments: [String], interactive: Bool = false) throws {
+        let tools = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers", isDirectory: true)
+        try self.init(executable: tools.appendingPathComponent(role.executable), arguments: arguments, interactive: interactive)
+    }
+
+    init(executable: URL, arguments: [String], interactive: Bool = false) throws {
         let (chunks, outputEvents) = AsyncStream<Data>.makeStream()
         let (completion, exitEvents) = AsyncStream<Int32>.makeStream()
         self.chunks = chunks
         self.completion = completion
 
-        let tools = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers", isDirectory: true)
-        process.executableURL = tools.appendingPathComponent(role.executable)
+        process.executableURL = executable
         process.arguments = arguments
         input = interactive ? Pipe() : nil
         if let input {
@@ -250,7 +288,8 @@ private final class RemoteChannel {
 
 @MainActor
 final class LocalConnection: ObservableObject {
-    @Published var listenPort = "4444"
+    static let frameRates = [30, 60, 90, 120, 144, 165, 240]
+    @Published var listenPort = UserDefaults.standard.string(forKey: "listenPort") ?? "4444"
     @Published var inviteInput = ""
     @Published private(set) var controllerID = ""
     @Published private(set) var hostID = ""
@@ -260,6 +299,8 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
     @Published private(set) var pendingPair: PendingPair?
+    @Published private(set) var trustedDeviceCount = 0
+    @Published var confirmForgetTrusted = false
     @Published private(set) var controllerNotice: ConnectionNotice?
     @Published private(set) var hostNotice: ConnectionNotice?
     @Published private(set) var screenPermission = ScreenPermission.unknown
@@ -268,33 +309,63 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var isCheckingInputPermission = false
     @Published var showsHostPermissionGuide = false
     @Published private(set) var isScanning = false
-    @Published private(set) var nearbyHosts: [NearbyHost] = []
+    @Published private var discoveredHosts: [NearbyHost] = []
+    @Published private(set) var deviceNames = UserDefaults.standard.dictionary(forKey: "deviceNames") as? [String: String] ?? [:] {
+        didSet { UserDefaults.standard.set(deviceNames, forKey: "deviceNames") }
+    }
+    @Published private(set) var hiddenDevices = UserDefaults.standard.stringArray(forKey: "hiddenDevices") ?? [] {
+        didSet { UserDefaults.standard.set(hiddenDevices, forKey: "hiddenDevices") }
+    }
+    @Published var selectedNearbyHostID: String?
     @Published private(set) var session: PairedHost?
+    @Published private(set) var isViewOnly = false
     @Published private(set) var remoteFrame: NSImage?
+    @Published private(set) var frameDisplayID: UInt32?
+    @Published private(set) var networkStats: RemoteNetworkStats?
     @Published private(set) var remoteHostName = ""
     @Published private(set) var displays: [RemoteDisplay] = []
     @Published private(set) var selectedDisplay: RemoteDisplay?
     @Published var frameQuality = FrameQuality.automatic
     @Published var frameResolution = FrameResolution.automatic
+    @Published var targetFPS = 60
+    @Published private(set) var remoteVideoSize: CGSize?
     @Published var showTextControls = false
+    @Published var showDisplayControls = false
+    @Published var showNetworkStats = false
+    @Published var showControlCenter = false
     @Published private(set) var screenNotice: ConnectionNotice?
     @Published private(set) var inputNotice: ConnectionNotice?
     @Published private(set) var isSendingInput = false
     @Published var remoteText = ""
     let localHostName = Host.current().localizedName ?? "此 Mac"
 
+    var nearbyHosts: [NearbyHost] {
+        discoveredHosts.filter { !hiddenDevices.contains($0.id) }
+    }
+
     private let identityDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".koko", isDirectory: true)
     private var hostCommand: LocalCommand?
     private var isCapturingScreen = false
     private var checkProcess: Process?
-    private let hostPointer = DesktopPointer()
+    private let hostPointer = DesktopInput()
     private var frameChannel: RemoteChannel?
+    let videoSurface = VideoSurface()
+    private var videoSettings: VideoSettings?
+    private var videoReceiver: VideoReceiver?
+    private var videoTask: Task<Void, Never>?
+    private var videoRetryAfter = ContinuousClock.now
+    private var lastVideoFrameAt: ContinuousClock.Instant?
+    private(set) var supportsVideo = false
+
+    var displayedSize: CGSize? { remoteVideoSize ?? remoteFrame?.size }
     private var pointerChannel: RemoteChannel?
     private var pointerQueue: [(display: UInt32, event: RemotePointerEvent)] = []
     private var pointerTask: Task<Void, Never>?
     private var displayRefresh = Date.distantPast
     private var captureTime = 0.18
+    private var lastFrameAt: ContinuousClock.Instant?
+    private var cachedFrames: [UInt32: NSImage] = [:]
     private var viewportEdge = 1600
     private var stopRequested = false
     private var cancelRequested = false
@@ -308,7 +379,11 @@ final class LocalConnection: ObservableObject {
             let id = try await command.result()
             switch role {
             case .controller: controllerID = id
-            case .host: hostID = id
+            case .host:
+                hostID = id
+                if let peers = try? String(contentsOf: trustedDeviceFile, encoding: .utf8) {
+                    trustedDeviceCount = peers.split(whereSeparator: \.isNewline).count
+                }
             }
         } catch {
             let notice = ConnectionNotice(message: error.localizedDescription, isError: true)
@@ -351,7 +426,7 @@ final class LocalConnection: ObservableObject {
         do {
             let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
             let command = try LocalCommand(.host, arguments: [
-                "serve-pair", keyPath(for: .host), address, "--app-desktop",
+                "serve-pair", keyPath(for: .host), address, "--app-desktop", localHostName,
             ], interactive: true)
             hostCommand = command
             _ = try await command.result(collectOutput: false, onLine: updatePairingStatus)
@@ -377,7 +452,7 @@ final class LocalConnection: ObservableObject {
         case "Session closed":
             isSharingWithPeer = false
             hostPointer.release()
-            hostNotice = ConnectionNotice(message: "远程会话已结束。重启远程协助可发新授权码。")
+            hostNotice = ConnectionNotice(message: "远程会话已结束。仍可从局域网重新连接。")
         case "Pair declined", "Pair request ended":
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
@@ -386,7 +461,11 @@ final class LocalConnection: ObservableObject {
             directInvite = ""
             hostNotice = ConnectionNotice(message: "授权码已过期，仍可通过局域网搜索申请控制。")
         default:
-            if line.hasPrefix("Pair code: ") {
+            if line.hasPrefix("Trusted devices: "), let count = Int(line.dropFirst("Trusted devices: ".count)) {
+                trustedDeviceCount = count
+            } else if line.hasPrefix("Trust storage failed: ") {
+                hostNotice = ConnectionNotice(message: "无法保存设备信任。请检查 Koko 的数据目录。", isError: true)
+            } else if line.hasPrefix("Pair code: ") {
                 connectionCode = String(line.dropFirst("Pair code: ".count))
                 hostNotice = ConnectionNotice(message: "连接码 5 分钟内有效，授权一次后失效。")
             } else if line.hasPrefix("Pair invite: ") {
@@ -433,12 +512,20 @@ final class LocalConnection: ObservableObject {
                     return RemoteDisplay(id: id, name: screen.localizedName, width: mode.pixelWidth, height: mode.pixelHeight)
                 }
                 let ordered = displays.filter { $0.id == main } + displays.filter { $0.id != main }
-                return RemoteReply(status: "displays", hostName: localHostName, displays: ordered)
+                return RemoteReply(status: "displays", hostName: localHostName, displays: ordered, video: true)
+            case "video":
+                guard let display = action.display, let edge = action.edge, let quality = action.quality,
+                      let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
+                let settings = VideoSettings(display: display, edge: edge, quality: quality, fps: fps)
+                Task { await streamDesktopVideo(settings, socket: socket) }
             case "screenshot", "capture":
                 guard !isCapturingScreen else { return RemoteReply(status: "error", code: "capture_busy") }
                 isCapturingScreen = true
                 defer { isCapturingScreen = false }
-                let bytes = try await captureScreen(displayID: action.display, edge: action.edge ?? 1600, quality: action.quality)
+                let bytes = try await captureScreen(
+                    displayID: action.display, edge: action.edge ?? 1600,
+                    quality: action.quality, showsCursor: action.action == "screenshot"
+                )
                 screenPermission = .granted
                 let image = bytes.base64EncodedString()
                 return action.action == "screenshot"
@@ -475,13 +562,63 @@ final class LocalConnection: ObservableObject {
         }
     }
 
-    func respondToPairing(_ request: PendingPair, allow: Bool) {
+    func respondToPairing(_ request: PendingPair, allow: Bool, remember: Bool = false) {
         do {
-            try hostCommand?.send("\(allow ? "approve" : "decline") \(request.number)")
+            let action = allow ? (remember ? "remember" : "approve") : "decline"
+            try hostCommand?.send("\(action) \(request.number)")
             pendingPair = nil
         } catch {
             hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
         }
+    }
+
+    private var trustedDeviceFile: URL {
+        identityDirectory.appendingPathComponent("trusted-controllers")
+    }
+
+    func forgetTrustedDevices() {
+        do {
+            if let hostCommand {
+                try hostCommand.send("forget-trusted")
+            } else {
+                try FileManager.default.removeItem(at: trustedDeviceFile)
+                trustedDeviceCount = 0
+            }
+        } catch {
+            hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
+        }
+    }
+
+    var selectedNearbyHost: NearbyHost? {
+        nearbyHosts.first(where: { $0.id == selectedNearbyHostID })
+    }
+
+    func name(for host: NearbyHost) -> String {
+        deviceNames[host.id] ?? host.label
+    }
+
+    func rename(_ host: NearbyHost, to name: String) {
+        let label = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(64))
+        deviceNames[host.id] = label.isEmpty ? nil : label
+    }
+
+    func hide(_ host: NearbyHost) {
+        hiddenDevices.append(host.id)
+        if selectedNearbyHostID == host.id { selectedNearbyHostID = nil }
+    }
+
+    func restoreHiddenDevices() {
+        hiddenDevices.removeAll()
+    }
+
+    func switchSessionMode(viewOnly: Bool) {
+        if viewOnly {
+            pointerQueue.removeAll()
+            if let display = selectedDisplay, pointerChannel != nil {
+                queuePointer(.init(kind: .release), display: display.id)
+            }
+        }
+        isViewOnly = viewOnly
     }
 
     func stopHosting() {
@@ -495,11 +632,11 @@ final class LocalConnection: ObservableObject {
         if let process = hostCommand?.process, process.isRunning { process.interrupt() }
     }
 
-    func verify(code: String) async {
+    func verify(code: String, viewOnly: Bool = false) async {
         isChecking = true
         cancelRequested = false
         controllerNotice = ConnectionNotice(message: code.hasPrefix("koko://request/")
-            ? "等待被控端同意远程控制…" : "正在使用授权码连接…")
+            ? "正在连接局域网设备…" : "正在使用授权码连接…")
         defer {
             checkProcess = nil
             isChecking = false
@@ -511,7 +648,11 @@ final class LocalConnection: ObservableObject {
             ])
             checkProcess = command.process
             let reply = try await command.result()
-            session = try JSONDecoder().decode(PairedHost.self, from: Data(reply.utf8))
+            let host = try JSONDecoder().decode(PairedHost.self, from: Data(reply.utf8))
+            let defaultFPS = UserDefaults.standard.integer(forKey: "defaultFrameRate")
+            targetFPS = Self.frameRates.contains(defaultFPS) ? defaultFPS : 60
+            isViewOnly = viewOnly
+            session = host
             controllerNotice = nil
         } catch {
             let message = error.localizedDescription
@@ -532,12 +673,13 @@ final class LocalConnection: ObservableObject {
     }
 
     func scanLAN() async {
+        guard !isScanning else { return }
         isScanning = true
         defer { isScanning = false }
         do {
             let command = try LocalCommand(.controller, arguments: ["discover"])
             let result = try await command.result()
-            nearbyHosts = try JSONDecoder().decode([NearbyHost].self, from: Data(result.utf8))
+            discoveredHosts = try JSONDecoder().decode([NearbyHost].self, from: Data(result.utf8))
                 .filter { $0.id != hostID }
             controllerNotice = nearbyHosts.isEmpty
                 ? ConnectionNotice(message: "未发现可连接的 Koko 设备。") : nil
@@ -550,7 +692,7 @@ final class LocalConnection: ObservableObject {
         guard let session else { return }
         while !Task.isCancelled && self.session == session {
             let changed = await refreshFrame(session)
-            try? await Task.sleep(for: changed ? .milliseconds(90) : .seconds(1))
+            try? await Task.sleep(for: supportsVideo ? .milliseconds(300) : changed ? .milliseconds(90) : .seconds(1))
         }
     }
 
@@ -565,7 +707,11 @@ final class LocalConnection: ObservableObject {
                     screenNotice = remoteError(reply.code ?? "display_unavailable")
                     return false
                 }
-                if self.displays != displays { self.displays = displays }
+                if self.displays != displays {
+                    self.displays = displays
+                    let available = Set(displays.map(\.id))
+                    cachedFrames = cachedFrames.filter { available.contains($0.key) }
+                }
                 if let selectedDisplay, let current = displays.first(where: { $0.id == selectedDisplay.id }) {
                     if selectedDisplay != current { self.selectedDisplay = current }
                 } else {
@@ -573,9 +719,24 @@ final class LocalConnection: ObservableObject {
                 }
                 let name = reply.hostName ?? "远程 Mac"
                 if remoteHostName != name { remoteHostName = name }
+                supportsVideo = reply.video == true
                 displayRefresh = .now
             }
             guard let selectedDisplay else { return false }
+            if supportsVideo {
+                let edge = frameResolution == .automatic ? max(480, min(4096, (viewportEdge / 128) * 128)) : frameResolution.rawValue
+                let quality = frameQuality == .automatic ? 70 : frameQuality.rawValue
+                let settings = VideoSettings(display: selectedDisplay.id, edge: edge, quality: quality, fps: targetFPS)
+                if videoSettings != settings || (videoTask == nil && ContinuousClock.now >= videoRetryAfter) {
+                    startVideo(session, settings: settings)
+                } else if let lastVideoFrameAt, ContinuousClock.now - lastVideoFrameAt > .seconds(1),
+                          var idle = networkStats, idle.framesPerSecond != 0 {
+                    idle.framesPerSecond = 0
+                    idle.kilobitsPerSecond = 0
+                    networkStats = idle
+                }
+                return true
+            }
             let edge = frameResolution == .automatic
                 ? max(480, min(4096, Int(Double(viewportEdge) * (captureTime > 0.35 ? 0.60 : captureTime > 0.20 ? 0.85 : 1))))
                 : frameResolution.rawValue
@@ -584,36 +745,152 @@ final class LocalConnection: ObservableObject {
                 : frameQuality.rawValue
             let start = ContinuousClock.now
             let reply = try await channel.send(.init(action: "capture", display: selectedDisplay.id, edge: edge, quality: quality))
-            guard frameChannel === channel, self.selectedDisplay?.id == selectedDisplay.id else { return false }
+            guard frameChannel === channel else { return false }
+            guard self.selectedDisplay?.id == selectedDisplay.id else { return true }
             if reply.status == "image", let image = reply.image, let bytes = Data(base64Encoded: image),
                let frame = NSImage(data: bytes) {
-                let elapsed = (ContinuousClock.now - start).components
-                let seconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+                let now = ContinuousClock.now
+                let seconds = (now - start).secondsValue
                 captureTime = captureTime * 0.80 + seconds * 0.20
+                let interval = lastFrameAt.map { (now - $0).secondsValue }
+                networkStats = RemoteNetworkStats(
+                    rttMS: reply.rttMS,
+                    frameMS: Int(seconds * 1000),
+                    framesPerSecond: interval.map { 1 / $0 },
+                    kilobitsPerSecond: interval.map { Double(bytes.count) * 8 / $0 / 1000 },
+                    direct: reply.direct
+                )
+                lastFrameAt = now
+                cachedFrames[selectedDisplay.id] = frame
                 remoteFrame = frame
+                if frameDisplayID != selectedDisplay.id { frameDisplayID = selectedDisplay.id }
                 if screenNotice != nil { screenNotice = nil }
                 return true
             }
-            remoteFrame = nil
+            if frameDisplayID != nil { frameDisplayID = nil }
+            networkStats = nil
             if reply.code == "display_unavailable" { displayRefresh = .distantPast }
             screenNotice = remoteError(reply.code)
         } catch {
             if self.session == session && !Task.isCancelled {
                 frameChannel?.close()
                 frameChannel = nil
-                remoteFrame = nil
+                frameDisplayID = nil
+                networkStats = nil
+                lastFrameAt = nil
                 screenNotice = remoteError(error.localizedDescription)
+                stopVideo()
             }
         }
         return false
     }
 
+    private func startVideo(_ session: PairedHost, settings: VideoSettings) {
+        stopVideo()
+        videoSettings = settings
+        do {
+            let receiver = try VideoReceiver(keyPath: keyPath(for: .controller), host: session, settings: settings)
+            videoReceiver = receiver
+            videoTask = Task { await receiveVideo(receiver, settings: settings) }
+        } catch {
+            screenNotice = remoteError("capture_failed")
+            videoRetryAfter = .now.advanced(by: .seconds(1))
+        }
+    }
+
+    private func receiveVideo(_ receiver: VideoReceiver, settings: VideoSettings) async {
+        let started = ContinuousClock.now
+        var measurementStarted = started
+        var frameCount = 0
+        var byteCount = 0
+        var firstFrameMS: Int?
+        var size: CGSize?
+        var rtt: Int?
+        var direct: Bool?
+        var failure = "capture_failed"
+        do {
+            records: while let (kind, bytes) = try await receiver.next() {
+                guard videoReceiver === receiver, !Task.isCancelled else { return }
+                switch kind {
+                case .path:
+                    if bytes.count == 9 {
+                        rtt = bytes.prefix(8).reduce(0) { ($0 << 8) | Int($1) }
+                        direct = bytes.last == 1
+                    }
+                case .error:
+                    failure = String(decoding: bytes, as: UTF8.self)
+                    break records
+                case .format:
+                    size = try videoSurface.setFormat(bytes)
+                case .frame:
+                    guard selectedDisplay?.id == settings.display else { continue }
+                    while !videoSurface.isReadyForMoreMediaData {
+                        if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
+                        try await Task.sleep(for: .milliseconds(2))
+                        guard videoReceiver === receiver else { return }
+                    }
+                    guard selectedDisplay?.id == settings.display else { continue }
+                    try videoSurface.enqueue(bytes)
+                    let now = ContinuousClock.now
+                    lastVideoFrameAt = now
+                    if firstFrameMS == nil {
+                        let frameMS = Int((now - started).secondsValue * 1000)
+                        firstFrameMS = frameMS
+                        measurementStarted = now
+                        frameDisplayID = settings.display
+                        remoteVideoSize = size
+                        screenNotice = nil
+                        networkStats = RemoteNetworkStats(rttMS: rtt, frameMS: frameMS,
+                                                          framesPerSecond: nil, kilobitsPerSecond: nil,
+                                                          direct: direct, isVideo: true)
+                    }
+                    frameCount += 1
+                    byteCount += bytes.count
+                    let seconds = (now - measurementStarted).secondsValue
+                    if seconds >= 1, let firstFrameMS {
+                        networkStats = RemoteNetworkStats(
+                            rttMS: rtt, frameMS: firstFrameMS, framesPerSecond: Double(frameCount) / seconds,
+                            kilobitsPerSecond: Double(byteCount) * 8 / seconds / 1000, direct: direct, isVideo: true
+                        )
+                        measurementStarted = now
+                        frameCount = 0
+                        byteCount = 0
+                    }
+                }
+            }
+        } catch {
+            failure = (error as? VideoError)?.rawValue ?? error.localizedDescription
+        }
+        guard videoReceiver === receiver, !Task.isCancelled else { return }
+        frameDisplayID = nil
+        networkStats = nil
+        screenNotice = remoteError(failure)
+        stopVideo()
+        videoRetryAfter = .now.advanced(by: failure == "video_busy" ? .milliseconds(300) : .seconds(1))
+        if failure == "display_unavailable" { displayRefresh = .distantPast }
+    }
+
+    private func stopVideo() {
+        videoTask?.cancel()
+        videoTask = nil
+        videoReceiver?.close()
+        videoReceiver = nil
+        lastVideoFrameAt = nil
+    }
+
     func selectDisplay(_ display: RemoteDisplay) {
         guard selectedDisplay?.id != display.id else { return }
-        if let selectedDisplay { queuePointer(.init(kind: .release), display: selectedDisplay.id) }
-        remoteFrame = nil
+        if let selectedDisplay, pointerChannel != nil || pointerTask != nil {
+            queuePointer(.init(kind: .release), display: selectedDisplay.id)
+        }
+        if let cached = cachedFrames[display.id] { remoteFrame = cached }
+        frameDisplayID = nil
         screenNotice = nil
         selectedDisplay = display
+    }
+
+    func refreshDisplays() {
+        displayRefresh = .distantPast
     }
 
     func setViewportEdge(_ edge: Int) {
@@ -622,6 +899,7 @@ final class LocalConnection: ObservableObject {
 
     func queuePointer(_ event: RemotePointerEvent, display: UInt32) {
         guard let session else { return }
+        guard !isViewOnly || event.kind == .release else { return }
         if event.kind == .move, inputNotice != nil { return }
         if let last = pointerQueue.last, last.display == display,
            last.event.kind == .move, event.kind == .move {
@@ -678,7 +956,7 @@ final class LocalConnection: ObservableObject {
     }
 
     func sendInput(_ action: RemoteAction) async {
-        guard !isSendingInput, let session else { return }
+        guard !isViewOnly, !isSendingInput, let session else { return }
         isSendingInput = true
         defer { isSendingInput = false }
         do {
@@ -708,13 +986,17 @@ final class LocalConnection: ObservableObject {
         case "input_permission_required":
             message = "被控端需要授予辅助功能权限，才能接收键鼠。"
         case "capture_busy":
-            message = "被控端正在采集画面，请稍后点「刷新画面」。"
+            message = "被控端正在采集画面，正在自动重试。"
         case "display_unavailable":
             message = "这个显示器已离线，正在检查可用的显示器。"
         case "invalid_command":
             message = "请让两端使用同一版本的 Koko。"
         case "capture_failed":
-            message = "被控端未能采集所选显示器，请检查登录会话和录屏权限。"
+            message = "等待被控端画面。锁屏时可从控制中心打开 macOS 屏幕共享。"
+        case "video_codec_failed", "video_packet_invalid":
+            message = "无法解码当前画面，请试试降低分辨率或目标帧率。"
+        case "video_busy":
+            message = "正在切换视频流…"
         case "input_failed":
             message = "被控端未能发送键鼠事件。"
         default:
@@ -728,7 +1010,20 @@ final class LocalConnection: ObservableObject {
     func disconnect() {
         let disconnected = session
         session = nil
+        isViewOnly = false
         remoteFrame = nil
+        remoteVideoSize = nil
+        videoSurface.clear()
+        stopVideo()
+        videoSettings = nil
+        supportsVideo = false
+        frameDisplayID = nil
+        cachedFrames.removeAll()
+        networkStats = nil
+        lastFrameAt = nil
+        showDisplayControls = false
+        showNetworkStats = false
+        showControlCenter = false
         screenNotice = nil
         inputNotice = nil
         remoteText = ""
@@ -764,5 +1059,11 @@ final class LocalConnection: ObservableObject {
 
     private func keyPath(for role: DeviceRole) -> String {
         identityDirectory.appendingPathComponent(role.keyFilename).path
+    }
+}
+
+private extension Duration {
+    var secondsValue: Double {
+        Double(components.seconds) + Double(components.attoseconds) / 1e18
     }
 }

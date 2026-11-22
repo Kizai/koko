@@ -14,7 +14,7 @@
 | :--- | :--- | :--- | :--- |
 | **P2P 传输与打洞 (`koko-p2p`)** | [iroh](https://github.com/n0-computer/iroh) | 纯 Rust 实现的 QUIC + NAT 穿透 + 中继回落；按公钥（`NodeId`）拨号，天然端到端加密；单条连接支持多路复用 Stream，完美同时承载视频流与 Agent RPC | WebRTC（适合浏览器直连，但信令复杂、DataChannel 承载结构化 RPC 较笨重，留待后续 Web 网关扩展） |
 | **MCP 协议层 (`koko-agent`)** | [rmcp](https://github.com/modelcontextprotocol/rust-sdk) | 官方 Rust MCP SDK，支持 `#[tool]` 宏与 stdio / HTTP 传输，直接将远端设备暴露为 Claude / OpenAI / 本地模型的标准工具节点 | 自研 JSON-RPC（维护成本高，生态兼容性差） |
-| **屏幕采集** | macOS 测试包使用 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) | 图形版由 Koko.app 进程按需采集选中的显示器并编码 JPEG，原有单帧 CLI 仍可请求主屏 PNG | 其他平台可评估 [xcap](https://github.com/nashaofu/xcap)，高帧率流另行验证 [scap](https://github.com/CapSoftware/scap) 或原生方案 |
+| **屏幕采集** | macOS 使用 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) 和 [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) | Koko.app 连续采集所选显示器。被控端通过当前用户私有的 Unix socket 将 H.264 送入已授权的 QUIC 视频流。控制端用 AVFoundation 显示。CLI 截图保持主屏 PNG | 其他平台可评估 [xcap](https://github.com/nashaofu/xcap)、[scap](https://github.com/CapSoftware/scap) 或原生方案 |
 | **键鼠注入** | macOS 测试包使用 [Core Graphics](https://developer.apple.com/documentation/coregraphics/cgevent) | 画面与鼠标使用独立连接，按显示器映射坐标，顺序传递按钮与拖拽事件 | 其他平台可评估 [enigo](https://github.com/enigo-rs/enigo)，Wayland 支持按实际输入后端验证 |
 | **桌面客户端 (`koko-client`)** | [Tauri v2](https://github.com/tauri-apps/tauri)（MVP 首选） | 研发效率高、包体小，极适合快速构建“设备列表 + 实时旁观画面 + Agent 操作日志/审批面板 + 一键接管悬浮条” | 若明确要第一时间做 iOS/Android 且追求零拷贝纹理渲染，改用 Flutter + [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge)；若追求纯 Rust 极简分发可选 [Slint](https://github.com/slint-ui/slint) |
 
@@ -87,7 +87,7 @@ flowchart LR
 
 身份与连接工作项在一条双向流上验证授权。每个方向发送一帧，格式依次为 `0x01`、四字节大端载荷长度和 JSON 字符串。控制端发 `"hello"`，授权后的主机回 `"ready"`。本轮使用固定的七字节 JSON 载荷。主机在读取请求前根据 QUIC 握手确认的公钥检查授权名单，检查完成后由控制端关闭连接。
 
-短连接码通过独立的 `koko/pair/1` QUIC ALPN 配对。发现服务公布主机公钥、地址以及连接码与该公钥绑定的摘要。控制端通过 QUIC 验证主机公钥，连接码只在加密连接内提交。组网直连邀请提供公钥和候选 IPv4 地址。有效授权码直接授予当前会话的查看与键鼠权限。局域网搜索只发现设备，从列表发出的无授权码请求需要被控端本机批准。
+短连接码通过独立的 `koko/pair/1` QUIC ALPN 配对。发现服务公布主机名、公钥、地址以及连接码与该公钥绑定的摘要。控制端通过 QUIC 验证主机公钥，连接码只在加密连接内提交。组网直连邀请提供公钥和候选 IPv4 地址。有效授权码直接授予当前会话的查看与键鼠权限。局域网首次连接由被控端确认。被控端可以把控制端公钥保存为信任设备，在本机共享开启时允许其直接重连。
 
 macOS 测试版使用 `koko/remote/1` 在独立 QUIC 流中传递有限长度的 JSON 命令和响应。主机检查当前授权控制端公钥，采集和输入通过包内 helper 调用 ScreenCaptureKit 和 Core Graphics。初版支持主屏 PNG、比例坐标点击、文本、明确的常用按键及断开会话。上表中的 Media 与 Agent RPC 是后续协议规划。
 

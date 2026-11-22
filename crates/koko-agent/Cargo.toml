@@ -9,4 +9,4 @@ iroh.workspace = true
 koko-p2p.workspace = true
 koko-proto.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }

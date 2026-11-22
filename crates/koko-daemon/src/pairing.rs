@@ -1,7 +1,9 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
+use std::path::Path;
 
 use iroh::{
     EndpointId, SecretKey,
@@ -84,29 +86,38 @@ impl ProtocolHandler for Pairing {
 pub(crate) async fn serve(
     key: SecretKey,
     address: SocketAddr,
-    use_app_desktop: bool,
+    app: Option<(&Path, &str)>,
 ) -> Result<(), Box<dyn Error>> {
     if !address.is_ipv4() {
         return Err("pairing requires an IPv4 listen address".into());
     }
+
+    let trust_file = app.map(|(file, _)| file.with_file_name("trusted-controllers"));
+    let mut trusted = match trust_file.as_deref() {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .lines()
+                .filter_map(|line| line.parse().ok())
+                .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(error) => return Err(error.into()),
+        },
+        None => BTreeSet::new(),
+    };
 
     let endpoint = bind_host(key, address).await?;
     let address = endpoint.bound_sockets()[0];
     let code = InviteCode::generate();
     let display_code = code.to_string();
     let direct = direct_invite(&listening_target(endpoint.id(), address)?, &code);
-    let mut advertisement = match publish_invite(endpoint.id(), address, &code) {
-        Ok(advertisement) => Some(advertisement),
-        Err(error) => {
-            eprintln!("Discovery unavailable: {error}");
-            None
-        }
-    };
-    let mut stop_discovery = || {
-        if let Some(advertisement) = advertisement.take() {
-            let _ = advertisement.shutdown();
-        }
-    };
+    let advertisement =
+        match publish_invite(endpoint.id(), address, &code, app.map(|(_, name)| name)) {
+            Ok(advertisement) => Some(advertisement),
+            Err(error) => {
+                eprintln!("Discovery unavailable: {error}");
+                None
+            }
+        };
     let (allow_peer, allowed_peer) = watch::channel(None);
     let (requests, mut incoming) = mpsc::channel(1);
     let (app_desktop, mut desktop_requests) = AppDesktop::channel();
@@ -115,8 +126,10 @@ pub(crate) async fn serve(
             REMOTE_ALPN,
             RemoteHost {
                 allowed_peer: allow_peer.clone(),
-                app_desktop: use_app_desktop.then_some(app_desktop),
+                app_desktop: app.is_some().then_some(app_desktop),
                 pointer: tokio::sync::Mutex::new(()),
+                #[cfg(unix)]
+                video: tokio::sync::Mutex::new(()),
             },
         )
         .accept(ALPN, Host { allowed_peer })
@@ -124,6 +137,7 @@ pub(crate) async fn serve(
         .spawn();
 
     println!("Listening on {address}");
+    println!("Trusted devices: {}", trusted.len());
     println!("Pair code: {display_code}");
     if let Some(direct) = direct {
         println!("Pair invite: {direct}");
@@ -157,31 +171,55 @@ pub(crate) async fn serve(
                 println!("Pair code expired");
             }
             Some(request) = incoming.recv() => {
-                if open && request.by_code && !request.decision.is_closed() {
+                if request.decision.is_closed() {
+                    continue;
+                }
+                if allow_peer.borrow().is_some() {
+                    let _ = request.decision.send(false);
+                    continue;
+                }
+                if (open && request.by_code) || (!request.by_code && trusted.contains(&request.peer)) {
+                    println!("Pair approved");
                     allow_peer.send_replace(Some(request.peer));
                     let _ = request.decision.send(true);
                     open = false;
                     pending = None;
-                    incoming.close();
-                    stop_discovery();
-                    println!("Pair approved");
-                } else if allow_peer.borrow().is_none() && !request.by_code
+                } else if !request.by_code
                     && pending.as_ref().is_none_or(|(_, current)| current.decision.is_closed())
                 {
                     request_number += 1;
                     println!("Pair request: {request_number} {}", request.peer.fmt_short());
                     pending = Some((request_number, request));
+                } else {
+                    let _ = request.decision.send(false);
                 }
             }
             Some(request) = desktop_requests.recv() => app_desktops.request(request),
             command = commands.recv() => {
                 let Some(command) = command else { break; };
+                if command == "forget-trusted" {
+                    if let Some(path) = &trust_file {
+                        if let Err(error) = save_trusted(path, &BTreeSet::new()) {
+                            eprintln!("Trust storage failed: {error}");
+                            continue;
+                        }
+                        trusted.clear();
+                        allow_peer.send_if_modified(|peer| {
+                            if peer.is_none() { return false; }
+                            println!("Session closed");
+                            *peer = None;
+                            true
+                        });
+                        println!("Trusted devices: 0");
+                    }
+                    continue;
+                }
                 let Some((action, number)) = command.split_once(' ') else { continue; };
                 if action == "desktop-reply" {
                     app_desktops.reply(number);
                     continue;
                 }
-                if !matches!(action, "approve" | "decline")
+                if !matches!(action, "approve" | "decline" | "remember")
                     || pending.as_ref().is_none_or(|(id, _)| number.parse::<u64>() != Ok(*id))
                 {
                     continue;
@@ -193,18 +231,37 @@ pub(crate) async fn serve(
                     let _ = request.decision.send(false);
                     println!("Pair declined");
                 } else {
+                    if action == "remember" && let Some(path) = &trust_file {
+                        trusted.insert(request.peer);
+                        if let Err(error) = save_trusted(path, &trusted) {
+                            trusted.remove(&request.peer);
+                            eprintln!("Trust storage failed: {error}");
+                        } else {
+                            println!("Trusted devices: {}", trusted.len());
+                        }
+                    }
+                    println!("Pair approved");
                     allow_peer.send_replace(Some(request.peer));
                     let _ = request.decision.send(true);
                     open = false;
-                    incoming.close();
-                    stop_discovery();
-                    println!("Pair approved");
                 }
             }
         }
     }
-    stop_discovery();
+    if let Some(advertisement) = advertisement {
+        let _ = advertisement.shutdown();
+    }
     router.shutdown().await?;
+    Ok(())
+}
+
+fn save_trusted(path: &Path, trusted: &BTreeSet<EndpointId>) -> io::Result<()> {
+    let mut file =
+        tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    for peer in trusted {
+        writeln!(file, "{peer}")?;
+    }
+    file.persist(path)?;
     Ok(())
 }
 

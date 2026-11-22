@@ -8,6 +8,9 @@ pub const REMOTE_ALPN: &[u8] = b"koko/remote/1";
 pub const CONTROL_REQUEST: &[u8] = b"request";
 pub const MAX_REMOTE_REQUEST: usize = 8192;
 pub const MAX_REMOTE_REPLY: usize = 16 * 1024 * 1024;
+pub const MAX_VIDEO_PACKET: usize = 8 * 1024 * 1024;
+pub const VIDEO_ERROR: u8 = 3;
+pub const VIDEO_PATH: u8 = 4;
 
 // The first byte is the Control channel, then a big-endian u32 and its JSON payload.
 pub const CONTROL_HELLO: &[u8] = b"\x01\x00\x00\x00\x07\"hello\"";
@@ -23,6 +26,12 @@ pub enum RemoteCommand {
         display: u32,
         edge: u16,
         quality: u8,
+    },
+    Video {
+        display: u32,
+        edge: u16,
+        quality: u8,
+        fps: u16,
     },
     Pointer {
         display: u32,
@@ -82,6 +91,15 @@ pub enum PointerEvent {
         dx: i16,
         dy: i16,
     },
+    KeyDown {
+        code: u8,
+        flags: u8,
+        repeat: bool,
+    },
+    KeyUp {
+        code: u8,
+        flags: u8,
+    },
     Release,
 }
 
@@ -91,6 +109,9 @@ impl PointerEvent {
             Self::Move { x, y } | Self::Up { x, y, .. } => (x, y),
             Self::Down { x, y, clicks, .. } if (1..=3).contains(&clicks) => (x, y),
             Self::Scroll { x, y, dx, dy } if dx != 0 || dy != 0 => (x, y),
+            Self::KeyDown { code, flags, .. } | Self::KeyUp { code, flags } => {
+                return code <= 127 && flags & !0xbf == 0;
+            }
             Self::Release => return true,
             _ => return false,
         };
@@ -149,6 +170,8 @@ pub enum RemoteReply {
     Displays {
         host_name: String,
         displays: Vec<RemoteDisplay>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        video: bool,
     },
     Error {
         code: String,
@@ -168,7 +191,16 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             display,
             edge,
             quality,
-        } => *display != 0 && (320..=4096).contains(edge) && (20..=95).contains(quality),
+        } => valid_capture(*display, *edge, *quality),
+        RemoteCommand::Video {
+            display,
+            edge,
+            quality,
+            fps,
+        } => {
+            valid_capture(*display, *edge, *quality)
+                && matches!(fps, 30 | 60 | 90 | 120 | 144 | 165 | 240)
+        }
         RemoteCommand::Pointer { display, events } => {
             *display != 0
                 && (1..=32).contains(&events.len())
@@ -182,4 +214,8 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
         | RemoteCommand::Displays
         | RemoteCommand::Key { .. } => true,
     }
+}
+
+fn valid_capture(display: u32, edge: u16, quality: u8) -> bool {
+    display != 0 && (320..=4096).contains(&edge) && (20..=95).contains(&quality)
 }
