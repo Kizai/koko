@@ -5,7 +5,7 @@
     <key>CFBundleDisplayName</key>
     <string>Koko</string>
     <key>CFBundleIconFile</key>
-    <string>KoKo.icns</string>
+    <string>KoKoMark.icns</string>
     <key>CFBundleExecutable</key>
     <string>Koko</string>
     <key>CFBundleIdentifier</key>
@@ -24,6 +24,12 @@
     <array>
         <string>_koko-pair._udp</string>
     </array>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>KoKo 在你复制或接收文件时，需要访问桌面文件夹中的相应文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>KoKo 在你复制或接收文件时，需要访问文稿文件夹中的相应文件。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>KoKo 在你复制或接收文件时，需要访问下载文件夹中的相应文件。</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Koko 使用录屏权限，供你向已授权的设备共享主显示器画面。</string>
 </dict>

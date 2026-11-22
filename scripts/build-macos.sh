@@ -83,7 +83,8 @@ for points in 16 32 128 256 512; do
     pixels=$((points * 2))
     sips -z "$pixels" "$pixels" "$logo" --out "$iconset/icon_${points}x${points}@2x.png" >/dev/null
 done
-iconutil --convert icns --output "$app/Contents/Resources/KoKo.icns" "$iconset"
+rm -f "$app/Contents/Resources/KoKo.icns"
+iconutil --convert icns --output "$app/Contents/Resources/KoKoMark.icns" "$iconset"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
 codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"

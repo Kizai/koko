@@ -15,6 +15,7 @@ KoKo connects two authorized Macs over a local or routed network. The host decid
 
 - LAN discovery, single-use codes, routed-network invitations, and reconnection for trusted controllers.
 - Continuous H.264 video, multiple displays, mouse and keyboard input, and a view-only mode. The Control Center sets resolution, quality, and target frame rate. The network panel reports the actual receive rate.
+- Starting with 0.1.11 on both Macs, Command-C and Command-V share plain text or regular files over the paired session.
 - Single-file transfers, Terminal, and localhost port forwarding through the host's SSH account.
 - A universal macOS 13+ preview for Apple Silicon and Intel. Read-only MCP and internet traversal and relay testing are on the roadmap.
 

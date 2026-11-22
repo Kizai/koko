@@ -144,7 +144,11 @@ pub fn publish_invite(
 ) -> Result<ServiceDaemon, Box<dyn Error>> {
     let proof = code.discovery_proof(host);
     let name = format!("koko-{}", &proof[..16]);
-    let mut properties = vec![("id", host.to_string()), ("proof", proof)];
+    let mut properties = vec![
+        ("id", host.to_string()),
+        ("proof", proof),
+        ("os", std::env::consts::OS.to_owned()),
+    ];
     if let Some(label) = label {
         let display_name: String = label
             .trim()
@@ -200,21 +204,32 @@ async fn discover_invite(code: &InviteCode) -> Result<EndpointAddr, Box<dyn Erro
         .ok_or_else(|| "Koko host not found for this code".into())
 }
 
-pub async fn discover_hosts() -> Result<Vec<(EndpointAddr, Option<String>)>, Box<dyn Error>> {
+pub struct DiscoveredHost {
+    pub target: EndpointAddr,
+    pub name: Option<String>,
+    pub os: Option<String>,
+}
+
+pub async fn discover_hosts() -> Result<Vec<DiscoveredHost>, Box<dyn Error>> {
     let daemon = ServiceDaemon::new()?;
     let events = daemon.browse(SERVICE)?;
-    let mut hosts = BTreeMap::<EndpointId, (EndpointAddr, Option<String>)>::new();
+    let mut hosts = BTreeMap::<EndpointId, DiscoveredHost>::new();
     let _ = timeout(Duration::from_secs(2), async {
         while let Ok(event) = events.recv_async().await {
             if let ServiceEvent::ServiceResolved(service) = event
                 && let Some(target) = discovered_target(&service)
             {
-                let host = hosts
-                    .entry(target.id)
-                    .or_insert_with(|| (EndpointAddr::new(target.id), None));
-                host.0.addrs.extend(target.addrs);
+                let host = hosts.entry(target.id).or_insert_with(|| DiscoveredHost {
+                    target: EndpointAddr::new(target.id),
+                    name: None,
+                    os: None,
+                });
+                host.target.addrs.extend(target.addrs);
+                if let Some(os) = service.get_property_val_str("os") {
+                    host.os = Some(os.to_owned());
+                }
                 if let Some(label) = service.get_property_val_str("name") {
-                    host.1 = Some(label.to_owned());
+                    host.name = Some(label.to_owned());
                 }
             }
         }

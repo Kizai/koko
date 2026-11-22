@@ -28,6 +28,31 @@ struct WindowButtonAlignment: NSViewRepresentable {
             measure()
         }
 
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        private var dragOffset: CGPoint?
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func mouseDown(with event: NSEvent) {
+            guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            if event.clickCount == 2 {
+                dragOffset = nil
+                window.zoom(nil)
+                return
+            }
+            dragOffset = event.locationInWindow
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            guard let window, let dragOffset else { return }
+            let pointer = window.convertPoint(toScreen: event.locationInWindow)
+            window.setFrameOrigin(CGPoint(x: pointer.x - dragOffset.x, y: pointer.y - dragOffset.y))
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            dragOffset = nil
+        }
+
         func measure() {
             DispatchQueue.main.async { [weak self] in
                 guard let self, let window, !window.styleMask.contains(.fullScreen),

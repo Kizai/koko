@@ -37,10 +37,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let devices: Vec<_> = discover_hosts()
                 .await?
                 .into_iter()
-                .map(|(target, name)| {
+                .map(|device| {
+                    let target = device.target;
                     serde_json::json!({
                         "id": target.id.to_string(),
-                        "label": name.unwrap_or_else(|| format!("Koko {}", target.id.fmt_short())),
+                        "os": device.os,
+                        "label": device.name.unwrap_or_else(|| format!("Koko {}", target.id.fmt_short())),
                         "request": lan_request(&target),
                     })
                 })

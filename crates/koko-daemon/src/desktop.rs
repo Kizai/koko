@@ -43,7 +43,8 @@ impl AppDesktop {
 
     async fn request(&self, command: RemoteCommand, video_socket: Option<String>) -> RemoteReply {
         let (reply, response) = oneshot::channel();
-        match tokio::time::timeout(Duration::from_secs(9), async {
+        let clipboard = matches!(command, RemoteCommand::Clipboard { .. });
+        match tokio::time::timeout(command.desktop_timeout(), async {
             self.0
                 .send(DesktopRequest {
                     command,
@@ -57,6 +58,7 @@ impl AppDesktop {
         .await
         {
             Ok(Some(reply)) => reply,
+            Err(_) if clipboard => RemoteReply::error("clipboard_timeout"),
             _ => RemoteReply::error("desktop_unavailable"),
         }
     }
@@ -174,7 +176,15 @@ impl RemoteHost {
                         if matches!(command, RemoteCommand::Pointer { .. }) && pointer.is_none() {
                             RemoteReply::error("pointer_busy")
                         } else {
-                            app.run(command).await
+                            let mut access = authorization.clone();
+                            tokio::select! {
+                                biased;
+                                _ = access.changed() => {
+                                    connection.close(1u32.into(), b"peer not authorized");
+                                    return Ok(());
+                                }
+                                reply = app.run(command) => reply,
+                            }
                         }
                     } else {
                         tokio::task::spawn_blocking(move || execute(command))
@@ -271,6 +281,7 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         RemoteCommand::Screenshot => native(&["screenshot"], None),
         RemoteCommand::Capture { .. }
         | RemoteCommand::Displays
+        | RemoteCommand::Clipboard { .. }
         | RemoteCommand::Pointer { .. }
         | RemoteCommand::Video { .. } => {
             return RemoteReply::error("desktop_unavailable");
@@ -406,6 +417,64 @@ mod tests {
         assert!(
             matches!(reply?, RemoteReply::Error { code } if code == "screen_permission_required")
         );
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clipboard_chunk_requires_current_session_authorization() -> Result<(), Box<dyn Error>>
+    {
+        use koko_proto::{ClipboardOp, ClipboardPacket};
+
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let controller = SecretKey::generate();
+        let (allowed_peer, _) = watch::channel(Some(controller.public()));
+        let (app_desktop, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    allowed_peer: allowed_peer.clone(),
+                    app_desktop: Some(app_desktop),
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let client = RemoteClient::connect(controller, host).await?;
+        let command = RemoteCommand::Clipboard {
+            transfer: "01234567-89ab-cdef-0123-456789abcdef".into(),
+            op: ClipboardOp::Write,
+            packet: Some(ClipboardPacket::Data {
+                bytes: "/".repeat(87380) + "/w==",
+            }),
+        };
+        let respond = async {
+            let request = requests.recv().await.unwrap();
+            let RemoteCommand::Clipboard {
+                packet: Some(ClipboardPacket::Data { bytes }),
+                ..
+            } = request.command
+            else {
+                panic!("expected a file chunk");
+            };
+            assert_eq!(bytes.len(), 87384);
+            request.reply.send(RemoteReply::Ok).unwrap();
+        };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client.send(&command), respond)
+        })
+        .await?;
+        assert!(matches!(reply?, RemoteReply::Ok));
+        allowed_peer.send_replace(None);
+        assert!(client.send(&command).await.is_err());
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        client.close().await;
         router.shutdown().await?;
         Ok(())
     }

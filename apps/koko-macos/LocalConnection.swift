@@ -1,5 +1,7 @@
 import AppKit
 import Combine
+import IOKit.pwr_mgt
+import ScreenCaptureKit
 import Foundation
 
 enum DeviceRole: String, CaseIterable, Identifiable {
@@ -48,6 +50,24 @@ struct NearbyHost: Decodable, Identifiable {
     let id: String
     let label: String
     let request: String
+    let os: String?
+
+    var platformName: String {
+        switch os {
+        case "windows": "Windows"
+        case "macos": "Mac"
+        case "linux": "Linux"
+        default: "系统未知"
+        }
+    }
+
+    var platformIcon: String {
+        switch os {
+        case "windows": "square.grid.2x2.fill"
+        case "macos": "apple.logo"
+        default: "desktopcomputer"
+        }
+    }
 }
 
 struct RemoteDisplay: Codable, Equatable, Identifiable {
@@ -98,6 +118,9 @@ enum FrameQuality: Int, CaseIterable, Identifiable {
 
 struct RemoteAction: Codable {
     let action: String
+    var transfer: String?
+    var op: String?
+    var packet: ClipboardPacket?
     var x: Int? = nil
     var y: Int? = nil
     var key: String? = nil
@@ -110,7 +133,7 @@ struct RemoteAction: Codable {
     var videoSocket: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case action, x, y, key, text, display, edge, quality, fps, events
+        case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events
         case videoSocket = "video_socket"
     }
 }
@@ -126,6 +149,8 @@ struct RemoteNetworkStats {
 
 private struct RemoteReply: Codable {
     let status: String
+    var packet: ClipboardPacket?
+    var clipboard: Bool?
     var png: String? = nil
     var code: String? = nil
     var image: String? = nil
@@ -136,7 +161,7 @@ private struct RemoteReply: Codable {
     var video: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case status, png, code, image, displays, direct, video
+        case status, packet, clipboard, png, code, image, displays, direct, video
         case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
@@ -150,6 +175,7 @@ private struct CommandError: LocalizedError {
 struct LocalCommand {
     let process = Process()
     private let output = Pipe()
+    private let writer = DispatchQueue(label: "KoKo.helper.stdin")
     private let input: Pipe?
     private let chunks: AsyncStream<Data>
     private let completion: AsyncStream<Int32>
@@ -169,6 +195,10 @@ struct LocalCommand {
         process.arguments = arguments
         input = interactive ? Pipe() : nil
         if let input {
+            // A helper can exit between isRunning and write. Report EPIPE on this pipe without terminating the GUI.
+            guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
             process.standardInput = input
         } else {
             process.standardInput = FileHandle.nullDevice
@@ -191,17 +221,27 @@ struct LocalCommand {
         }
     }
 
-    func send(_ line: String) throws {
-        try input?.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
+    func send(_ line: String) async throws {
+        try await write(Data((line + "\n").utf8))
     }
 
-    func writeRequest(_ data: Data) throws {
-        try input?.fileHandleForWriting.write(contentsOf: data)
-        try input?.fileHandleForWriting.close()
+    private func write(_ data: Data) async throws {
+        guard let handle = input?.fileHandleForWriting else { throw CommandError(errorDescription: "辅助进程没有输入管道。") }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            writer.async {
+                continuation.resume(with: Result { try handle.write(contentsOf: data) })
+            }
+        }
+    }
+
+    func writeRequest(_ data: Data) async throws {
+        defer { finishInput() }
+        try await write(data)
     }
 
     func finishInput() {
-        try? input?.fileHandleForWriting.close()
+        let handle = input?.fileHandleForWriting
+        writer.async { try? handle?.close() }
     }
 
     func result(collectOutput: Bool = true, onLine: (String) -> Void = { _ in }) async throws -> String {
@@ -258,9 +298,18 @@ private final class RemoteChannel {
     func send(_ action: RemoteAction) async throws -> RemoteReply {
         try Task.checkCancellation()
         if let termination { throw termination }
-        let request = try JSONEncoder().encode(action)
-        try command.send(String(decoding: request, as: UTF8.self))
-        return try await withCheckedThrowingContinuation { pending = $0 }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .withoutEscapingSlashes
+        let request = try encoder.encode(action)
+        return try await withCheckedThrowingContinuation { reply in
+            pending = reply
+            Task {
+                do {
+                    guard termination == nil else { return }
+                    try await command.send(String(decoding: request, as: UTF8.self))
+                } catch { finish(error) }
+            }
+        }
     }
 
     private func receive(_ line: String) {
@@ -281,6 +330,7 @@ private final class RemoteChannel {
     }
 
     func close() {
+        guard termination == nil else { return }
         command.finishInput()
         finish(CancellationError())
     }
@@ -334,6 +384,7 @@ final class LocalConnection: ObservableObject {
     @Published var showNetworkStats = false
     @Published var showControlCenter = false
     @Published private(set) var screenNotice: ConnectionNotice?
+    @Published private(set) var clipboardNotice: ConnectionNotice?
     @Published private(set) var inputNotice: ConnectionNotice?
     @Published private(set) var isSendingInput = false
     @Published var remoteText = ""
@@ -345,6 +396,13 @@ final class LocalConnection: ObservableObject {
 
     private let identityDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".koko", isDirectory: true)
+    private var hostClipboard: HostClipboard? {
+        willSet { hostClipboard?.destination?.discard() }
+    }
+    private var clipboardChannel: RemoteChannel?
+    @Published private(set) var clipboardTransferID: String?
+    private(set) var supportsClipboard = false
+    private var displayActivity = IOPMAssertionID(0)
     private var hostCommand: LocalCommand?
     private var isCapturingScreen = false
     private var checkProcess: Process?
@@ -414,6 +472,7 @@ final class LocalConnection: ObservableObject {
         stopRequested = false
         hostNotice = ConnectionNotice(message: "正在启动监听…")
         defer {
+            endHostDesktop()
             hostCommand = nil
             isHosting = false
             isSharingWithPeer = false
@@ -444,12 +503,14 @@ final class LocalConnection: ObservableObject {
         case "Pointer closed":
             hostPointer.release()
         case "Pair approved":
+            endHostDesktop()
             isSharingWithPeer = true
             connectionCode = ""
             directInvite = ""
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "远程协助已授权，控制端可查看与操作。")
         case "Session closed":
+            endHostDesktop()
             isSharingWithPeer = false
             hostPointer.release()
             hostNotice = ConnectionNotice(message: "远程会话已结束。仍可从局域网重新连接。")
@@ -494,7 +555,7 @@ final class LocalConnection: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .withoutEscapingSlashes
             let json = try encoder.encode(reply)
-            try command.send("desktop-reply \(request) \(String(decoding: json, as: UTF8.self))")
+            try await command.send("desktop-reply \(request) \(String(decoding: json, as: UTF8.self))")
         } catch {
             hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
         }
@@ -503,16 +564,24 @@ final class LocalConnection: ObservableObject {
     private func executeDesktopAction(_ action: RemoteAction) async -> RemoteReply {
         do {
             switch action.action {
+            case "clipboard":
+                return try await handleHostClipboard(action)
             case "displays":
+                // Renew only while an authorized viewer is asking for screens.
+                IOPMAssertionDeclareUserActivity("KoKo remote desktop" as CFString, kIOPMUserActiveRemote, &displayActivity)
+                guard CGPreflightScreenCaptureAccess() else { throw ScreenCaptureError.permissionRequired }
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 let main = CGMainDisplayID()
-                let displays: [RemoteDisplay] = NSScreen.screens.compactMap { screen in
-                    let key = NSDeviceDescriptionKey("NSScreenNumber")
-                    guard let id = (screen.deviceDescription[key] as? NSNumber)?.uint32Value,
-                          let mode = CGDisplayCopyDisplayMode(id) else { return nil }
-                    return RemoteDisplay(id: id, name: screen.localizedName, width: mode.pixelWidth, height: mode.pixelHeight)
+                let screens = NSScreen.screens
+                let displays = content.displays.map { display in
+                    let id = display.displayID
+                    let screen = screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == id }
+                    let mode = CGDisplayCopyDisplayMode(id)
+                    return RemoteDisplay(id: id, name: screen?.localizedName ?? "显示器 \(id)",
+                                         width: mode?.pixelWidth ?? display.width, height: mode?.pixelHeight ?? display.height)
                 }
                 let ordered = displays.filter { $0.id == main } + displays.filter { $0.id != main }
-                return RemoteReply(status: "displays", hostName: localHostName, displays: ordered, video: true)
+                return RemoteReply(status: "displays", clipboard: true, hostName: localHostName, displays: ordered, video: true)
             case "video":
                 guard let display = action.display, let edge = action.edge, let quality = action.quality,
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
@@ -551,6 +620,8 @@ final class LocalConnection: ObservableObject {
                 throw DesktopError.invalidCommand
             }
             return RemoteReply(status: "ok")
+        } catch let error as ClipboardError {
+            return RemoteReply(status: "error", code: error.rawValue)
         } catch let error as DesktopError {
             if error == .inputPermissionRequired { inputPermission = .required }
             return RemoteReply(status: "error", code: error.rawValue)
@@ -562,10 +633,10 @@ final class LocalConnection: ObservableObject {
         }
     }
 
-    func respondToPairing(_ request: PendingPair, allow: Bool, remember: Bool = false) {
+    func respondToPairing(_ request: PendingPair, allow: Bool, remember: Bool = false) async {
         do {
             let action = allow ? (remember ? "remember" : "approve") : "decline"
-            try hostCommand?.send("\(action) \(request.number)")
+            try await hostCommand?.send("\(action) \(request.number)")
             pendingPair = nil
         } catch {
             hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
@@ -576,10 +647,10 @@ final class LocalConnection: ObservableObject {
         identityDirectory.appendingPathComponent("trusted-controllers")
     }
 
-    func forgetTrustedDevices() {
+    func forgetTrustedDevices() async {
         do {
             if let hostCommand {
-                try hostCommand.send("forget-trusted")
+                try await hostCommand.send("forget-trusted")
             } else {
                 try FileManager.default.removeItem(at: trustedDeviceFile)
                 trustedDeviceCount = 0
@@ -613,6 +684,8 @@ final class LocalConnection: ObservableObject {
 
     func switchSessionMode(viewOnly: Bool) {
         if viewOnly {
+            cancelClipboardTransfer()
+            clipboardNotice = nil
             pointerQueue.removeAll()
             if let display = selectedDisplay, pointerChannel != nil {
                 queuePointer(.init(kind: .release), display: display.id)
@@ -621,7 +694,16 @@ final class LocalConnection: ObservableObject {
         isViewOnly = viewOnly
     }
 
+    private func endHostDesktop() {
+        hostClipboard = nil
+        if displayActivity != 0 {
+            IOPMAssertionRelease(displayActivity)
+            displayActivity = 0
+        }
+    }
+
     func stopHosting() {
+        endHostDesktop()
         stopRequested = true
         isSharingWithPeer = false
         hostPointer.release()
@@ -704,6 +786,12 @@ final class LocalConnection: ObservableObject {
                 let reply = try await channel.send(.init(action: "displays"))
                 guard frameChannel === channel else { return false }
                 guard let displays = reply.displays, !displays.isEmpty else {
+                    if reply.code == "desktop_unavailable", videoTask != nil, frameDisplayID != nil {
+                        displayRefresh = .now
+                        return true
+                    }
+                    frameDisplayID = nil
+                    stopVideo()
                     screenNotice = remoteError(reply.code ?? "display_unavailable")
                     return false
                 }
@@ -719,6 +807,7 @@ final class LocalConnection: ObservableObject {
                 }
                 let name = reply.hostName ?? "远程 Mac"
                 if remoteHostName != name { remoteHostName = name }
+                supportsClipboard = reply.clipboard == true
                 supportsVideo = reply.video == true
                 displayRefresh = .now
             }
@@ -775,6 +864,11 @@ final class LocalConnection: ObservableObject {
             if self.session == session && !Task.isCancelled {
                 frameChannel?.close()
                 frameChannel = nil
+                // A display-list timeout can occur while the independent video stream is still delivering frames.
+                if videoTask != nil, frameDisplayID != nil, !error.localizedDescription.contains("peer not authorized") {
+                    displayRefresh = .now
+                    return true
+                }
                 frameDisplayID = nil
                 networkStats = nil
                 lastFrameAt = nil
@@ -955,6 +1049,195 @@ final class LocalConnection: ObservableObject {
         }
     }
 
+    private func beginHostClipboard(_ id: String) -> HostClipboard {
+        let transfer = HostClipboard(id: id)
+        hostClipboard = transfer
+        Task { [weak transfer] in
+            while let activity = transfer?.lastActivity {
+                try? await Task.sleep(until: activity.advanced(by: .seconds(125)), clock: .continuous)
+                guard let transfer, hostClipboard === transfer else { return }
+                if ContinuousClock.now - transfer.lastActivity >= .seconds(125) {
+                    hostClipboard = nil
+                    return
+                }
+            }
+        }
+        return transfer
+    }
+
+    private func handleHostClipboard(_ action: RemoteAction) async throws -> RemoteReply {
+        guard hasInputPermission(request: false) else { throw DesktopError.inputPermissionRequired }
+        guard let id = action.transfer else { throw ClipboardError.invalid }
+        let board = NSPasteboard.general
+        do {
+            switch action.op {
+            case "copy":
+                let transfer = beginHostClipboard(id)
+                let before = board.changeCount
+                try postRemoteKey("copy")
+                for _ in 0..<50 {
+                    try await Task.sleep(for: .milliseconds(40))
+                    guard hostClipboard === transfer else { throw ClipboardError.invalid }
+                    if board.changeCount != before {
+                        let source = try await ClipboardSource.read(from: board)
+                        guard hostClipboard === transfer else { throw ClipboardError.invalid }
+                        transfer.source = source
+                        transfer.lastActivity = .now
+                        return RemoteReply(status: "ok")
+                    }
+                }
+                throw ClipboardError.unchanged
+            case "begin":
+                beginHostClipboard(id).destination = ClipboardDestination()
+            default:
+                guard let transfer = hostClipboard, transfer.id == id else { throw ClipboardError.invalid }
+                transfer.lastActivity = .now
+                switch action.op {
+                case "cancel": hostClipboard = nil
+                case "next":
+                    guard let source = transfer.source else { throw ClipboardError.invalid }
+                    let packet = try await source.next()
+                    guard hostClipboard === transfer else { throw ClipboardError.invalid }
+                    transfer.lastActivity = .now
+                    if packet.kind == .end { hostClipboard = nil }
+                    return RemoteReply(status: "clipboard", packet: packet)
+                case "write":
+                    guard let packet = action.packet, let destination = transfer.destination else { throw ClipboardError.invalid }
+                    try await destination.accept(packet, on: board) { self.hostClipboard === transfer }
+                    guard hostClipboard === transfer else { throw ClipboardError.invalid }
+                    transfer.lastActivity = .now
+                    if packet.kind == .end {
+                        hostClipboard = nil
+                        try postRemoteKey("paste")
+                    }
+                default: throw ClipboardError.invalid
+                }
+            }
+            return RemoteReply(status: "ok")
+        } catch {
+            if hostClipboard?.id == id { hostClipboard = nil }
+            throw ClipboardError.from(error)
+        }
+    }
+
+    func cancelClipboardTransfer() {
+        guard let transfer = clipboardTransferID, let session else { return }
+        clipboardTransferID = nil
+        clipboardChannel?.close()
+        clipboardChannel = nil
+        clipboardNotice = nil
+        // Cancellation travels independently of the request waiting for filesystem access.
+        Task { _ = try? await remote(.init(action: "clipboard", transfer: transfer, op: "cancel"), session: session) }
+    }
+
+    func clipboardShortcut(_ key: String) async {
+        guard supportsClipboard else {
+            await sendInput(.init(action: "key", key: key))
+            return
+        }
+        guard !isViewOnly, let session, clipboardChannel == nil else { return }
+        let channel: RemoteChannel
+        do {
+            channel = try RemoteChannel(keyPath: keyPath(for: .controller), host: session)
+        } catch {
+            clipboardNotice = remoteError(error.localizedDescription)
+            return
+        }
+        clipboardChannel = channel
+        let transfer = UUID().uuidString
+        clipboardTransferID = transfer
+        let board = NSPasteboard.general
+        let destination = ClipboardDestination()
+        defer {
+            destination.discard()
+            channel.close()
+            if clipboardChannel === channel { clipboardChannel = nil; clipboardTransferID = nil }
+        }
+        func exchange(_ op: String, _ packet: ClipboardPacket? = nil) async throws -> RemoteReply {
+            guard clipboardChannel === channel else { throw CancellationError() }
+            let reply = try await channel.send(.init(action: "clipboard", transfer: transfer, op: op, packet: packet))
+            guard clipboardChannel === channel else { throw CancellationError() }
+            if reply.status == "error" {
+                if reply.code == ClipboardError.permission.rawValue {
+                    throw CommandError(errorDescription: "被控端没有文件夹访问权限。请在被控 Mac 的「隐私与安全性 → 文件与文件夹」中允许 KoKo 访问对应目录，再重新复制。")
+                }
+                throw ClipboardError(rawValue: reply.code ?? "") ?? CommandError(errorDescription: remoteError(reply.code).message)
+            }
+            return reply
+        }
+        var bytesTransferred: Int64 = 0
+        var lastUpdate = ContinuousClock.now
+        let originalReceiver = videoReceiver
+        var waitedForFile = false
+        func recoverStalledVideo() {
+            guard waitedForFile, let originalReceiver, videoReceiver === originalReceiver,
+                  self.session == session,
+                  lastVideoFrameAt.map({ ContinuousClock.now - $0 >= .seconds(2) }) ?? true else { return }
+            waitedForFile = false
+            stopVideo()
+            frameDisplayID = nil
+            displayRefresh = .distantPast
+            videoRetryAfter = .now
+        }
+        let waitingNotice = Task { @MainActor in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                guard clipboardChannel === channel else { return }
+                if ContinuousClock.now - lastUpdate >= .seconds(2) {
+                    waitedForFile = true
+                    let message = "正在等待文件访问。若 macOS 弹出提示，请在弹窗所在的 Mac 上选择允许或拒绝。"
+                    if clipboardNotice?.message != message { clipboardNotice = ConnectionNotice(message: message) }
+                }
+            }
+        }
+        defer {
+            waitingNotice.cancel()
+            recoverStalledVideo()
+        }
+        func reportProgress(_ packet: ClipboardPacket) {
+            recoverStalledVideo()
+            guard packet.kind == .data, let bytes = packet.bytes else { return }
+            bytesTransferred += Int64(bytes.count)
+            guard ContinuousClock.now - lastUpdate >= .milliseconds(400) else { return }
+            lastUpdate = .now
+            let size = ByteCountFormatter.string(fromByteCount: bytesTransferred, countStyle: .file)
+            clipboardNotice = ConnectionNotice(message: key == "copy" ? "已接收 \(size)…" : "已发送 \(size)…")
+        }
+        do {
+            clipboardNotice = ConnectionNotice(message: key == "copy" ? "正在复制到本机…" : "正在粘贴到被控端…")
+            if key == "copy" {
+                let before = board.changeCount
+                _ = try await exchange("copy")
+                while true {
+                    guard let packet = try await exchange("next").packet else { throw ClipboardError.invalid }
+                    guard board.changeCount == before else { throw ClipboardError.unchanged }
+                    try await destination.accept(packet, on: board) { self.clipboardChannel === channel && board.changeCount == before }
+                    reportProgress(packet)
+                    if packet.kind == .end { break }
+                }
+            } else {
+                let source = try await ClipboardSource.read(from: board)
+                _ = try await exchange("begin")
+                while true {
+                    let packet = try await source.next()
+                    _ = try await exchange("write", packet)
+                    reportProgress(packet)
+                    if packet.kind == .end { break }
+                }
+            }
+            clipboardNotice = nil
+        } catch {
+            waitingNotice.cancel()
+            guard clipboardChannel === channel else { return }
+            if let issue = error as? CommandError {
+                clipboardNotice = ConnectionNotice(message: issue.localizedDescription, isError: true)
+            } else {
+                clipboardNotice = remoteError(ClipboardError.from(error).rawValue)
+            }
+            _ = try? await exchange("cancel")
+        }
+    }
+
     func sendInput(_ action: RemoteAction) async {
         guard !isViewOnly, !isSendingInput, let session else { return }
         isSendingInput = true
@@ -973,7 +1256,7 @@ final class LocalConnection: ObservableObject {
         let command = try LocalCommand(.controller, arguments: [
             "remote", keyPath(for: .controller), session.hostID, session.address,
         ], interactive: true)
-        try command.writeRequest(request)
+        try await command.writeRequest(request)
         let result = try await command.result()
         return try JSONDecoder().decode(RemoteReply.self, from: Data(result.utf8))
     }
@@ -981,6 +1264,16 @@ final class LocalConnection: ObservableObject {
     private func remoteError(_ reason: String?) -> ConnectionNotice {
         let message: String
         switch reason {
+        case "clipboard_file_permission":
+            message = "本机没有文件夹访问权限。请在「隐私与安全性 → 文件与文件夹」中允许 KoKo 访问对应目录，再重新复制。"
+        case "clipboard_timeout":
+            message = "文件传输等待超时。请检查两台 Mac 上的文件访问提示，处理后重新复制。"
+        case "clipboard_unsupported":
+            message = "可共享普通文件或 64 KiB 以内的纯文本。文件夹请先压缩。"
+        case "clipboard_unchanged":
+            message = "剪贴板已变化或远端没有复制到新内容。请重新选择并复制。"
+        case "clipboard_invalid", "clipboard_failed":
+            message = "剪贴板传输未完成，请检查源文件、接收目录和连接后重试。"
         case "screen_permission_required":
             message = "请在被控端允许 Koko 录屏并重新打开 Koko，然后重新连接。"
         case "input_permission_required":
@@ -988,7 +1281,7 @@ final class LocalConnection: ObservableObject {
         case "capture_busy":
             message = "被控端正在采集画面，正在自动重试。"
         case "display_unavailable":
-            message = "这个显示器已离线，正在检查可用的显示器。"
+            message = "正在唤醒并重新检测显示器。若外接屏已断开或关闭电源，请选择其他屏幕。"
         case "invalid_command":
             message = "请让两端使用同一版本的 Koko。"
         case "capture_failed":
@@ -1016,6 +1309,11 @@ final class LocalConnection: ObservableObject {
         videoSurface.clear()
         stopVideo()
         videoSettings = nil
+        supportsClipboard = false
+        clipboardTransferID = nil
+        clipboardNotice = nil
+        clipboardChannel?.close()
+        clipboardChannel = nil
         supportsVideo = false
         frameDisplayID = nil
         cachedFrames.removeAll()

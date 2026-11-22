@@ -284,7 +284,6 @@ struct DeviceToolSheet: View {
         do {
             command = try LocalCommand(executable: URL(fileURLWithPath: executable), arguments: arguments,
                                        interactive: input != nil)
-            if let input { try command.writeRequest(input) }
         } catch {
             if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
             throw error
@@ -296,6 +295,7 @@ struct DeviceToolSheet: View {
                 if let cleanup { try? FileManager.default.removeItem(at: cleanup) }
             }
             do {
+                if let input { try await command.writeRequest(input) }
                 _ = try await command.result()
                 guard operation?.process === command.process else { return }
                 notice = ConnectionNotice(message: try finish())

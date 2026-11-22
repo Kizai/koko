@@ -32,6 +32,14 @@ struct KokoApp: App {
 private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
     let connection = LocalConnection()
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
+           let url = Bundle.main.url(forResource: name, withExtension: nil),
+           let icon = NSImage(contentsOf: url) {
+            NSApp.applicationIconImage = icon
+        }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -119,7 +127,7 @@ private struct ConnectionView: View {
             Text("名称只显示在这台 Mac 上。留空会恢复设备原名。")
         }
         .confirmationDialog("清除已信任设备？", isPresented: $connection.confirmForgetTrusted) {
-            Button("清除信任", role: .destructive) { connection.forgetTrustedDevices() }
+            Button("清除信任", role: .destructive) { Task { await connection.forgetTrustedDevices() } }
         } message: {
             Text("下次连接将重新请求确认。当前共享中的会话也会结束。")
         }
@@ -128,11 +136,13 @@ private struct ConnectionView: View {
     private var windowHeader: some View {
         HStack(spacing: 8) {
             if let host = connection.selectedNearbyHost {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 6))
+                Image(systemName: host.platformIcon)
+                    .help(host.platformName)
+                    .font(.system(size: 13))
                     .foregroundStyle(.green)
                     .accessibilityLabel("局域网已发现")
                 Text(connection.name(for: host)).font(.callout.weight(.semibold)).lineLimit(1)
+                    .allowsHitTesting(false)
                 Menu {
                     Button("刷新设备", systemImage: "arrow.clockwise") {
                         Task { await connection.scanLAN() }
@@ -151,7 +161,7 @@ private struct ConnectionView: View {
                 .fixedSize()
                 .accessibilityLabel("设备操作")
             } else {
-                Text("远程协助").font(.callout.weight(.semibold))
+                Text("远程协助").font(.callout.weight(.semibold)).allowsHitTesting(false)
             }
             Spacer()
             Button {
@@ -214,7 +224,7 @@ private struct ConnectionView: View {
                         Button {
                             connection.selectedNearbyHostID = host.id
                         } label: {
-                            Label(connection.name(for: host), systemImage: "desktopcomputer")
+                            Label(connection.name(for: host), systemImage: host.platformIcon)
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(8)
@@ -223,7 +233,7 @@ private struct ConnectionView: View {
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .help("查看设备")
+                        .help("\(host.platformName) · \(connection.name(for: host))")
                     }
                 }
             }
@@ -387,9 +397,9 @@ private struct ConnectionView: View {
                     Text("信任后，此设备在本机共享开启时可直接连接。")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack {
-                        Button("拒绝") { connection.respondToPairing(request, allow: false) }
-                        Button("仅允许这次") { connection.respondToPairing(request, allow: true) }
-                        Button("信任并连接") { connection.respondToPairing(request, allow: true, remember: true) }
+                        Button("拒绝") { Task { await connection.respondToPairing(request, allow: false) } }
+                        Button("仅允许这次") { Task { await connection.respondToPairing(request, allow: true) } }
+                        Button("信任并连接") { Task { await connection.respondToPairing(request, allow: true, remember: true) } }
                             .buttonStyle(.borderedProminent)
                     }
                 }
@@ -443,6 +453,8 @@ private struct ConnectionView: View {
                         LocalInputTest(test: inputTest)
                     }
             }
+            Button("文件与文件夹设置") { openPrivacySettings("Privacy_FilesAndFolders") }
+                .help("首次收发受保护目录中的文件时，macOS 会询问是否允许 KoKo 访问该目录。")
             if connection.screenPermission == .required || connection.inputPermission == .required {
                 if Bundle.main.object(forInfoDictionaryKey: "KokoAdHocSigned") as? Bool == true {
                     Text("此测试包使用临时签名。升级后 macOS 可能仍显示旧授权，需要为当前安装版本重新授权。")

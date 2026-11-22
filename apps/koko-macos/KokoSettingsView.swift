@@ -106,7 +106,7 @@ struct KokoSettingsView: View {
         .onAppear { listenPort = connection.listenPort }
         .onChange(of: connection.listenPort) { listenPort = $0 }
         .confirmationDialog("清除已信任设备？", isPresented: $showForget) {
-            Button("清除信任", role: .destructive) { connection.forgetTrustedDevices() }
+            Button("清除信任", role: .destructive) { Task { await connection.forgetTrustedDevices() } }
         } message: {
             Text("当前共享会话会结束，下次连接需要重新确认。")
         }

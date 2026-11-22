@@ -34,7 +34,7 @@ impl RemoteClient {
     }
 
     pub async fn send(&self, command: &RemoteCommand) -> Result<RemoteReply, Box<dyn Error>> {
-        timeout(Duration::from_secs(12), async {
+        timeout(command.desktop_timeout() + Duration::from_secs(3), async {
             let mut recv = self.open_command(command).await?;
             Ok(serde_json::from_slice(
                 &recv.read_to_end(MAX_REMOTE_REPLY).await?,

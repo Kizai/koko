@@ -3,7 +3,7 @@
 | 想了解什么 | 从这里开始 |
 | --- | --- |
 | 项目介绍、下载、安装和源码构建 | [简体中文 README](../README.md) · [English](./overview.md) |
-| 安装 macOS 测试包、选择角色和验证局域网连接 | [macOS 双机测试](./macos.md) |
+| 安装 macOS 测试包，验证局域网连接、显示器唤醒与跨设备粘贴 | [macOS 双机测试](./macos.md) |
 | 本机系统权限、远端设备授权和截图验收 | [macOS 权限设计](./macos-permissions.md) |
 | 模块职责、设备授权和通信协议 | [架构设计](./architecture.md) |
 | 当前要交付什么、按什么顺序验收 | [Phase 1 实现计划](./implementation.md) |

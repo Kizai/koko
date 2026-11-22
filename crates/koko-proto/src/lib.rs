@@ -6,7 +6,7 @@ pub const ALPN: &[u8] = b"koko/1";
 pub const PAIR_ALPN: &[u8] = b"koko/pair/1";
 pub const REMOTE_ALPN: &[u8] = b"koko/remote/1";
 pub const CONTROL_REQUEST: &[u8] = b"request";
-pub const MAX_REMOTE_REQUEST: usize = 8192;
+pub const MAX_REMOTE_REQUEST: usize = 128 * 1024;
 pub const MAX_REMOTE_REPLY: usize = 16 * 1024 * 1024;
 pub const MAX_VIDEO_PACKET: usize = 8 * 1024 * 1024;
 pub const VIDEO_ERROR: u8 = 3;
@@ -19,6 +19,11 @@ pub const CONTROL_READY: &[u8] = b"\x01\x00\x00\x00\x07\"ready\"";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RemoteCommand {
+    Clipboard {
+        transfer: String,
+        op: ClipboardOp,
+        packet: Option<ClipboardPacket>,
+    },
     Disconnect,
     Screenshot,
     Displays,
@@ -47,6 +52,25 @@ pub enum RemoteCommand {
     Text {
         text: String,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardOp {
+    Copy,
+    Begin,
+    Next,
+    Write,
+    Cancel,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClipboardPacket {
+    Text { bytes: String },
+    File { name: String, size: u64 },
+    Data { bytes: String },
+    End,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +184,9 @@ impl RemoteKey {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RemoteReply {
+    Clipboard {
+        packet: ClipboardPacket,
+    },
     Ok,
     Frame {
         png: String,
@@ -172,6 +199,8 @@ pub enum RemoteReply {
         displays: Vec<RemoteDisplay>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         video: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clipboard: bool,
     },
     Error {
         code: String,
@@ -184,8 +213,37 @@ impl RemoteReply {
     }
 }
 
+impl RemoteCommand {
+    pub fn desktop_timeout(&self) -> std::time::Duration {
+        // Clipboard file access may wait for a person to answer a macOS privacy prompt.
+        std::time::Duration::from_secs(if matches!(self, Self::Clipboard { .. }) {
+            120
+        } else {
+            9
+        })
+    }
+}
+
 pub fn valid_remote_command(command: &RemoteCommand) -> bool {
     match command {
+        RemoteCommand::Clipboard {
+            transfer,
+            op,
+            packet,
+        } => {
+            transfer.len() == 36
+                && matches!(
+                    (op, packet),
+                    (ClipboardOp::Write, Some(_))
+                        | (
+                            ClipboardOp::Begin
+                                | ClipboardOp::Copy
+                                | ClipboardOp::Next
+                                | ClipboardOp::Cancel,
+                            None
+                        )
+                )
+        }
         RemoteCommand::Click { x, y } => *x < 10_000 && *y < 10_000,
         RemoteCommand::Capture {
             display,

@@ -24,6 +24,7 @@ struct RemoteControlView: View {
                     videoSurface: connection.videoSurface,
                     display: connection.isViewOnly ? nil : connection.frameDisplayID,
                     acceptsKeyboard: forwardPhysicalKeyboard,
+                    clipboard: { key in Task { await connection.clipboardShortcut(key) } },
                     pointer: connection.queuePointer,
                     resize: connection.setViewportEdge
                 )
@@ -42,13 +43,20 @@ struct RemoteControlView: View {
                     screenStatus("正在切换到 \(screen.name)", icon: "display")
                 }
             }
-            if let notice = connection.inputNotice {
-                Label(notice.message, systemImage: "cursorarrow.rays")
+            .overlay(alignment: .bottomTrailing) {
+                if let notice = connection.clipboardNotice ?? connection.inputNotice {
+                    HStack(spacing: 8) {
+                        Label(notice.message, systemImage: connection.clipboardNotice == nil ? "cursorarrow.rays" : "doc.on.clipboard")
+                        if connection.clipboardTransferID != nil {
+                            Button("取消传输", action: connection.cancelClipboardTransfer)
+                                .buttonStyle(.borderless)
+                        }
+                    }
                     .font(.callout)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(.orange.opacity(0.15))
+                    .padding(8)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .padding(10)
+                }
             }
         }
         .frame(minWidth: 670, idealWidth: 1060, minHeight: 410, idealHeight: 650)
@@ -111,6 +119,7 @@ struct RemoteControlView: View {
                 .truncationMode(.middle)
                 .frame(maxWidth: 184, alignment: .leading)
                 .fixedSize(horizontal: true, vertical: false)
+                .allowsHitTesting(false)
             Divider().frame(height: 18)
             ViewThatFits(in: .horizontal) {
                 tabs.fixedSize(horizontal: true, vertical: false)
@@ -243,7 +252,11 @@ struct RemoteControlView: View {
                     Menu("快捷键") {
                         ForEach(keys.indices, id: \.self) { index in
                             Button(keys[index].0) {
-                                Task { await connection.sendInput(.init(action: "key", key: keys[index].1)) }
+                                let key = keys[index].1
+                                Task {
+                                    if ["copy", "paste"].contains(key) { await connection.clipboardShortcut(key) }
+                                    else { await connection.sendInput(.init(action: "key", key: key)) }
+                                }
                             }
                         }
                     }
@@ -302,11 +315,13 @@ private struct RemoteCanvas: NSViewRepresentable {
     let videoSurface: VideoSurface
     let display: UInt32?
     let acceptsKeyboard: Bool
+    let clipboard: (String) -> Void
     let pointer: (RemotePointerEvent, UInt32) -> Void
     let resize: (Int) -> Void
 
     func makeNSView(context: Context) -> CanvasView {
         let canvas = CanvasView()
+        canvas.onClipboard = clipboard
         canvas.onPointer = pointer
         canvas.onResize = resize
         canvas.wantsLayer = true
@@ -346,6 +361,7 @@ private final class CanvasView: NSView {
             }
         }
     }
+    var onClipboard: ((String) -> Void)?
     var onPointer: ((RemotePointerEvent, UInt32) -> Void)?
     var onResize: ((Int) -> Void)?
     private var pressed = Set<RemoteMouseButton>()
@@ -431,7 +447,13 @@ private final class CanvasView: NSView {
     }
 
     private func forwardKey(_ event: NSEvent, down: Bool) -> Bool {
-        guard acceptsKeyboard, videoSize != nil, let displayID, event.keyCode < 128 else { return false }
+        guard acceptsKeyboard, let displayID, event.keyCode < 128 else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if down, modifiers == .command, let character = event.charactersIgnoringModifiers?.lowercased(),
+           character == "c" || character == "v" {
+            if !event.isARepeat { onClipboard?(character == "c" ? "copy" : "paste") }
+            return true
+        }
         let code = event.keyCode
         if down { pressedKeys.insert(code) } else if pressedKeys.remove(code) == nil { return false }
         let flags = UInt8(truncatingIfNeeded: event.modifierFlags.rawValue >> 16) & 0xbf
