@@ -75,8 +75,15 @@ ditto apps/koko-macos/Info.plist "$app/Contents/Info.plist"
 plutil -insert CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 plutil -insert CFBundleVersion -string "$version" "$app/Contents/Info.plist"
 plutil -insert KokoAdHocSigned -bool "$ad_hoc" "$app/Contents/Info.plist"
-xcrun swift apps/koko-macos/build/AppIcon.swift "$build_dir/KoKo.iconset"
-iconutil --convert icns --output "$app/Contents/Resources/KoKo.icns" "$build_dir/KoKo.iconset"
+logo="$repo_root/docs/assets/koko-logo.png"
+iconset="$build_dir/KoKo.iconset"
+mkdir -p "$iconset"
+for points in 16 32 128 256 512; do
+    sips -z "$points" "$points" "$logo" --out "$iconset/icon_${points}x${points}.png" >/dev/null
+    pixels=$((points * 2))
+    sips -z "$pixels" "$pixels" "$logo" --out "$iconset/icon_${points}x${points}@2x.png" >/dev/null
+done
+iconutil --convert icns --output "$app/Contents/Resources/KoKo.icns" "$iconset"
 ditto LICENSE "$app/Contents/Resources/LICENSE"
 codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"
