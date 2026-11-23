@@ -6,6 +6,10 @@ pub const ALPN: &[u8] = b"koko/1";
 pub const PAIR_ALPN: &[u8] = b"koko/pair/1";
 pub const REMOTE_ALPN: &[u8] = b"koko/remote/1";
 pub const CONTROL_REQUEST: &[u8] = b"request";
+pub const MAX_PAIR_REQUEST: usize = 1024;
+pub const MAX_PAIR_REPLY: usize = 256;
+pub const PAIR_VERSION: u8 = 2;
+pub const MAX_PEER_NAME: usize = 64;
 pub const MAX_REMOTE_REQUEST: usize = 128 * 1024;
 pub const MAX_REMOTE_REPLY: usize = 16 * 1024 * 1024;
 pub const MAX_VIDEO_PACKET: usize = 8 * 1024 * 1024;
@@ -16,6 +20,82 @@ pub const VIDEO_PATH: u8 = 4;
 pub const CONTROL_HELLO: &[u8] = b"\x01\x00\x00\x00\x07\"hello\"";
 pub const CONTROL_READY: &[u8] = b"\x01\x00\x00\x00\x07\"ready\"";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerKind {
+    Human,
+    Agent,
+}
+
+/// Ordered from least to most capable, so an agent's request can be compared with what it was granted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    Observer,
+    AgentSafe,
+    Human,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observer => "observer",
+            Self::AgentSafe => "agent_safe",
+            Self::Human => "human",
+        }
+    }
+}
+
+impl std::str::FromStr for Scope {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "observer" => Ok(Self::Observer),
+            "agent_safe" => Ok(Self::AgentSafe),
+            "human" => Ok(Self::Human),
+            _ => Err("unknown scope"),
+        }
+    }
+}
+
+/// A pairing request from a client that declares who it is. Older clients send only a code or `request`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairHello {
+    pub v: u8,
+    pub kind: PeerKind,
+    pub name: String,
+    pub scope: Scope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+impl PairHello {
+    pub fn valid(&self) -> bool {
+        self.v == PAIR_VERSION
+            && !self.name.trim().is_empty()
+            && self.name.chars().count() <= MAX_PEER_NAME
+            && !self.name.chars().any(char::is_control)
+            && match self.kind {
+                PeerKind::Human => self.scope == Scope::Human,
+                PeerKind::Agent => self.scope != Scope::Human,
+            }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PairGranted {
+    pub v: u8,
+    pub scope: Scope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RemoteCommand {
@@ -25,12 +105,17 @@ pub enum RemoteCommand {
         packet: Option<ClipboardPacket>,
     },
     Disconnect,
+    Hello,
     Screenshot,
     Displays,
     Capture {
         display: u32,
         edge: u16,
         quality: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<ImageFormat>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<bool>,
     },
     Video {
         display: u32,
@@ -199,11 +284,21 @@ pub enum RemoteReply {
         packet: ClipboardPacket,
     },
     Ok,
+    Hello {
+        kind: PeerKind,
+        scope: Scope,
+    },
     Frame {
         png: String,
     },
     Image {
         image: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        height: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        format: Option<ImageFormat>,
     },
     Displays {
         host_name: String,
@@ -233,6 +328,20 @@ impl RemoteCommand {
             9
         })
     }
+
+    /// Agents may only look at the screen until input leases exist.
+    pub fn allowed_for(&self, scope: Scope) -> bool {
+        scope == Scope::Human
+            || matches!(
+                self,
+                Self::Hello
+                    | Self::Displays
+                    | Self::Screenshot
+                    | Self::Capture { .. }
+                    | Self::Video { .. }
+                    | Self::Disconnect
+            )
+    }
 }
 
 pub fn valid_remote_command(command: &RemoteCommand) -> bool {
@@ -260,6 +369,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             display,
             edge,
             quality,
+            ..
         } => valid_capture(*display, *edge, *quality),
         RemoteCommand::Video {
             display,
@@ -281,6 +391,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             !text.is_empty() && text.len() <= 2048 && !text.contains('\0')
         }
         RemoteCommand::Disconnect
+        | RemoteCommand::Hello
         | RemoteCommand::Screenshot
         | RemoteCommand::Displays
         | RemoteCommand::Key { .. } => true,

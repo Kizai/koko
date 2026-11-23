@@ -7,7 +7,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::presets};
-use koko_proto::{CONTROL_READY, CONTROL_REQUEST, PAIR_ALPN};
+use koko_proto::{
+    CONTROL_READY, CONTROL_REQUEST, MAX_PAIR_REPLY, PAIR_ALPN, PAIR_VERSION, PairGranted,
+    PairHello, PeerKind, Scope,
+};
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::time::timeout;
 
@@ -38,6 +41,10 @@ impl InviteCode {
 
     pub fn matches(&self, supplied: &[u8]) -> bool {
         blake3::hash(&self.0) == blake3::hash(supplied)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -328,23 +335,60 @@ pub async fn request_pairing_with_options(
     code: Option<&InviteCode>,
     options: PairingOptions,
 ) -> Result<SocketAddr, Box<dyn Error>> {
+    let payload = code.map_or(CONTROL_REQUEST, |code| &code.0);
+    let (address, reply) = exchange(key, target, payload, CONTROL_READY.len(), options).await?;
+    if reply != CONTROL_READY {
+        return Err("invalid Koko pairing response".into());
+    }
+    Ok(address)
+}
+
+/// Pairs an agent identity. The host confirms the first pairing even when the code is valid,
+/// and may grant a narrower scope than requested.
+pub async fn request_agent_pairing(
+    key: SecretKey,
+    target: EndpointAddr,
+    code: Option<&InviteCode>,
+    name: &str,
+    scope: Scope,
+    options: PairingOptions,
+) -> Result<(SocketAddr, Scope), Box<dyn Error>> {
+    let hello = PairHello {
+        v: PAIR_VERSION,
+        kind: PeerKind::Agent,
+        name: name.to_owned(),
+        scope,
+        code: code.map(ToString::to_string),
+    };
+    if !hello.valid() {
+        return Err("invalid agent name or scope".into());
+    }
+    let payload = serde_json::to_vec(&hello)?;
+    let (address, reply) = exchange(key, target, &payload, MAX_PAIR_REPLY, options).await?;
+    let granted: PairGranted =
+        serde_json::from_slice(&reply).map_err(|_| "invalid Koko pairing response")?;
+    if granted.v != PAIR_VERSION || granted.scope > scope {
+        return Err("invalid Koko pairing response".into());
+    }
+    Ok((address, granted.scope))
+}
+
+async fn exchange(
+    key: SecretKey,
+    target: EndpointAddr,
+    payload: &[u8],
+    reply_limit: usize,
+    options: PairingOptions,
+) -> Result<(SocketAddr, Vec<u8>), Box<dyn Error>> {
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .bind()
         .await?;
     let connection = options.connect(&endpoint, target).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
-    send.write_all(code.map_or(CONTROL_REQUEST, |code| &code.0))
-        .await?;
+    send.write_all(payload).await?;
     send.finish()?;
-    let result = timeout(
-        Duration::from_secs(90),
-        recv.read_to_end(CONTROL_READY.len()),
-    )
-    .await??;
-    if result != CONTROL_READY {
-        return Err("invalid Koko pairing response".into());
-    }
+    let reply = timeout(Duration::from_secs(90), recv.read_to_end(reply_limit)).await??;
     let paths = connection.paths();
     let address = paths
         .iter()
@@ -356,7 +400,7 @@ pub async fn request_pairing_with_options(
         .ok_or("pairing completed without an active direct address")?;
     connection.close(0u32.into(), b"pairing complete");
     endpoint.close().await;
-    Ok(address)
+    Ok((address, reply))
 }
 
 #[cfg(test)]

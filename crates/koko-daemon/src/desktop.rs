@@ -9,12 +9,14 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use koko_proto::{
-    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, RemoteCommand, RemoteReply, VIDEO_ERROR,
+    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope, VIDEO_ERROR,
     valid_remote_command,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
+
+use crate::session::{Sessions, report_end};
 
 pub(crate) struct DesktopRequest {
     command: RemoteCommand,
@@ -101,7 +103,7 @@ impl AppDesktopRequests {
 
 #[derive(Debug)]
 pub(crate) struct RemoteHost {
-    pub(crate) allowed_peer: watch::Sender<Option<EndpointId>>,
+    pub(crate) sessions: watch::Sender<Sessions>,
     pub(crate) app_desktop: Option<AppDesktop>,
     pub(crate) pointer: Mutex<()>,
     #[cfg(unix)]
@@ -125,29 +127,28 @@ impl RemoteHost {
         connection: &Connection,
         pointer: &mut Option<MutexGuard<'a, ()>>,
     ) -> Result<(), AcceptError> {
-        let authorization = self.allowed_peer.subscribe();
-        if *authorization.borrow() != Some(connection.remote_id()) {
+        let peer = connection.remote_id();
+        let authorization = self.sessions.subscribe();
+        let Some(scope) = authorization.borrow().scope(peer) else {
             connection.close(1u32.into(), b"peer not authorized");
             return Ok(());
-        }
+        };
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             let bytes = recv
                 .read_to_end(MAX_REMOTE_REQUEST)
                 .await
                 .map_err(AcceptError::from_err)?;
-            if authorization.has_changed().unwrap_or(true)
-                || *authorization.borrow() != Some(connection.remote_id())
-            {
+            if authorization.borrow().scope(peer) != Some(scope) {
                 connection.close(1u32.into(), b"peer not authorized");
                 return Ok(());
             }
             let command = serde_json::from_slice::<RemoteCommand>(&bytes);
             let reply = match command {
+                Ok(command) if !command.allowed_for(scope) => RemoteReply::error("scope_denied"),
                 Ok(command @ RemoteCommand::Video { .. }) => {
-                    let mut authorization = authorization.clone();
                     tokio::select! {
                         biased;
-                        _ = authorization.changed() => {
+                        _ = revoked(&authorization, peer, scope) => {
                             connection.close(1u32.into(), b"peer not authorized");
                             return Ok(());
                         }
@@ -158,16 +159,24 @@ impl RemoteHost {
                     continue;
                 }
                 Ok(RemoteCommand::Disconnect) => {
-                    self.allowed_peer.send_if_modified(|peer| {
-                        if *peer != Some(connection.remote_id()) {
-                            return false;
-                        }
-                        println!("Session closed");
-                        *peer = None;
-                        true
+                    let mut ended = None;
+                    self.sessions.send_if_modified(|sessions| {
+                        ended = sessions.end(peer);
+                        ended.is_some()
                     });
+                    if let Some(kind) = ended {
+                        report_end(kind);
+                    }
                     RemoteReply::Ok
                 }
+                Ok(RemoteCommand::Hello) => RemoteReply::Hello {
+                    kind: if scope == Scope::Human {
+                        PeerKind::Human
+                    } else {
+                        PeerKind::Agent
+                    },
+                    scope,
+                },
                 Ok(command) if valid_remote_command(&command) => {
                     if let Some(app) = &self.app_desktop {
                         if matches!(command, RemoteCommand::Pointer { .. }) && pointer.is_none() {
@@ -176,10 +185,9 @@ impl RemoteHost {
                         if matches!(command, RemoteCommand::Pointer { .. }) && pointer.is_none() {
                             RemoteReply::error("pointer_busy")
                         } else {
-                            let mut access = authorization.clone();
                             tokio::select! {
                                 biased;
-                                _ = access.changed() => {
+                                _ = revoked(&authorization, peer, scope) => {
                                     connection.close(1u32.into(), b"peer not authorized");
                                     return Ok(());
                                 }
@@ -250,6 +258,14 @@ impl RemoteHost {
     }
 }
 
+/// Resolves once this peer no longer holds the session it connected with.
+async fn revoked(authorization: &watch::Receiver<Sessions>, peer: EndpointId, scope: Scope) {
+    let _ = authorization
+        .clone()
+        .wait_for(|sessions| sessions.scope(peer) != Some(scope))
+        .await;
+}
+
 async fn send_video_error(send: &mut SendStream, code: &str) -> Result<(), AcceptError> {
     let size = (code.len() as u32 + 1).to_be_bytes();
     send.write_all(&size).await.map_err(AcceptError::from_err)?;
@@ -277,7 +293,9 @@ fn execute(command: RemoteCommand) -> RemoteReply {
 
     let screenshot = matches!(command, RemoteCommand::Screenshot);
     let result = match command {
-        RemoteCommand::Disconnect => unreachable!("disconnect is handled by the session"),
+        RemoteCommand::Disconnect | RemoteCommand::Hello => {
+            unreachable!("session commands are handled by the host")
+        }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
         RemoteCommand::Capture { .. }
         | RemoteCommand::Displays
@@ -373,13 +391,13 @@ mod tests {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
         let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
         let controller = SecretKey::generate();
-        let (allowed_peer, _) = watch::channel(Some(controller.public()));
+        let (sessions, _) = watch::channel(Sessions::human(controller.public()));
         let (app_desktop, mut requests) = AppDesktop::channel();
         let router = Router::builder(endpoint)
             .accept(
                 koko_proto::REMOTE_ALPN,
                 RemoteHost {
-                    allowed_peer,
+                    sessions,
                     app_desktop: Some(app_desktop),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
@@ -422,6 +440,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_observer_agent_can_look_but_not_touch() -> Result<(), Box<dyn Error>> {
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let person = SecretKey::generate();
+        let agent = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions {
+            human: Some(person.public()),
+            agent: Some((agent.public(), Scope::Observer)),
+        });
+        let (app_desktop, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions: sessions.clone(),
+                    app_desktop: Some(app_desktop),
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let client = RemoteClient::connect(agent.clone(), host.clone()).await?;
+        let person_client = RemoteClient::connect(person, host).await?;
+
+        let hello = client.send(&RemoteCommand::Hello).await?;
+        assert!(matches!(
+            hello,
+            RemoteReply::Hello {
+                kind: PeerKind::Agent,
+                scope: Scope::Observer
+            }
+        ));
+        let pointer = client
+            .send(&RemoteCommand::Pointer {
+                display: 1,
+                events: vec![PointerEvent::Move { x: 1, y: 1 }],
+                source_os: None,
+            })
+            .await?;
+        assert!(matches!(pointer, RemoteReply::Error { code } if code == "scope_denied"));
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        let capture = RemoteCommand::Capture {
+            display: 1,
+            edge: 1280,
+            quality: 80,
+            format: Some(koko_proto::ImageFormat::Png),
+            cursor: Some(true),
+        };
+        let respond = async {
+            let request = requests.recv().await.unwrap();
+            assert!(matches!(
+                request.command,
+                RemoteCommand::Capture {
+                    format: Some(koko_proto::ImageFormat::Png),
+                    ..
+                }
+            ));
+            request.reply.send(RemoteReply::Ok).unwrap();
+        };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client.send(&capture), respond)
+        })
+        .await?;
+        assert!(matches!(reply?, RemoteReply::Ok));
+
+        // Ending the agent's session leaves the person's session in place.
+        assert!(matches!(
+            client.send(&RemoteCommand::Disconnect).await?,
+            RemoteReply::Ok
+        ));
+        assert_eq!(sessions.borrow().agent, None);
+        assert!(client.send(&RemoteCommand::Hello).await.is_err());
+        assert!(matches!(
+            person_client.send(&RemoteCommand::Hello).await?,
+            RemoteReply::Hello {
+                scope: Scope::Human,
+                ..
+            }
+        ));
+        client.close().await;
+        person_client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clipboard_chunk_requires_current_session_authorization() -> Result<(), Box<dyn Error>>
     {
         use koko_proto::{ClipboardOp, ClipboardPacket};
@@ -429,13 +538,13 @@ mod tests {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
         let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
         let controller = SecretKey::generate();
-        let (allowed_peer, _) = watch::channel(Some(controller.public()));
+        let (sessions, _) = watch::channel(Sessions::human(controller.public()));
         let (app_desktop, mut requests) = AppDesktop::channel();
         let router = Router::builder(endpoint)
             .accept(
                 koko_proto::REMOTE_ALPN,
                 RemoteHost {
-                    allowed_peer: allowed_peer.clone(),
+                    sessions: sessions.clone(),
                     app_desktop: Some(app_desktop),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
@@ -468,7 +577,7 @@ mod tests {
         })
         .await?;
         assert!(matches!(reply?, RemoteReply::Ok));
-        allowed_peer.send_replace(None);
+        sessions.send_replace(Sessions::default());
         assert!(client.send(&command).await.is_err());
         assert!(matches!(
             requests.try_recv(),
@@ -485,13 +594,13 @@ mod tests {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
         let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
         let controller = SecretKey::generate();
-        let (allowed_peer, _) = watch::channel(Some(controller.public()));
+        let (sessions, _) = watch::channel(Sessions::human(controller.public()));
         let (app_desktop, mut requests) = AppDesktop::channel();
         let router = Router::builder(endpoint)
             .accept(
                 koko_proto::REMOTE_ALPN,
                 RemoteHost {
-                    allowed_peer,
+                    sessions,
                     app_desktop: Some(app_desktop),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]

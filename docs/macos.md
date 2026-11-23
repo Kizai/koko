@@ -83,15 +83,42 @@ KoKo 的键鼠转发面向已解锁的 macOS 桌面。被控端已开启系统�
 2. 两端刷新局域网列表。开启 KoKo 共享的主机广播系统类型，侧栏显示对应图标，悬停可见系统名称。旧版设备缺少系统字段时显示通用图标。
 3. 保持被控 Mac 开机并监听，让显示器进入节能熄屏后再进入远程桌面。主机会请求 macOS 唤醒显示器，控制端重新获取画面。整台 Mac 睡眠、合盖或显示器物理断电时，需要先让设备恢复可用。
 
-## Agent 配对
+## Agent 与 MCP
 
-Agent 可以直接调用应用内的 CLI。同一局域网使用短码，通过组网时也可以把完整的直连邀请作为同一命令的参数：
+`koko-agent mcp` 让 Claude Desktop 等 MCP 客户端以独立的 Agent 身份查看被控 Mac 的屏幕。当前版本只读，不能发送键鼠。在控制端 Mac 编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`，加入下面的配置后重启 Claude Desktop：
+
+```json
+{
+  "mcpServers": {
+    "koko": {
+      "command": "/Applications/Koko.app/Contents/Helpers/koko-agent",
+      "args": ["mcp", "--name", "Claude Desktop"]
+    }
+  }
+}
+```
+
+Agent 密钥默认保存在 `~/.koko/agent.key`，已配对的设备保存在 `~/.koko/agent-hosts.json`。用 `--identity <文件>` 可以为不同客户端使用不同身份。工具说明与结果码见 [Agent 与 MCP 设计规范](./agent.md#工具)。
+
+### 验收
+
+1. 被控端打开「允许远程协助」。在 Claude 中说「用连接码 ABCDE-FGHJK 连接我的 Mac」，换成被控端显示的实际连接码。
+2. 被控端出现「Agent「Claude Desktop」请求查看此 Mac 的屏幕」。选「信任并连接」后，Claude 收到 `paired`，被控端的本机共享卡片显示 Agent 已连接。
+3. 让 Claude 截图。确认图像与被控端主屏一致；指定另一块显示器时也能截到。
+4. 在控制端用 KoKo 同时进入同一台被控端的桌面，确认人与 Agent 的会话互不影响。
+5. 被控端点「断开 Agent」，再让 Claude 截图。已信任的 Agent 应自动重连，被控端不再询问。
+6. 被控端「清除信任」后再截图，Claude 应收到 `not_paired` 一类的结果，重新配对需要再次确认。
+7. 用第二个 Agent 身份（`--identity` 指向另一个文件）在第一个 Agent 连接期间配对，应收到 `agent_busy`。
+
+### 命令行配对
+
+脚本也可以直接调用应用内的 CLI。同一局域网使用短码，通过组网时也可以把完整的直连邀请作为同一命令的参数：
 
 ```bash
 /Applications/Koko.app/Contents/Helpers/koko-agent pair ABCDE-FGHJK
 ```
 
-把示例码换成实际连接码。命令返回包含 `status`、`host_id` 和 `address` 的 JSON。CLI 默认复用本机 `~/.koko/controller.key`。`koko-agent discover` 列出设备，使用设备的 `request` 字段进入同一套局域网授权流程。后续 MCP 可以复用这些入口。
+把示例码换成实际连接码。命令返回包含 `status`、`host_id` 和 `address` 的 JSON。这条命令使用 `~/.koko/controller.key`，被控端会把它当作人类控制端，授予完整权限。`koko-agent discover` 列出设备，使用设备的 `request` 字段进入同一套局域网授权流程。
 
 ## 构建测试包
 

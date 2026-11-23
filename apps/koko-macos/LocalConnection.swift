@@ -34,6 +34,28 @@ enum ScreenPermission {
 struct PendingPair {
     let number: String
     let fingerprint: String
+    var kind = "human"
+    var name = ""
+    var scope = "human"
+
+    var isAgent: Bool { kind == "agent" }
+}
+
+struct AgentSession: Equatable {
+    let fingerprint: String
+    let name: String
+    let scope: String
+}
+
+/// What an agent may do on this Mac, as the host owner sees it.
+func agentAccessTitle(_ scope: String) -> String {
+    scope == "agent_safe" ? "查看并操作此 Mac" : "查看此 Mac 的屏幕"
+}
+
+private struct PeerDescription: Decodable {
+    var kind = "agent"
+    let name: String
+    let scope: String
 }
 
 struct PairedHost: Decodable, Equatable {
@@ -132,9 +154,11 @@ struct RemoteAction: Codable {
     var events: [RemotePointerEvent]? = nil
     var sourceOS: String? = nil
     var videoSocket: String? = nil
+    var format: String? = nil
+    var cursor: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events
+        case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events, format, cursor
         case sourceOS = "source_os"
         case videoSocket = "video_socket"
     }
@@ -161,9 +185,12 @@ private struct RemoteReply: Codable {
     var rttMS: Int? = nil
     var direct: Bool? = nil
     var video: Bool? = nil
+    var width: Int? = nil
+    var height: Int? = nil
+    var format: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case status, packet, clipboard, png, code, image, displays, direct, video
+        case status, packet, clipboard, png, code, image, displays, direct, video, width, height, format
         case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
@@ -351,6 +378,7 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
     @Published private(set) var pendingPair: PendingPair?
+    @Published private(set) var agentSession: AgentSession?
     @Published private(set) var trustedDeviceCount = 0
     @Published var confirmForgetTrusted = false
     @Published private(set) var controllerNotice: ConnectionNotice?
@@ -442,7 +470,10 @@ final class LocalConnection: ObservableObject {
             case .controller: controllerID = id
             case .host:
                 hostID = id
-                if let peers = try? String(contentsOf: trustedDeviceFile, encoding: .utf8) {
+                if let data = try? Data(contentsOf: trustedDeviceFile),
+                   let records = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                    trustedDeviceCount = records.count
+                } else if let peers = try? String(contentsOf: legacyTrustedDeviceFile, encoding: .utf8) {
                     trustedDeviceCount = peers.split(whereSeparator: \.isNewline).count
                 }
             }
@@ -504,6 +535,7 @@ final class LocalConnection: ObservableObject {
             connectionCode = ""
             directInvite = ""
             pendingPair = nil
+            agentSession = nil
             hostPointer.release()
         }
 
@@ -542,6 +574,12 @@ final class LocalConnection: ObservableObject {
         case "Pair declined", "Pair request ended":
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
+        case "Pair code used":
+            connectionCode = ""
+            directInvite = ""
+        case "Agent session closed":
+            agentSession = nil
+            hostNotice = ConnectionNotice(message: "Agent 会话已结束。")
         case "Pair code expired":
             connectionCode = ""
             directInvite = ""
@@ -557,9 +595,24 @@ final class LocalConnection: ObservableObject {
             } else if line.hasPrefix("Pair invite: ") {
                 directInvite = String(line.dropFirst("Pair invite: ".count))
             } else if line.hasPrefix("Pair request: ") {
-                let fields = line.dropFirst("Pair request: ".count).split(separator: " ", maxSplits: 1)
-                if fields.count == 2 {
-                    pendingPair = PendingPair(number: String(fields[0]), fingerprint: String(fields[1]))
+                let fields = line.dropFirst("Pair request: ".count).split(separator: " ", maxSplits: 2)
+                if fields.count >= 2 {
+                    var request = PendingPair(number: String(fields[0]), fingerprint: String(fields[1]))
+                    if fields.count == 3,
+                       let peer = try? JSONDecoder().decode(PeerDescription.self, from: Data(fields[2].utf8)) {
+                        request.kind = peer.kind
+                        request.name = peer.name
+                        request.scope = peer.scope
+                    }
+                    pendingPair = request
+                }
+            } else if line.hasPrefix("Agent session: ") {
+                let fields = line.dropFirst("Agent session: ".count).split(separator: " ", maxSplits: 1)
+                if fields.count == 2,
+                   let peer = try? JSONDecoder().decode(PeerDescription.self, from: Data(fields[1].utf8)) {
+                    agentSession = AgentSession(fingerprint: String(fields[0]), name: peer.name, scope: peer.scope)
+                    pendingPair = nil
+                    hostNotice = ConnectionNotice(message: "Agent「\(peer.name)」已连接，可\(agentAccessTitle(peer.scope))。")
                 }
             } else if line.hasPrefix("Desktop request: "), let command = hostCommand {
                 let fields = line.dropFirst("Desktop request: ".count).split(separator: " ", maxSplits: 1)
@@ -573,7 +626,7 @@ final class LocalConnection: ObservableObject {
 
     private func respondToDesktopRequest(_ request: UInt64, action: RemoteAction, command: LocalCommand) async {
         guard !stopRequested, hostCommand?.process === command.process else { return }
-        guard isSharingWithPeer else { return }
+        guard isSharingWithPeer || agentSession != nil else { return }
         let reply = await executeDesktopAction(action)
         guard !stopRequested, hostCommand?.process === command.process else { return }
         do {
@@ -616,15 +669,18 @@ final class LocalConnection: ObservableObject {
                 guard !isCapturingScreen else { return RemoteReply(status: "error", code: "capture_busy") }
                 isCapturingScreen = true
                 defer { isCapturingScreen = false }
-                let bytes = try await captureScreen(
+                let png = action.action == "screenshot" || action.format == "png"
+                let shot = try await captureScreenImage(
                     displayID: action.display, edge: action.edge ?? 1600,
-                    quality: action.quality, showsCursor: action.action == "screenshot"
+                    quality: png ? nil : action.quality,
+                    showsCursor: action.cursor ?? (action.action == "screenshot")
                 )
                 screenPermission = .granted
-                let image = bytes.base64EncodedString()
+                let image = shot.data.base64EncodedString()
                 return action.action == "screenshot"
                     ? RemoteReply(status: "frame", png: image)
-                    : RemoteReply(status: "image", image: image)
+                    : RemoteReply(status: "image", image: image, width: shot.width, height: shot.height,
+                                  format: png ? "png" : "jpeg")
             case "pointer":
                 guard let display = action.display, let events = action.events else { throw DesktopError.invalidCommand }
                 let mapKeys = action.sourceOS == "windows" && (UserDefaults.standard.object(forKey: "mapWindowsModifiers") as? Bool ?? true)
@@ -670,7 +726,20 @@ final class LocalConnection: ObservableObject {
     }
 
     private var trustedDeviceFile: URL {
+        identityDirectory.appendingPathComponent("trusted-controllers.json")
+    }
+
+    // Written by releases before agents could pair. The daemon migrates it on its next start.
+    private var legacyTrustedDeviceFile: URL {
         identityDirectory.appendingPathComponent("trusted-controllers")
+    }
+
+    func endAgentSession() async {
+        do {
+            try await hostCommand?.send("end-agent")
+        } catch {
+            hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
+        }
     }
 
     func forgetTrustedDevices() async {
@@ -678,7 +747,10 @@ final class LocalConnection: ObservableObject {
             if let hostCommand {
                 try await hostCommand.send("forget-trusted")
             } else {
-                try FileManager.default.removeItem(at: trustedDeviceFile)
+                for file in [trustedDeviceFile, legacyTrustedDeviceFile]
+                where FileManager.default.fileExists(atPath: file.path) {
+                    try FileManager.default.removeItem(at: file)
+                }
                 trustedDeviceCount = 0
             }
         } catch {
@@ -732,6 +804,7 @@ final class LocalConnection: ObservableObject {
         endHostDesktop()
         stopRequested = true
         isSharingWithPeer = false
+        agentSession = nil
         hostPointer.release()
         connectionCode = ""
         directInvite = ""

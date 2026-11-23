@@ -1,3 +1,6 @@
+mod mcp;
+mod registry;
+
 use std::error::Error;
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,11 +29,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("Authorized by {host}");
         }
         [command, code] if command == "pair" => {
-            let home =
-                std::env::var_os("HOME").ok_or("HOME is missing; pass a key file explicitly")?;
-            let directory = PathBuf::from(home).join(".koko");
-            std::fs::create_dir_all(&directory)?;
-            pair(&directory.join("controller.key"), code, Default::default()).await?;
+            pair(
+                &koko_directory()?.join("controller.key"),
+                code,
+                Default::default(),
+            )
+            .await?;
+        }
+        [command, flags @ ..] if command == "mcp" => {
+            let mut identity = None;
+            let mut name = None;
+            let mut flags = flags.iter();
+            while let Some(flag) = flags.next() {
+                let value = flags
+                    .next()
+                    .ok_or_else(|| format!("{flag} needs a value"))?;
+                match flag.as_str() {
+                    "--identity" => identity = Some(PathBuf::from(value)),
+                    "--name" => name = Some(value.trim().to_owned()),
+                    _ => return Err(format!("unknown mcp option: {flag}").into()),
+                }
+            }
+            let name = name.unwrap_or_else(|| "KoKo Agent".into());
+            if name.is_empty()
+                || name.chars().count() > koko_proto::MAX_PEER_NAME
+                || name.chars().any(char::is_control)
+            {
+                return Err("--name must be 1-64 printable characters".into());
+            }
+            let identity = match identity {
+                Some(identity) => identity,
+                None => koko_directory()?.join("agent.key"),
+            };
+            let key = load_or_create_identity(&identity)?;
+            mcp::serve(key, &identity, name).await?;
         }
         [command, file, code, flags @ ..] if command == "pair" => {
             let mut options = PairingOptions::default();
@@ -100,12 +132,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | remote <key-file> <host-id> <host-ip:port> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
+                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | mcp [--identity <key-file>] [--name <name>] | remote <key-file> <host-id> <host-ip:port> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
                     .into(),
             );
         }
     }
     Ok(())
+}
+
+fn koko_directory() -> Result<PathBuf, Box<dyn Error>> {
+    let home = std::env::var_os("HOME").ok_or("HOME is missing; pass a key file explicitly")?;
+    let directory = PathBuf::from(home).join(".koko");
+    std::fs::create_dir_all(&directory)?;
+    Ok(directory)
 }
 
 async fn pair(path: &Path, input: &str, options: PairingOptions) -> Result<(), Box<dyn Error>> {

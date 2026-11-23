@@ -1,25 +1,32 @@
 mod desktop;
 mod pairing;
+mod session;
+mod trust;
 
 use std::error::Error;
 use std::path::Path;
 
 use iroh::{
-    EndpointId,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use koko_p2p::{bind_host, load_identity, load_or_create_identity};
 use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY};
+use session::Sessions;
 
 #[derive(Debug)]
 struct Host {
-    allowed_peer: tokio::sync::watch::Receiver<Option<EndpointId>>,
+    authorized: tokio::sync::watch::Receiver<Sessions>,
 }
 
 impl ProtocolHandler for Host {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        if *self.allowed_peer.borrow() != Some(connection.remote_id()) {
+        if self
+            .authorized
+            .borrow()
+            .scope(connection.remote_id())
+            .is_none()
+        {
             connection.close(1u32.into(), b"peer not authorized");
             return Ok(());
         }
@@ -71,7 +78,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         [command, file, bind, peer] if command == "serve" => {
             let identity = load_identity(Path::new(file))?;
             let host = Host {
-                allowed_peer: tokio::sync::watch::channel(Some(peer.parse()?)).1,
+                authorized: tokio::sync::watch::channel(Sessions {
+                    human: Some(peer.parse()?),
+                    agent: None,
+                })
+                .1,
             };
             let endpoint = bind_host(identity, bind.parse()?).await?;
             let router = Router::builder(endpoint).accept(ALPN, host).spawn();
@@ -135,7 +146,7 @@ mod tests {
             .accept(
                 ALPN,
                 Host {
-                    allowed_peer: tokio::sync::watch::channel(Some(controller_id)).1,
+                    authorized: tokio::sync::watch::channel(Sessions::human(controller_id)).1,
                 },
             )
             .spawn();

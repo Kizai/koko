@@ -23,7 +23,7 @@ KoKo 让你在另一台 Mac 上查看和操作已授权的桌面。被控端决�
 | 会话剪贴板（0.1.11 起） | 通过 ⌘C / ⌘V 双向传输纯文本和普通文件 |
 | 画面设置 | 传输分辨率、画质、30–240 FPS 目标档位与实测接收帧率 |
 | 设备工具 | 单文件收发、终端、两端 localhost 端口转发，使用系统 SSH |
-| Agent 接入 | 发现、配对、按需截图与输入 CLI，MCP 接口在规划中 |
+| Agent 接入 | 只读 MCP：设备列表、配对、截图；发现、配对、截图与输入 CLI。Agent 键鼠控制在规划中 |
 
 ## 快速开始
 
@@ -78,7 +78,7 @@ KoKo 让你在另一台 Mac 上查看和操作已授权的桌面。被控端决�
 /Applications/Koko.app/Contents/Helpers/koko-agent pair ABCDE-FGHJK
 ```
 
-配对成功后返回 `host_id` 和 `address`。脚本可以用这两个字段发起已授权的截图或输入请求。[CLI 使用与验收](./docs/macos.md#agent-配对)
+配对成功后返回 `host_id` 和 `address`。脚本可以用这两个字段发起已授权的截图或输入请求。[CLI 与 MCP 使用](./docs/macos.md#agent-与-mcp)
 
 ## 从源码构建
 

@@ -9,6 +9,7 @@ base64.workspace = true
 iroh.workspace = true
 koko-p2p.workspace = true
 koko-proto.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "signal", "sync", "time"] }

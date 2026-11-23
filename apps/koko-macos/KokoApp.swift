@@ -418,15 +418,30 @@ private struct ConnectionView: View {
             }
             if let request = connection.pendingPair {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("设备 \(request.fingerprint) 请求查看和控制此 Mac")
-                    Text("信任后，此设备在本机共享开启时可直接连接。")
-                        .font(.caption).foregroundStyle(.secondary)
+                    if request.isAgent {
+                        Label("Agent「\(request.name)」（\(request.fingerprint)）请求\(agentAccessTitle(request.scope))",
+                              systemImage: "sparkles")
+                        Text("Agent 由 AI 程序驱动。只在首次连接时确认；信任后，它在本机共享开启时可直接连接。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text("设备 \(request.fingerprint) 请求查看和控制此 Mac")
+                        Text("信任后，此设备在本机共享开启时可直接连接。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     HStack {
                         Button("拒绝") { Task { await connection.respondToPairing(request, allow: false) } }
                         Button("仅允许这次") { Task { await connection.respondToPairing(request, allow: true) } }
                         Button("信任并连接") { Task { await connection.respondToPairing(request, allow: true, remember: true) } }
                             .buttonStyle(.borderedProminent)
                     }
+                }
+            }
+            if let agent = connection.agentSession {
+                HStack {
+                    Label("Agent「\(agent.name)」已连接，可\(agentAccessTitle(agent.scope))", systemImage: "sparkles")
+                        .font(.callout)
+                    Spacer()
+                    Button("断开 Agent") { Task { await connection.endAgentSession() } }
                 }
             }
             if connection.trustedDeviceCount > 0 {

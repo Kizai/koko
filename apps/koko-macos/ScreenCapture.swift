@@ -55,6 +55,13 @@ func screenCaptureSource(
 func captureScreen(
     displayID: CGDirectDisplayID? = nil, edge: Int = 1600, quality: Int? = nil, showsCursor: Bool = true
 ) async throws -> Data {
+    try await captureScreenImage(displayID: displayID, edge: edge, quality: quality, showsCursor: showsCursor).data
+}
+
+/// Encodes PNG when `quality` is nil, JPEG otherwise, and reports the encoded image size.
+func captureScreenImage(
+    displayID: CGDirectDisplayID?, edge: Int, quality: Int?, showsCursor: Bool
+) async throws -> (data: Data, width: Int, height: Int) {
     let (filter, config) = try await screenCaptureSource(displayID: displayID, edge: edge)
     config.showsCursor = showsCursor
 
@@ -96,7 +103,7 @@ func captureScreen(
     let properties = quality.map { [kCGImageDestinationLossyCompressionQuality: Double($0) / 100] as CFDictionary }
     CGImageDestinationAddImage(destination, image, properties)
     guard CGImageDestinationFinalize(destination) else { throw ScreenCaptureError.captureFailed }
-    return data as Data
+    return (data as Data, image.width, image.height)
 }
 
 func hasScreenCapturePermission(request: Bool) -> Bool {
