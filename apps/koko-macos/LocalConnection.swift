@@ -388,7 +388,9 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var controllerID = ""
     @Published private(set) var hostID = ""
     @Published private(set) var isChecking = false
-    @Published private(set) var isHosting = false
+    @Published private(set) var isHosting = false {
+        didSet { KeepAwake.shared.update(hosting: isHosting) }
+    }
     @Published private(set) var isSharingWithPeer = false
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""

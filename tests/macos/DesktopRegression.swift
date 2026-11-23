@@ -16,7 +16,8 @@ struct DesktopRegression {
         try await checkHelperPipes()
         try checkClipboardItems()
         try checkAgentPolicy()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写和 Agent 高危操作规则测试")
+        try checkUpdateProgress()
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {

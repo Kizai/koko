@@ -42,15 +42,42 @@ final class ReleaseUpdates: ObservableObject {
     let installedVersion: String?
     @Published private(set) var state: State = .idle
     @Published private(set) var automaticNotice: Release?
+    /// The release shown in the update window, with its notes from GitHub once loaded.
+    @Published private(set) var offered: Release?
+    @Published private(set) var notes: [String: String] = [:]
+    @Published private(set) var installPhase = InstallPhase.idle
 
-    private let installer = UpdateInstaller()
+    private lazy var installer = UpdateInstaller { [weak self] phase in self?.installPhase = phase }
+
+    /// Shows a release in the update window. Nothing downloads until the person chooses to update.
+    func offer(_ release: Release) {
+        offered = release
+        if case .failed = installPhase { installPhase = .idle }
+    }
 
     func install(_ release: Release) {
+        installPhase = .preparing
         do {
             try installer.install(version: release.version, feedURL: release.feedURL)
         } catch {
-            state = .failed("无法开始更新：" + error.localizedDescription)
+            installPhase = .failed("无法开始更新：" + error.localizedDescription)
         }
+    }
+
+    func cancelInstall() {
+        installer.cancel()
+    }
+
+    /// Loads the release notes written on GitHub. Without them the window links to the release page.
+    func loadNotes(for release: Release) async {
+        guard notes[release.version] == nil else { return }
+        struct Notes: Decodable { let body: String? }
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/Kizai/koko/releases/tags/v\(release.version)")!)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        guard let (data, status) = try? await fetch(request), status == 200,
+              let body = try? JSONDecoder().decode(Notes.self, from: data).body,
+              !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        notes[release.version] = body
     }
 
     private let defaults: UserDefaults

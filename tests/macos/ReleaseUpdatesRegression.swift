@@ -129,3 +129,20 @@ extension DesktopRegression {
         }
     }
 }
+
+extension DesktopRegression {
+    /// The update window's single bar moves forward through download, unpacking and installing.
+    static func checkUpdateProgress() throws {
+        let phases: [InstallPhase] = [
+            .preparing, .downloading(received: 0, total: nil), .downloading(received: 50, total: 100),
+            .downloading(received: 100, total: 100), .extracting(0.5), .installing,
+        ]
+        let fractions = phases.compactMap(\.fraction)
+        guard fractions.count == phases.count, fractions == fractions.sorted(),
+              InstallPhase.downloading(received: 100, total: 100).fraction == 0.85,
+              InstallPhase.idle.fraction == nil, InstallPhase.failed("x").fraction == nil
+        else { throw Failure("更新进度应只增不减，空闲和失败时不显示进度条") }
+        guard CloseAction(rawValue: "") == nil, KeepAwake.Mode.allCases.first == .never
+        else { throw Failure("关闭窗口和保持唤醒应有明确的默认值") }
+    }
+}

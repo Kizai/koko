@@ -20,10 +20,15 @@ struct KokoApp: App {
         .windowResizability(.contentMinSize)
         .windowStyle(.hiddenTitleBar)
 
+        Window("软件更新", id: "update") {
+            UpdateWindow(updates: delegate.updates)
+        }
+        .windowResizability(.contentSize)
+
         Window("设置", id: "settings") {
             KokoSettingsView(connection: delegate.connection, updates: delegate.updates)
         }
-        .defaultSize(width: 550, height: 430)
+        .defaultSize(width: 560, height: 520)
         .windowResizability(.contentSize)
 
         MenuBarExtra {
@@ -51,6 +56,7 @@ private struct KokoMenuIcon: View {
               : connection.isSharingWithPeer || connection.agentSession != nil ? "display.2" : "display")
             .onAppear {
                 opener.openMain = {
+                    NSApp.setActivationPolicy(.regular)
                     openWindow(id: "connection")
                     NSApp.activate(ignoringOtherApps: true)
                 }
@@ -73,6 +79,7 @@ private struct KokoMenu: View {
         Text(status)
         Divider()
         Button("打开 KoKo") {
+            NSApp.setActivationPolicy(.regular)
             openWindow(id: "connection")
             NSApp.activate(ignoringOtherApps: true)
         }
@@ -97,6 +104,8 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
            let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon
         }
+        CloseAction.observeWindows()
+        KeepAwake.shared.update(hosting: false)
         Task { await connection.restoreSharing() }
     }
 
@@ -111,8 +120,10 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
         Task { await updates.check(manual: false) }
     }
 
-    /// Closing windows keeps sharing running in the background; Quit in the menu bar or ⌘Q ends KoKo.
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    /// By default closing windows keeps sharing running from the menu bar; the setting can quit instead.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        CloseAction.current == .quit
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         connection.stopForQuit()
@@ -150,7 +161,10 @@ private struct ConnectionView: View {
                     Label("KoKo \(release.version) 可更新", systemImage: "arrow.down.circle")
                     Spacer()
                     Link("更新说明", destination: release.pageURL)
-                    Button("下载并安装") { updates.install(release) }
+                    Button("查看并更新") {
+                        updates.offer(release)
+                        openWindow(id: "update")
+                    }
                     Button("跳过此版本", action: updates.dismissAutomaticNotice)
                         .buttonStyle(.borderless)
                 }

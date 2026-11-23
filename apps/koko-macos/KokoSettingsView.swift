@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 let defaultDownloadDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads").path
@@ -17,6 +18,12 @@ struct KokoSettingsView: View {
     @AppStorage("preferLAN") private var preferLAN = true
     @AppStorage("adaptiveStreaming") private var adaptiveStreaming = true
     @AppStorage("mapWindowsModifiers") private var mapWindowsModifiers = true
+    @AppStorage(KeepAwake.key) private var keepAwake = KeepAwake.Mode.never.rawValue
+    @AppStorage(CloseAction.key) private var closeAction = CloseAction.menuBar.rawValue
+    @ViewState private var launchAtLogin = LaunchAtLogin.isEnabled
+    @ViewState private var loginNeedsApproval = LaunchAtLogin.needsApproval
+    @ViewState private var loginError: String?
+    @Environment(\.openWindow) private var openWindow
 
     private enum Section: String, CaseIterable, Identifiable {
         case general = "常规", security = "安全", keyboard = "键盘", network = "网络", advanced = "高级"
@@ -46,49 +53,79 @@ struct KokoSettingsView: View {
             Form {
                 switch section {
                 case .general:
-                    Picker("新会话的帧率", selection: $defaultFrameRate) {
-                        ForEach(LocalConnection.frameRates, id: \.self) { fps in
-                            Text("\(fps) FPS").tag(fps)
+                    SwiftUI.Section {
+                        Toggle(isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin)) {
+                            Text("开机自启动")
+                        }
+                        .toggleStyle(.switch)
+                        if loginNeedsApproval {
+                            LabeledContent("需要在系统设置中允许 KoKo 登录时打开") {
+                                Button("打开登录项设置") { SMAppService.openSystemSettingsLoginItems() }
+                            }
+                            .font(.callout)
+                        }
+                        Picker(selection: $keepAwake) {
+                            ForEach(KeepAwake.Mode.allCases) { Text($0.title).tag($0.rawValue) }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("让这台 Mac 保持唤醒状态")
+                                Text("防止闲置时进入睡眠导致无法远程访问。屏幕仍可关闭，合上屏幕后仍会睡眠。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Picker("关闭窗口时", selection: $closeAction) {
+                            ForEach(CloseAction.allCases) { Text($0.title).tag($0.rawValue) }
                         }
                     }
-                    LabeledContent("接收文件位置") {
-                        VStack(alignment: .trailing, spacing: 6) {
+                    SwiftUI.Section {
+                        Picker("新会话的帧率", selection: $defaultFrameRate) {
+                            ForEach(LocalConnection.frameRates, id: \.self) { fps in
+                                Text("\(fps) FPS").tag(fps)
+                            }
+                        }
+                    }
+                    SwiftUI.Section {
+                        LabeledContent("传输文件存储路径") {
                             HStack {
-                                Button("选择文件夹…", action: chooseDownloadDirectory)
-                                Button("在访达打开") {
+                                Button("修改路径", action: chooseDownloadDirectory)
+                                Button("打开文件夹") {
                                     NSWorkspace.shared.open(URL(fileURLWithPath: downloadDirectory, isDirectory: true))
                                 }
                             }
-                            Text(downloadDirectory)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .help(downloadDirectory)
                         }
+                        Text(downloadDirectory)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(downloadDirectory)
                     }
-                    LabeledContent("版本") {
-                        Text(updates.installedVersion ?? "—")
-                        Button("检查更新") { Task { await updates.check(manual: true) } }
-                            .disabled(updates.state == .checking)
-                    }
-                    switch updates.state {
-                    case .idle:
-                        EmptyView()
-                    case .checking:
-                        Text("正在检查 GitHub Releases…")
-                    case .upToDate:
-                        Text("当前已是最新可用版本。").foregroundStyle(.secondary)
-                    case .available(let release):
-                        LabeledContent("有可用更新 · \(release.version)") {
-                            Link("更新说明", destination: release.pageURL)
-                            Button("下载并安装") { updates.install(release) }
+                    SwiftUI.Section {
+                        LabeledContent("版本") {
+                            Text(updates.installedVersion ?? "—")
+                            Button("检查更新") { Task { await updates.check(manual: true) } }
+                                .disabled(updates.state == .checking)
                         }
-                    case .failed(let message):
-                        LabeledContent {
-                            Link("打开发布页", destination: URL(string: "https://github.com/Kizai/koko/releases")!)
-                        } label: {
-                            Text(message).font(.callout)
+                        switch updates.state {
+                        case .idle:
+                            EmptyView()
+                        case .checking:
+                            Text("正在检查 GitHub Releases…")
+                        case .upToDate:
+                            Text("当前已是最新可用版本。").foregroundStyle(.secondary)
+                        case .available(let release):
+                            LabeledContent("有可用更新 · \(release.version)") {
+                                Button("查看并更新") {
+                                    updates.offer(release)
+                                    openWindow(id: "update")
+                                }
+                            }
+                        case .failed(let message):
+                            LabeledContent {
+                                Link("打开发布页", destination: URL(string: "https://github.com/Kizai/koko/releases")!)
+                            } label: {
+                                Text(message).font(.callout)
+                            }
                         }
                     }
                 case .security:
@@ -138,7 +175,13 @@ struct KokoSettingsView: View {
             }
             .formStyle(.grouped)
         }
-        .frame(width: 550, height: 356)
+        .frame(width: 560, height: 520)
+        .onChange(of: keepAwake) { _ in KeepAwake.shared.update(hosting: connection.isHosting) }
+        .alert("无法更改开机自启动", isPresented: Binding(get: { loginError != nil }, set: { if !$0 { loginError = nil } })) {
+            Button("好") {}
+        } message: {
+            Text(loginError ?? "")
+        }
         .sheet(isPresented: $showPermissions, onDismiss: connection.permissionGuideDidDismiss) { PermissionGuide(connection: connection) }
         .onAppear { listenPort = connection.listenPort }
         .onChange(of: connection.listenPort) { listenPort = $0 }
@@ -147,6 +190,16 @@ struct KokoSettingsView: View {
         } message: {
             Text("当前共享会话会结束，下次连接需要重新确认。")
         }
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try LaunchAtLogin.set(enabled)
+        } catch {
+            loginError = error.localizedDescription
+        }
+        launchAtLogin = LaunchAtLogin.isEnabled
+        loginNeedsApproval = LaunchAtLogin.needsApproval
     }
 
     private func advancedToggle(_ title: String, _ hint: String, _ setting: Binding<Bool>) -> some View {
