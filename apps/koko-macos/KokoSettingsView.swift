@@ -27,7 +27,7 @@ struct KokoSettingsView: View {
     @Environment(\.openWindow) private var openWindow
 
     private enum Section: String, CaseIterable, Identifiable {
-        case general = "常规", security = "安全", keyboard = "键盘", network = "网络", advanced = "高级"
+        case general = "常规", security = "安全", keyboard = "键盘", network = "网络", advanced = "高级", about = "关于"
         var id: Self { self }
         var icon: String {
             switch self {
@@ -36,6 +36,7 @@ struct KokoSettingsView: View {
             case .keyboard: "keyboard"
             case .network: "network"
             case .advanced: "slider.horizontal.3"
+            case .about: "info.circle"
             }
         }
     }
@@ -51,9 +52,13 @@ struct KokoSettingsView: View {
             .labelsHidden()
             .padding(18)
             Divider()
-            Form {
-                switch section {
-                case .general:
+            if section == .about {
+                aboutView
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Form {
+                    switch section {
+                    case .general:
                     SwiftUI.Section {
                         Toggle(isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin)) {
                             Text("开机自启动")
@@ -182,9 +187,12 @@ struct KokoSettingsView: View {
                     advancedToggle("流畅度增强", "网络延迟升高时降低自动画质和自适应分辨率。", $adaptiveStreaming)
                     advancedToggle("局域网优先", "先尝试同一子网的地址，再尝试邀请中的其他地址。", $preferLAN)
                     advancedToggle("跨系统键位映射", "Windows 控制此 Mac 时，Ctrl 对应 ⌘，Win 对应 Control，Alt 对应 Option。", $mapWindowsModifiers)
+                case .about:
+                    EmptyView()
                 }
+                }
+                .formStyle(.grouped)
             }
-            .formStyle(.grouped)
         }
         .frame(width: 560, height: 520)
         .onChange(of: keepAwake) { _ in KeepAwake.shared.update(hosting: connection.isHosting) }
@@ -201,6 +209,25 @@ struct KokoSettingsView: View {
             Button("清除信任", role: .destructive) { Task { await connection.forgetTrustedDevices() } }
         } message: {
             Text("当前共享会话会结束，下次连接需要重新确认。")
+        }
+    }
+
+    private var aboutView: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 12) {
+                if let icon = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName) {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 44, height: 44)
+                }
+                Text("KoKo")
+                    .font(.system(size: 26, weight: .semibold))
+            }
+            Text(updates.installedVersion.map { "V\($0)" } ?? "—")
+                .font(.title3.weight(.medium))
+                .foregroundStyle(.secondary)
+            Link("https://github.com/Kizai/koko", destination: URL(string: "https://github.com/Kizai/koko")!)
+                .font(.body)
         }
     }
 
