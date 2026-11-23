@@ -34,7 +34,7 @@ flowchart LR
 | --- | --- | --- |
 | `Koko.app` | `apps/koko-macos/` | SwiftUI 主窗口、远控窗口和设置。被控端执行 daemon 转发的桌面请求，包括显示器列表、截帧、视频推流、键鼠和剪贴板。控制端管理各个 `koko-agent` 子进程，解码显示视频，合并并发送键鼠事件。 |
 | `koko-daemon` | `crates/koko-daemon` | 被控端监听进程。管理连接码、局域网请求、信任列表和当前会话授权，把已授权的远控命令转给 `Koko.app` 或 `koko-desktop`。 |
-| `koko-agent` | `crates/koko-agent` | 控制端 CLI。负责发现、配对、单次命令、持续命令通道和视频订阅，应用和脚本使用同一个程序。`mcp` 子命令以 stdio 提供只读 MCP Server，见 [Agent 与 MCP 设计规范](./agent.md)。 |
+| `koko-agent` | `crates/koko-agent` | 控制端 CLI。负责发现、配对、单次命令、持续命令通道和视频订阅，应用和脚本使用同一个程序。`mcp` 子命令以 stdio 提供 MCP Server，见 [Agent 与 MCP 设计规范](./agent.md)。 |
 | `koko-desktop` | `apps/koko-macos/desktop/` | 不经图形版、单独运行 daemon 时使用的 Swift 辅助程序，只处理主屏 PNG、比例坐标点击、常用按键和文本。 |
 | `koko-proto` | `crates/koko-proto` | ALPN 常量、远控命令与回复类型、请求校验和大小上限。 |
 | `koko-p2p` | `crates/koko-p2p` | 设备密钥持久化、iroh 端点、连接码、直连邀请、mDNS 发现和远控客户端。 |
@@ -81,7 +81,10 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | 作用域 | 授予对象 | 允许的命令 |
 | --- | --- | --- |
 | `human` | 人类控制端 | 全部命令 |
-| `observer`、`agent_safe` | Agent | `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。`agent_safe` 的键鼠能力随控制权租约在 M2 开放。 |
+| `observer` | Agent | `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。 |
+| `agent_safe` | Agent | `observer` 的命令，加上 `pointer`、`click`、`key`、`text` 和 `release_control`。输入还要经过控制权仲裁。剪贴板仍只对人类开放。 |
+
+Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）判定。控制权有三种状态：`idle` 时 Agent 的下一条输入取得控制权，3 秒内有过人类输入则拒绝；`active` 时 Agent 可以操作，人类控制端的键鼠或剪贴板请求、被控端的「停止」或 ⌃⌥⌘. 都会转为 `paused`；`paused` 时 Agent 的输入返回 `preempted_by_human`，直到被控端的人点「让 Agent 继续」。Agent 60 秒没有输入、发送 `release_control` 或会话结束时，控制权回到 `idle`。被 Agent 发出的每条请求会写入 `~/.koko/audit.log`，不含截图和文本内容。
 
 「观看模式」只在控制端停止发送键鼠和剪贴板请求，被控端不区分人类会话的观看与控制。
 
@@ -91,8 +94,9 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 
 | `action` | 参数 | 成功回复 |
 | --- | --- | --- |
-| `hello` | 无 | `hello`，含本连接的 `kind`（`human` 或 `agent`）和 `scope` |
-| `displays` | 无 | `displays`，含 `host_name`、显示器列表和 `video`、`clipboard` 能力标记 |
+| `hello` | 无 | `hello`，含本连接的 `kind`（`human` 或 `agent`）、`scope` 和控制权状态 `control` |
+| `release_control` | 无 | `ok`，Agent 交还控制权 |
+| `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
 | `video` | `capture` 的参数和 `fps`（30、60、90、120、144、165 或 240） | 二进制视频记录流 |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
@@ -103,7 +107,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 
 `pointer` 事件包括 `move`、`down`、`up`、`scroll`、`key_down`、`key_up` 和 `release`。按键使用 Mac 虚拟键码与 Core Graphics 修饰位右移 16 位。daemon 同一时间只允许一条连接发送 `pointer`，另一条连接会收到 `pointer_busy`，以保证按下、拖动和抬起的顺序。视频订阅同样只允许一个，新的订阅在旧订阅结束前收到 `video_busy`。
 
-失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板请求因可能等待 macOS 文件访问确认而等待 120 秒。
+失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板请求因可能等待 macOS 文件访问确认而等待 120 秒。
 
 以图形版模式运行时，所有命令都交给 `Koko.app`。单独运行 `koko-daemon serve-pair` 时，`screenshot`、`click`、`key` 和 `text` 由同目录的 `koko-desktop` 执行，其余命令返回 `desktop_unavailable`。
 
@@ -131,11 +135,12 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | `Pair request: <编号> <公钥短标识> <JSON>` | 等待确认的申请，JSON 含 `kind`、`name` 和 `scope` |
 | `Pair approved`、`Session closed` | 人类会话开始与结束 |
 | `Agent session: <公钥短标识> <JSON>`、`Agent session closed` | Agent 会话开始与结束，JSON 含 `name` 和 `scope` |
+| `Agent control: idle`、`active`、`paused` | Agent 控制权变化，应用据此显示屏幕顶部的指示条 |
 | `Pair declined`、`Pair request ended`、`Pair code used` | 申请被拒绝、申请方已离开、连接码因批准而失效 |
 | `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径 |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
-应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
 控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠和剪贴板各保持一个进程，按行收发 JSON；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
 
@@ -151,7 +156,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 
 ## 1. MVP 技术栈定案
 
-> 实现状态：iroh 已用于身份与传输，局域网发现另用 mDNS。macOS 采集、编码和键鼠已按下表的系统框架实现。桌面客户端由 Swift/SwiftUI 的 `Koko.app` 承担，未采用 Tauri。`koko-agent mcp` 已用 rmcp 提供只读 MCP。Windows 与 Linux 尚无实现。
+> 实现状态：iroh 已用于身份与传输，局域网发现另用 mDNS。macOS 采集、编码和键鼠已按下表的系统框架实现。桌面客户端由 Swift/SwiftUI 的 `Koko.app` 承担，未采用 Tauri。`koko-agent mcp` 已用 rmcp 提供 MCP，可截图与操作键鼠。Windows 与 Linux 尚无实现。
 
 为避免在早期陷入 6 端适配与底层编解码泥潭，MVP 阶段锁定 **Desktop 优先（Windows / macOS / Linux）+ P2P 打洞 + 原生 MCP 桥接**，优先跑通“人类旁观 + AI 远程操控真实电脑 + 随时接管”的完整闭环。
 
@@ -165,7 +170,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 
 ## 2. 系统总体架构（Human + Agent 双模拓扑）
 
-> 实现状态：下图是目标拓扑。只读 MCP Server 已实现；`koko-client`、四通道和 Control Arbiter 尚未实现。当前拓扑见[进程与模块](#进程与模块)。
+> 实现状态：下图是目标拓扑。MCP Server 与被控端的控制权仲裁已实现；`koko-client` 和四通道尚未实现，高危审批尚未实现。当前拓扑见[进程与模块](#进程与模块)。
 
 Koko 的核心思想是**“一套 P2P 加密通道，同时服务人类视觉与 AI 工具调用”**。本地侧（Controller）运行极简 MCP Server 与旁观 UI；远端侧（Host）运行 `koko-daemon`，负责采集、注入与权限仲裁。
 
@@ -238,7 +243,7 @@ flowchart LR
 
 ## 4. `koko-agent`（MCP 工具集）与人机协同仲裁
 
-> 实现状态：M1 只读 MCP 已实现：Agent 身份、首次确认与信任重连、`observer` 作用域、设备注册表，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`。控制权租约、Agent 键鼠、人工求助和界面树尚未实现。
+> 实现状态：M1 与 M2 已实现：Agent 身份、首次确认与信任重连、`observer` 与 `agent_safe` 作用域、控制权仲裁与人工抢占、被控端指示条和审计日志，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_release_control`。人工求助、本机实体输入检测和界面树尚未实现。
 
 完整设计见 [Agent 与 MCP 设计规范](./agent.md)，包括 Agent 身份与配对、作用域、控制权状态机、截图坐标映射、键名规范、MCP 工具、协议扩展和里程碑。要点如下：
 
@@ -285,7 +290,7 @@ koko/
 
 ### 5.2 务实的四阶段里程碑
 
-> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。只读 MCP 已实现；Agent 键鼠、NAT 穿透与中继、Arbiter 抢占尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
+> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠与人工抢占已实现；人工求助、NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
 
 | 阶段 | 核心目标 | 验收标准（可演示 Demo） |
 | :--- | :--- | :--- |

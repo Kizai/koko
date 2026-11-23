@@ -1,16 +1,16 @@
-//! Read-only MCP server: lets an AI client pair with KoKo hosts and look at their screens.
+//! MCP server: lets an AI client pair with KoKo hosts, look at their screens and operate them.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, VecDeque, hash_map::Entry};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, SecretKey};
 use koko_p2p::pairing::{PairingOptions, discover_hosts, request_agent_pairing, resolve_invite};
 use koko_p2p::remote::RemoteClient;
-use koko_proto::{ImageFormat, RemoteCommand, RemoteReply, Scope};
+use koko_proto::{ImageFormat, MouseButton, RemoteCommand, RemoteReply, Scope};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -21,14 +21,20 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use crate::input::{Gesture, key_events, mouse_events, to_protocol};
 use crate::registry::{HostRecord, Registry};
 
 const DEFAULT_EDGE: u16 = 1280;
 const JPEG_QUALITY: u8 = 80;
-const INSTRUCTIONS: &str = "KoKo shows you the screens of Macs whose owners paired them with you. \
+const MAX_SHOTS: usize = 64;
+const SETTLE: Duration = Duration::from_millis(600);
+const INSTRUCTIONS: &str = "KoKo lets you see and operate Macs whose owners paired them with you. \
 Call koko_list_devices first. If no device is paired, ask the user for the connection code shown \
 in KoKo on the host Mac and call koko_pair; the host owner approves the first pairing. \
-Use koko_screenshot to look at a display. Mouse and keyboard control are not available yet.";
+Take a screenshot with koko_screenshot, then use koko_mouse and koko_keyboard with pixel coordinates \
+from that screenshot. The host owner sees when you are in control and can stop you at any time. \
+If a result says preempted_by_human, stop and tell the user; do not retry until they ask. \
+Call koko_release_control when you finish.";
 
 /// A tool outcome the model should act on, reported as a tool error rather than a protocol error.
 struct Failure {
@@ -49,8 +55,17 @@ impl Failure {
         match code {
             "scope_denied" => Self::new(
                 "scope_denied",
-                "This agent's access on the host does not allow that action.",
+                "This agent may only view this host. To control it, call koko_pair with this device_id and scope agent_safe; the host owner must approve.",
             ),
+            "preempted_by_human" => Self::new(
+                "preempted_by_human",
+                "A person on the host took over or pressed stop. Stop and tell the user. Do not retry until they ask you to continue.",
+            ),
+            "input_permission_required" => Self::new(
+                "input_permission_required",
+                "The host Mac has not allowed KoKo to control the mouse and keyboard. Ask the user to grant Accessibility on the host.",
+            ),
+            "input_failed" => Self::new("input_failed", "The host could not send that input."),
             "screen_permission_required" => Self::new(
                 "screen_permission_required",
                 "The host Mac has not allowed KoKo to record the screen. Ask the user to grant Screen Recording on the host.",
@@ -130,12 +145,24 @@ fn now() -> u64 {
         .map_or(0, |time| time.as_secs())
 }
 
+/// Where a screenshot came from and how big it was, so its pixel coordinates can be mapped back.
+#[derive(Clone)]
+struct Shot {
+    id: String,
+    device: EndpointId,
+    display: u32,
+    width: u32,
+    height: u32,
+    edge: u16,
+}
+
 struct State {
     key: SecretKey,
     name: String,
     registry: Mutex<Registry>,
     clients: Mutex<HashMap<EndpointId, RemoteClient>>,
     screenshots: AtomicU64,
+    shots: std::sync::Mutex<VecDeque<Shot>>,
 }
 
 #[derive(Clone)]
@@ -144,11 +171,78 @@ pub struct KokoMcp {
     tool_router: ToolRouter<Self>,
 }
 
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScope {
+    Observer,
+    AgentSafe,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct PairParams {
     /// The 10-character connection code shown in KoKo on the host Mac (for example ABCDE-FGHJK),
-    /// or a direct invite that starts with koko://pair/v1/.
-    pub code_or_invite: String,
+    /// or a direct invite that starts with koko://pair/v1/. Omit it to ask an already paired
+    /// device again by device_id, for example for more access.
+    pub code_or_invite: Option<String>,
+    /// Device ID of an already paired host. Used when code_or_invite is omitted.
+    pub device_id: Option<String>,
+    /// "agent_safe" (default) to view and control the Mac, or "observer" to only view it.
+    pub scope: Option<AgentScope>,
+}
+
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseAction {
+    Move,
+    Click,
+    DoubleClick,
+    RightClick,
+    MiddleClick,
+    Drag,
+    Scroll,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct MouseParams {
+    /// Device ID from koko_list_devices.
+    pub device_id: String,
+    pub action: MouseAction,
+    /// X in pixels of the screenshot, from the left edge.
+    pub x: u32,
+    /// Y in pixels of the screenshot, from the top edge.
+    pub y: u32,
+    /// Drag end X in screenshot pixels. Required for drag.
+    pub to_x: Option<u32>,
+    /// Drag end Y in screenshot pixels. Required for drag.
+    pub to_y: Option<u32>,
+    /// Horizontal scroll in pixels; positive scrolls toward the left of the content.
+    pub dx: Option<i32>,
+    /// Vertical scroll in pixels; positive scrolls toward the top of the content.
+    pub dy: Option<i32>,
+    /// Screenshot the coordinates refer to. Defaults to the latest screenshot of this device.
+    pub screenshot_id: Option<String>,
+    /// Return a new screenshot of the same display after the action settles.
+    pub screenshot_after: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct KeyboardParams {
+    /// Device ID from koko_list_devices.
+    pub device_id: String,
+    /// Text to type into the focused field, up to 2048 bytes. Use this for literal text.
+    pub text: Option<String>,
+    /// Key combos pressed in order, such as ["cmd+a", "delete"] or ["cmd+shift+t"]. Modifiers:
+    /// cmd, ctrl, opt, shift, fn. Keys: a-z, 0-9, enter, escape, tab, space, delete, forward_delete,
+    /// up, down, left, right, home, end, page_up, page_down, f1-f12, and ANSI punctuation.
+    pub keys: Option<Vec<String>>,
+    /// Return a new screenshot after the keys settle.
+    pub screenshot_after: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DeviceParams {
+    /// Device ID from koko_list_devices.
+    pub device_id: String,
 }
 
 #[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -181,6 +275,7 @@ impl KokoMcp {
                 registry: Mutex::new(registry),
                 clients: Mutex::new(HashMap::new()),
                 screenshots: AtomicU64::new(0),
+                shots: std::sync::Mutex::new(VecDeque::new()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -306,6 +401,10 @@ impl KokoMcp {
     }
 }
 
+fn invalid(message: impl Into<String>) -> Failure {
+    Failure::new("invalid_input", message)
+}
+
 fn device_id(value: &str) -> Result<EndpointId, Failure> {
     value.trim().parse().map_err(|_| {
         Failure::new(
@@ -362,13 +461,13 @@ impl KokoMcp {
     }
 
     #[tool(
-        description = "Pair this agent with a KoKo host Mac using the connection code or direct invite the user reads from KoKo on that Mac. The host owner must approve the first pairing on the host; this call waits up to 90 seconds. Later connections to a trusted host need no approval."
+        description = "Pair this agent with a KoKo host Mac using the connection code or direct invite the user reads from KoKo on that Mac, or ask an already paired device again by device_id. The host owner must approve the first pairing and any request for more access; this call waits up to 90 seconds. Later connections to a trusted host need no approval."
     )]
     async fn koko_pair(
         &self,
         Parameters(params): Parameters<PairParams>,
     ) -> Result<CallToolResult, McpError> {
-        finish(self.pair(&params.code_or_invite).await)
+        finish(self.pair(params).await)
     }
 
     #[tool(
@@ -379,22 +478,70 @@ impl KokoMcp {
         &self,
         Parameters(params): Parameters<ScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        finish(self.screenshot(params).await)
+        finish(self.screenshot(params).await.map(CallToolResult::success))
+    }
+
+    #[tool(
+        description = "Move, click, double-click, right-click, drag or scroll on a paired KoKo host. Coordinates are pixels in a screenshot from koko_screenshot. Your first input takes control of the host; a person's input takes it back."
+    )]
+    async fn koko_mouse(
+        &self,
+        Parameters(params): Parameters<MouseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish(self.mouse(params).await)
+    }
+
+    #[tool(
+        description = "Type text or press key combos on a paired KoKo host. Input goes to the focused app. Use text for literal text and keys for shortcuts and special keys."
+    )]
+    async fn koko_keyboard(
+        &self,
+        Parameters(params): Parameters<KeyboardParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish(self.keyboard(params).await)
+    }
+
+    #[tool(
+        description = "Give control of a KoKo host back to its owner when you are done operating it."
+    )]
+    async fn koko_release_control(
+        &self,
+        Parameters(params): Parameters<DeviceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish(self.release(&params.device_id).await)
     }
 }
 
 impl KokoMcp {
-    async fn pair(&self, input: &str) -> Result<CallToolResult, Failure> {
-        let (code, target) = resolve_invite(input)
-            .await
-            .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
+    async fn pair(&self, params: PairParams) -> Result<CallToolResult, Failure> {
+        let scope = match params.scope.unwrap_or(AgentScope::AgentSafe) {
+            AgentScope::Observer => Scope::Observer,
+            AgentScope::AgentSafe => Scope::AgentSafe,
+        };
+        let (code, target, previous) = match (params.code_or_invite, params.device_id) {
+            (Some(input), _) => {
+                let (code, target) = resolve_invite(&input)
+                    .await
+                    .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
+                (code, target, None)
+            }
+            (None, Some(device)) => {
+                let record = self.record(device_id(&device)?).await?;
+                (None, record.target(), Some(record))
+            }
+            (None, None) => {
+                return Err(invalid(
+                    "Give code_or_invite, or device_id of a paired host.",
+                ));
+            }
+        };
         let id = target.id;
         let (address, scope) = request_agent_pairing(
             self.state.key.clone(),
             target.clone(),
             code.as_ref(),
             &self.state.name,
-            Scope::Observer,
+            scope,
             Self::options(),
         )
         .await
@@ -407,8 +554,11 @@ impl KokoMcp {
         }
         let mut record = HostRecord {
             id,
-            name: format!("KoKo {}", id.fmt_short()),
-            os: None,
+            name: previous.as_ref().map_or_else(
+                || format!("KoKo {}", id.fmt_short()),
+                |record| record.name.clone(),
+            ),
+            os: previous.and_then(|record| record.os),
             addresses,
             scope,
             paired_at: now(),
@@ -432,7 +582,7 @@ impl KokoMcp {
         )]))
     }
 
-    async fn screenshot(&self, params: ScreenshotParams) -> Result<CallToolResult, Failure> {
+    async fn screenshot(&self, params: ScreenshotParams) -> Result<Vec<ContentBlock>, Failure> {
         let id = device_id(&params.device_id)?;
         self.record(id).await?;
         let displays = match self.request(id, &RemoteCommand::Displays).await? {
@@ -449,9 +599,10 @@ impl KokoMcp {
             ScreenshotFormat::Jpeg => ImageFormat::Jpeg,
             ScreenshotFormat::Png => ImageFormat::Png,
         };
+        let edge = params.max_edge.unwrap_or(DEFAULT_EDGE).clamp(320, 4096);
         let command = RemoteCommand::Capture {
             display: display.id,
-            edge: params.max_edge.unwrap_or(DEFAULT_EDGE).clamp(320, 4096),
+            edge,
             quality: JPEG_QUALITY,
             format: Some(requested),
             cursor: Some(params.cursor.unwrap_or(true)),
@@ -471,6 +622,20 @@ impl KokoMcp {
             "s{}",
             self.state.screenshots.fetch_add(1, Ordering::Relaxed) + 1
         );
+        {
+            let mut shots = self.state.shots.lock().unwrap();
+            if shots.len() == MAX_SHOTS {
+                shots.pop_front();
+            }
+            shots.push_back(Shot {
+                id: screenshot_id.clone(),
+                device: id,
+                display: display.id,
+                width,
+                height,
+                edge,
+            });
+        }
         let main = displays.first().map(|first| first.id);
         let metadata = json!({
             "screenshot_id": screenshot_id,
@@ -492,10 +657,161 @@ impl KokoMcp {
             ImageFormat::Jpeg => "image/jpeg",
             ImageFormat::Png => "image/png",
         };
-        Ok(CallToolResult::success(vec![
+        Ok(vec![
             ContentBlock::image(image, mime),
             ContentBlock::text(metadata.to_string()),
-        ]))
+        ])
+    }
+
+    fn shot(&self, device: EndpointId, id: Option<&str>) -> Result<Shot, Failure> {
+        let shots = self.state.shots.lock().unwrap();
+        let shot = match id {
+            Some(id) => shots
+                .iter()
+                .rev()
+                .find(|shot| shot.id == id && shot.device == device),
+            None => shots.iter().rev().find(|shot| shot.device == device),
+        };
+        shot.cloned().ok_or_else(|| {
+            Failure::new(
+                "screenshot_required",
+                "Take a screenshot of this device with koko_screenshot first, then use its pixel coordinates.",
+            )
+        })
+    }
+
+    /// Sends one input command and, if asked, returns a fresh screenshot once the screen settles.
+    async fn act(
+        &self,
+        id: EndpointId,
+        command: RemoteCommand,
+        display: u32,
+        edge: u16,
+        screenshot_after: Option<bool>,
+    ) -> Result<CallToolResult, Failure> {
+        match self.request(id, &command).await? {
+            RemoteReply::Ok => {}
+            RemoteReply::Error { code } => return Err(Failure::from_host(&code)),
+            _ => return Err(Failure::from_host("invalid_command")),
+        }
+        let mut content = vec![ContentBlock::text(json!({"status": "ok"}).to_string())];
+        if screenshot_after.unwrap_or(false) {
+            tokio::time::sleep(SETTLE).await;
+            content.extend(
+                self.screenshot(ScreenshotParams {
+                    device_id: id.to_string(),
+                    display: Some(display),
+                    max_edge: Some(edge),
+                    format: None,
+                    cursor: None,
+                })
+                .await?,
+            );
+        }
+        Ok(CallToolResult::success(content))
+    }
+
+    async fn mouse(&self, params: MouseParams) -> Result<CallToolResult, Failure> {
+        let id = device_id(&params.device_id)?;
+        let shot = self.shot(id, params.screenshot_id.as_deref())?;
+        let point = |x: u32, y: u32| {
+            to_protocol(x, shot.width)
+                .zip(to_protocol(y, shot.height))
+                .ok_or_else(|| {
+                    Failure::new(
+                        "out_of_bounds",
+                        format!(
+                            "({x}, {y}) is outside the {}x{} screenshot.",
+                            shot.width, shot.height
+                        ),
+                    )
+                })
+        };
+        let gesture = match params.action {
+            MouseAction::Move => Gesture::Move,
+            MouseAction::Click => Gesture::Click(MouseButton::Left),
+            MouseAction::RightClick => Gesture::Click(MouseButton::Right),
+            MouseAction::MiddleClick => Gesture::Click(MouseButton::Middle),
+            MouseAction::DoubleClick => Gesture::DoubleClick,
+            MouseAction::Drag => {
+                let (Some(x), Some(y)) = (params.to_x, params.to_y) else {
+                    return Err(invalid("drag needs to_x and to_y."));
+                };
+                Gesture::Drag { to: point(x, y)? }
+            }
+            MouseAction::Scroll => {
+                let clamp = |value: Option<i32>| {
+                    value
+                        .unwrap_or(0)
+                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+                };
+                let (dx, dy) = (clamp(params.dx), clamp(params.dy));
+                if dx == 0 && dy == 0 {
+                    return Err(invalid("scroll needs a non-zero dx or dy."));
+                }
+                Gesture::Scroll { dx, dy }
+            }
+        };
+        let command = RemoteCommand::Pointer {
+            display: shot.display,
+            events: mouse_events(point(params.x, params.y)?, gesture),
+            source_os: None,
+        };
+        self.act(
+            id,
+            command,
+            shot.display,
+            shot.edge,
+            params.screenshot_after,
+        )
+        .await
+    }
+
+    async fn keyboard(&self, params: KeyboardParams) -> Result<CallToolResult, Failure> {
+        let id = device_id(&params.device_id)?;
+        self.record(id).await?;
+        let shot = self.shot(id, None).ok();
+        // Keys go to the focused app; the display only has to exist on the host.
+        let display = match &shot {
+            Some(shot) => shot.display,
+            None => match self.request(id, &RemoteCommand::Displays).await? {
+                RemoteReply::Displays { displays, .. } => displays
+                    .first()
+                    .map(|display| display.id)
+                    .ok_or_else(|| Failure::from_host("display_unavailable"))?,
+                RemoteReply::Error { code } => return Err(Failure::from_host(&code)),
+                _ => return Err(Failure::from_host("invalid_command")),
+            },
+        };
+        let command = match (params.text, params.keys) {
+            (Some(text), None) => {
+                if text.is_empty() || text.len() > 2048 || text.contains('\0') {
+                    return Err(invalid("text must be 1 to 2048 bytes without NUL."));
+                }
+                RemoteCommand::Text { text }
+            }
+            (None, Some(keys)) => RemoteCommand::Pointer {
+                display,
+                events: key_events(&keys).map_err(invalid)?,
+                source_os: None,
+            },
+            _ => return Err(invalid("Give exactly one of text or keys.")),
+        };
+        let edge = shot.map_or(DEFAULT_EDGE, |shot| shot.edge);
+        self.act(id, command, display, edge, params.screenshot_after)
+            .await
+    }
+
+    async fn release(&self, device: &str) -> Result<CallToolResult, Failure> {
+        let id = device_id(device)?;
+        self.record(id).await?;
+        match self.request(id, &RemoteCommand::ReleaseControl).await? {
+            RemoteReply::Ok => Ok(CallToolResult::success(vec![ContentBlock::text(
+                json!({"status": "released"}).to_string(),
+            )])),
+            RemoteReply::Error { code } => Err(Failure::from_host(&code)),
+            _ => Err(Failure::from_host("invalid_command")),
+        }
     }
 }
 
@@ -526,7 +842,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn offers_read_only_tools_and_reports_unpaired_devices() -> Result<(), Box<dyn Error>> {
+    async fn offers_the_tools_and_reports_unpaired_devices() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let registry = Registry::load(directory.path().join("agent-hosts.json"))?;
         let (server_io, client_io) = tokio::io::duplex(64 * 1024);
@@ -545,7 +861,17 @@ mod tests {
             .map(|tool| tool.name.to_string())
             .collect();
         names.sort();
-        assert_eq!(names, ["koko_list_devices", "koko_pair", "koko_screenshot"]);
+        assert_eq!(
+            names,
+            [
+                "koko_keyboard",
+                "koko_list_devices",
+                "koko_mouse",
+                "koko_pair",
+                "koko_release_control",
+                "koko_screenshot"
+            ]
+        );
 
         let device = SecretKey::generate().public().to_string();
         let result = client

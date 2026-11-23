@@ -1,3 +1,5 @@
+mod arbiter;
+mod audit;
 mod desktop;
 mod pairing;
 mod session;

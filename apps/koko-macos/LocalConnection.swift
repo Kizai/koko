@@ -188,9 +188,10 @@ private struct RemoteReply: Codable {
     var width: Int? = nil
     var height: Int? = nil
     var format: String? = nil
+    var control: String? = nil
 
     enum CodingKeys: String, CodingKey {
-        case status, packet, clipboard, png, code, image, displays, direct, video, width, height, format
+        case status, packet, clipboard, png, code, image, displays, direct, video, width, height, format, control
         case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
@@ -378,7 +379,16 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
     @Published private(set) var pendingPair: PendingPair?
-    @Published private(set) var agentSession: AgentSession?
+    @Published private(set) var agentSession: AgentSession? {
+        didSet { updateAgentIndicator() }
+    }
+    /// The host arbiter's view of agent control: idle, active or paused.
+    @Published private(set) var agentControl = "idle" {
+        didSet { updateAgentIndicator() }
+    }
+    /// What the remote host reports about an agent while this Mac is controlling it.
+    @Published private(set) var remoteAgentControl = "idle"
+    private let agentIndicator = AgentIndicator()
     @Published private(set) var trustedDeviceCount = 0
     @Published var confirmForgetTrusted = false
     @Published private(set) var controllerNotice: ConnectionNotice?
@@ -536,8 +546,11 @@ final class LocalConnection: ObservableObject {
             directInvite = ""
             pendingPair = nil
             agentSession = nil
+            agentControl = "idle"
             hostPointer.release()
         }
+        agentIndicator.onStop = { [weak self] in Task { await self?.sendHost("stop-agent") } }
+        agentIndicator.onResume = { [weak self] in Task { await self?.sendHost("resume-agent") } }
 
         do {
             let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -579,6 +592,9 @@ final class LocalConnection: ObservableObject {
             directInvite = ""
         case "Agent session closed":
             agentSession = nil
+            agentControl = "idle"
+        case "Agent control: idle", "Agent control: active", "Agent control: paused":
+            agentControl = String(line.dropFirst("Agent control: ".count))
             hostNotice = ConnectionNotice(message: "Agent 会话已结束。")
         case "Pair code expired":
             connectionCode = ""
@@ -673,7 +689,8 @@ final class LocalConnection: ObservableObject {
                 let shot = try await captureScreenImage(
                     displayID: action.display, edge: action.edge ?? 1600,
                     quality: png ? nil : action.quality,
-                    showsCursor: action.cursor ?? (action.action == "screenshot")
+                    showsCursor: action.cursor ?? (action.action == "screenshot"),
+                    excludingWindows: [agentIndicator.windowID].compactMap { $0 }
                 )
                 screenPermission = .granted
                 let image = shot.data.base64EncodedString()
@@ -735,11 +752,27 @@ final class LocalConnection: ObservableObject {
     }
 
     func endAgentSession() async {
+        await sendHost("end-agent")
+    }
+
+    func stopAgent() async {
+        await sendHost("stop-agent")
+    }
+
+    func resumeAgent() async {
+        await sendHost("resume-agent")
+    }
+
+    private func sendHost(_ line: String) async {
         do {
-            try await hostCommand?.send("end-agent")
+            try await hostCommand?.send(line)
         } catch {
             hostNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
         }
+    }
+
+    private func updateAgentIndicator() {
+        agentIndicator.update(control: agentControl, agentName: agentSession?.name)
     }
 
     func forgetTrustedDevices() async {
@@ -805,6 +838,7 @@ final class LocalConnection: ObservableObject {
         stopRequested = true
         isSharingWithPeer = false
         agentSession = nil
+        agentControl = "idle"
         hostPointer.release()
         connectionCode = ""
         directInvite = ""
@@ -910,6 +944,8 @@ final class LocalConnection: ObservableObject {
                 if remoteHostName != name { remoteHostName = name }
                 supportsClipboard = reply.clipboard == true
                 supportsVideo = reply.video == true
+                let control = reply.control ?? "idle"
+                if remoteAgentControl != control { remoteAgentControl = control }
                 displayRefresh = .now
             }
             guard let selectedDisplay else { return false }
@@ -1434,6 +1470,7 @@ final class LocalConnection: ObservableObject {
         displays = []
         selectedDisplay = nil
         remoteHostName = ""
+        remoteAgentControl = "idle"
         displayRefresh = .distantPast
         captureTime = 0.18
         showTextControls = false

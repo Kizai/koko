@@ -16,6 +16,10 @@ use koko_proto::{
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
 
+use std::sync::Arc;
+
+use crate::arbiter::Arbiter;
+use crate::audit::Audit;
 use crate::session::{Sessions, report_end};
 
 pub(crate) struct DesktopRequest {
@@ -105,6 +109,8 @@ impl AppDesktopRequests {
 pub(crate) struct RemoteHost {
     pub(crate) sessions: watch::Sender<Sessions>,
     pub(crate) app_desktop: Option<AppDesktop>,
+    pub(crate) arbiter: Arc<Arbiter>,
+    pub(crate) audit: Option<Audit>,
     pub(crate) pointer: Mutex<()>,
     #[cfg(unix)]
     pub(crate) video: Mutex<()>,
@@ -143,6 +149,10 @@ impl RemoteHost {
                 return Ok(());
             }
             let command = serde_json::from_slice::<RemoteCommand>(&bytes);
+            let audited = match (&self.audit, &command) {
+                (Some(_), Ok(command)) if scope != Scope::Human => Some(command.clone()),
+                _ => None,
+            };
             let reply = match command {
                 Ok(command) if !command.allowed_for(scope) => RemoteReply::error("scope_denied"),
                 Ok(command @ RemoteCommand::Video { .. }) => {
@@ -166,7 +176,14 @@ impl RemoteHost {
                     });
                     if let Some(kind) = ended {
                         report_end(kind);
+                        if kind == PeerKind::Agent {
+                            self.arbiter.reset();
+                        }
                     }
+                    RemoteReply::Ok
+                }
+                Ok(RemoteCommand::ReleaseControl) => {
+                    self.arbiter.release();
                     RemoteReply::Ok
                 }
                 Ok(RemoteCommand::Hello) => RemoteReply::Hello {
@@ -176,32 +193,53 @@ impl RemoteHost {
                         PeerKind::Agent
                     },
                     scope,
+                    control: Some(self.arbiter.control()),
                 },
-                Ok(command) if valid_remote_command(&command) => {
-                    if let Some(app) = &self.app_desktop {
-                        if matches!(command, RemoteCommand::Pointer { .. }) && pointer.is_none() {
-                            *pointer = self.pointer.try_lock().ok();
-                        }
-                        if matches!(command, RemoteCommand::Pointer { .. }) && pointer.is_none() {
-                            RemoteReply::error("pointer_busy")
-                        } else {
-                            tokio::select! {
-                                biased;
-                                _ = revoked(&authorization, peer, scope) => {
-                                    connection.close(1u32.into(), b"peer not authorized");
-                                    return Ok(());
-                                }
-                                reply = app.run(command) => reply,
-                            }
-                        }
-                    } else {
-                        tokio::task::spawn_blocking(move || execute(command))
-                            .await
-                            .unwrap_or_else(|_| RemoteReply::error("desktop_unavailable"))
+                Ok(command) if valid_remote_command(&command) => 'run: {
+                    let agent = scope != Scope::Human;
+                    if agent
+                        && command.is_agent_input()
+                        && let Err(code) = self.arbiter.agent_input()
+                    {
+                        break 'run RemoteReply::error(code);
                     }
+                    if !agent && command.is_human_input() {
+                        self.arbiter.human_input();
+                    }
+                    let Some(app) = &self.app_desktop else {
+                        break 'run tokio::task::spawn_blocking(move || execute(command))
+                            .await
+                            .unwrap_or_else(|_| RemoteReply::error("desktop_unavailable"));
+                    };
+                    // A person's pointer connection keeps button and drag order. An agent sends each
+                    // gesture complete in one request, so it does not take the per-connection lock.
+                    if !agent
+                        && matches!(command, RemoteCommand::Pointer { .. })
+                        && pointer.is_none()
+                    {
+                        *pointer = self.pointer.try_lock().ok();
+                        if pointer.is_none() {
+                            break 'run RemoteReply::error("pointer_busy");
+                        }
+                    }
+                    let mut reply = tokio::select! {
+                        biased;
+                        _ = revoked(&authorization, peer, scope) => {
+                            connection.close(1u32.into(), b"peer not authorized");
+                            return Ok(());
+                        }
+                        reply = app.run(command) => reply,
+                    };
+                    if let RemoteReply::Displays { control, .. } = &mut reply {
+                        *control = Some(self.arbiter.control());
+                    }
+                    reply
                 }
                 _ => RemoteReply::error("invalid_command"),
             };
+            if let (Some(audit), Some(command)) = (&self.audit, &audited) {
+                audit.record(peer, command, &reply);
+            }
             send.write_all(&serde_json::to_vec(&reply).map_err(AcceptError::from_err)?)
                 .await
                 .map_err(AcceptError::from_err)?;
@@ -293,7 +331,7 @@ fn execute(command: RemoteCommand) -> RemoteReply {
 
     let screenshot = matches!(command, RemoteCommand::Screenshot);
     let result = match command {
-        RemoteCommand::Disconnect | RemoteCommand::Hello => {
+        RemoteCommand::Disconnect | RemoteCommand::Hello | RemoteCommand::ReleaseControl => {
             unreachable!("session commands are handled by the host")
         }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
@@ -382,7 +420,7 @@ mod tests {
         bind_host,
         remote::{RemoteClient, send_command},
     };
-    use koko_proto::{MouseButton, PointerEvent};
+    use koko_proto::{ControlState, MouseButton, PointerEvent};
 
     use super::*;
 
@@ -399,6 +437,8 @@ mod tests {
                 RemoteHost {
                     sessions,
                     app_desktop: Some(app_desktop),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -456,6 +496,8 @@ mod tests {
                 RemoteHost {
                     sessions: sessions.clone(),
                     app_desktop: Some(app_desktop),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -470,7 +512,8 @@ mod tests {
             hello,
             RemoteReply::Hello {
                 kind: PeerKind::Agent,
-                scope: Scope::Observer
+                scope: Scope::Observer,
+                ..
             }
         ));
         let pointer = client
@@ -531,6 +574,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_person_preempts_an_operating_agent() -> Result<(), Box<dyn Error>> {
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let person = SecretKey::generate();
+        let agent = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions {
+            human: Some(person.public()),
+            agent: Some((agent.public(), Scope::AgentSafe)),
+        });
+        let arbiter = Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60)));
+        let (app_desktop, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(app_desktop),
+                    arbiter: arbiter.clone(),
+                    audit: None,
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let person_client = RemoteClient::connect(person, host.clone()).await?;
+        let agent_client = RemoteClient::connect(agent, host).await?;
+        let click = |x| RemoteCommand::Pointer {
+            display: 1,
+            events: vec![PointerEvent::Move { x, y: 10 }],
+            source_os: None,
+        };
+        let answer = async |requests: &mut mpsc::Receiver<DesktopRequest>| {
+            requests
+                .recv()
+                .await
+                .unwrap()
+                .reply
+                .send(RemoteReply::Ok)
+                .unwrap();
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // The person's pointer connection holds the pointer lock; the agent still gets through.
+            let command = click(1);
+            let (reply, ()) = tokio::join!(person_client.send(&command), answer(&mut requests));
+            assert!(matches!(reply?, RemoteReply::Ok));
+            let command = click(2);
+            let (reply, ()) = tokio::join!(agent_client.send(&command), answer(&mut requests));
+            assert!(matches!(reply?, RemoteReply::Ok));
+            assert_eq!(arbiter.control(), ControlState::Active);
+
+            let command = click(3);
+            let (reply, ()) = tokio::join!(person_client.send(&command), answer(&mut requests));
+            assert!(matches!(reply?, RemoteReply::Ok));
+            assert_eq!(arbiter.control(), ControlState::Paused);
+            let preempted = agent_client.send(&click(4)).await?;
+            assert!(
+                matches!(preempted, RemoteReply::Error { code } if code == "preempted_by_human")
+            );
+            assert!(matches!(
+                requests.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            let hello = agent_client.send(&RemoteCommand::Hello).await?;
+            assert!(matches!(
+                hello,
+                RemoteReply::Hello {
+                    control: Some(ControlState::Paused),
+                    ..
+                }
+            ));
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        person_client.close().await;
+        agent_client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clipboard_chunk_requires_current_session_authorization() -> Result<(), Box<dyn Error>>
     {
         use koko_proto::{ClipboardOp, ClipboardPacket};
@@ -546,6 +671,8 @@ mod tests {
                 RemoteHost {
                     sessions: sessions.clone(),
                     app_desktop: Some(app_desktop),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -602,6 +729,8 @@ mod tests {
                 RemoteHost {
                     sessions,
                     app_desktop: Some(app_desktop),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),

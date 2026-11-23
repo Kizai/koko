@@ -130,6 +130,21 @@ struct RemoteControlView: View {
             displayControls
             networkControls
             Spacer(minLength: 0)
+            switch connection.remoteAgentControl {
+            case "active":
+                Label("Agent 正在操作", systemImage: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize()
+                    .help("你在画面上的键鼠操作会让 Agent 暂停")
+            case "paused":
+                Label("Agent 已暂停", systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            default:
+                EmptyView()
+            }
             if connection.isViewOnly {
                 Label("观看模式", systemImage: "eye")
                     .font(.caption)

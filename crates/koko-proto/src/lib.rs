@@ -89,6 +89,18 @@ pub struct PairGranted {
     pub scope: Scope,
 }
 
+/// Who may send input to the host right now, as decided by the host's arbiter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlState {
+    /// No agent holds control. An agent's next input takes it.
+    Idle,
+    /// An agent holds control.
+    Active,
+    /// A person took over or pressed stop. Only a person can let the agent continue.
+    Paused,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFormat {
@@ -96,7 +108,7 @@ pub enum ImageFormat {
     Png,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RemoteCommand {
     Clipboard {
@@ -106,6 +118,7 @@ pub enum RemoteCommand {
     },
     Disconnect,
     Hello,
+    ReleaseControl,
     Screenshot,
     Displays,
     Capture {
@@ -141,7 +154,7 @@ pub enum RemoteCommand {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardOp {
     Copy,
@@ -151,7 +164,7 @@ pub enum ClipboardOp {
     Cancel,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClipboardPacket {
     Text { bytes: String },
@@ -178,7 +191,7 @@ pub enum MouseButton {
     Forward,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyboardPlatform {
     Macos,
@@ -187,7 +200,7 @@ pub enum KeyboardPlatform {
     Other,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PointerEvent {
     Move {
@@ -287,6 +300,8 @@ pub enum RemoteReply {
     Hello {
         kind: PeerKind,
         scope: Scope,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<ControlState>,
     },
     Frame {
         png: String,
@@ -307,6 +322,8 @@ pub enum RemoteReply {
         video: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         clipboard: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<ControlState>,
     },
     Error {
         code: String,
@@ -329,18 +346,45 @@ impl RemoteCommand {
         })
     }
 
-    /// Agents may only look at the screen until input leases exist.
     pub fn allowed_for(&self, scope: Scope) -> bool {
-        scope == Scope::Human
-            || matches!(
-                self,
-                Self::Hello
-                    | Self::Displays
-                    | Self::Screenshot
-                    | Self::Capture { .. }
-                    | Self::Video { .. }
-                    | Self::Disconnect
-            )
+        match scope {
+            Scope::Human => true,
+            Scope::AgentSafe => {
+                self.is_viewing() || self.is_agent_input() || matches!(self, Self::ReleaseControl)
+            }
+            Scope::Observer => self.is_viewing(),
+        }
+    }
+
+    fn is_viewing(&self) -> bool {
+        matches!(
+            self,
+            Self::Hello
+                | Self::Displays
+                | Self::Screenshot
+                | Self::Capture { .. }
+                | Self::Video { .. }
+                | Self::Disconnect
+        )
+    }
+
+    /// Input an agent may send while it holds control.
+    pub fn is_agent_input(&self) -> bool {
+        matches!(
+            self,
+            Self::Pointer { .. } | Self::Click { .. } | Self::Key { .. } | Self::Text { .. }
+        )
+    }
+
+    /// Whether a person sending this takes control away from an agent. A bare release is not input.
+    pub fn is_human_input(&self) -> bool {
+        match self {
+            Self::Pointer { events, .. } => events
+                .iter()
+                .any(|event| !matches!(event, PointerEvent::Release)),
+            Self::Clipboard { .. } => true,
+            _ => self.is_agent_input(),
+        }
     }
 }
 
@@ -392,6 +436,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
         }
         RemoteCommand::Disconnect
         | RemoteCommand::Hello
+        | RemoteCommand::ReleaseControl
         | RemoteCommand::Screenshot
         | RemoteCommand::Displays
         | RemoteCommand::Key { .. } => true,
@@ -400,4 +445,35 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
 
 fn valid_capture(display: u32, edge: u16, quality: u8) -> bool {
     display != 0 && (320..=4096).contains(&edge) && (20..=95).contains(&quality)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scopes_gate_agent_input() {
+        let pointer = RemoteCommand::Pointer {
+            display: 1,
+            events: vec![PointerEvent::Move { x: 1, y: 1 }],
+            source_os: None,
+        };
+        assert!(!pointer.allowed_for(Scope::Observer));
+        assert!(pointer.allowed_for(Scope::AgentSafe));
+        assert!(RemoteCommand::Displays.allowed_for(Scope::Observer));
+        assert!(!RemoteCommand::ReleaseControl.allowed_for(Scope::Observer));
+        let clipboard = RemoteCommand::Clipboard {
+            transfer: "x".into(),
+            op: ClipboardOp::Copy,
+            packet: None,
+        };
+        assert!(!clipboard.allowed_for(Scope::AgentSafe));
+        assert!(clipboard.is_human_input());
+        let release = RemoteCommand::Pointer {
+            display: 1,
+            events: vec![PointerEvent::Release],
+            source_os: None,
+        };
+        assert!(!release.is_human_input());
+    }
 }

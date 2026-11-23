@@ -85,7 +85,7 @@ KoKo 的键鼠转发面向已解锁的 macOS 桌面。被控端已开启系统�
 
 ## Agent 与 MCP
 
-`koko-agent mcp` 让 Claude Desktop 等 MCP 客户端以独立的 Agent 身份查看被控 Mac 的屏幕。当前版本只读，不能发送键鼠。在控制端 Mac 编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`，加入下面的配置后重启 Claude Desktop：
+`koko-agent mcp` 让 Claude Desktop 等 MCP 客户端以独立的 Agent 身份查看并操作被控 Mac。被控端需要授予录屏和辅助功能权限。在控制端 Mac 编辑 `~/Library/Application Support/Claude/claude_desktop_config.json`，加入下面的配置后重启 Claude Desktop：
 
 ```json
 {
@@ -103,12 +103,18 @@ Agent 密钥默认保存在 `~/.koko/agent.key`，已配对的设备保存在 `~
 ### 验收
 
 1. 被控端打开「允许远程协助」。在 Claude 中说「用连接码 ABCDE-FGHJK 连接我的 Mac」，换成被控端显示的实际连接码。
-2. 被控端出现「Agent「Claude Desktop」请求查看此 Mac 的屏幕」。选「信任并连接」后，Claude 收到 `paired`，被控端的本机共享卡片显示 Agent 已连接。
+2. 被控端出现「Agent「Claude Desktop」请求查看并操作此 Mac」。选「信任并连接」后，Claude 收到 `paired`，被控端的本机共享卡片显示 Agent 已连接。
 3. 让 Claude 截图。确认图像与被控端主屏一致；指定另一块显示器时也能截到。
-4. 在控制端用 KoKo 同时进入同一台被控端的桌面，确认人与 Agent 的会话互不影响。
-5. 被控端点「断开 Agent」，再让 Claude 截图。已信任的 Agent 应自动重连，被控端不再询问。
-6. 被控端「清除信任」后再截图，Claude 应收到 `not_paired` 一类的结果，重新配对需要再次确认。
-7. 用第二个 Agent 身份（`--identity` 指向另一个文件）在第一个 Agent 连接期间配对，应收到 `agent_busy`。
+4. 在被控端打开「本机权限 → 键鼠测试区」，让 Claude 点击「测试点击」，再点文本框输入 Koko，然后用 `cmd+a`、`delete` 清空。屏幕顶部应出现橙色指示条「Agent「Claude Desktop」正在操作这台 Mac」，测试区分别显示已收到点击和文本。
+5. 让 Claude 在访达中拖动一个窗口，并在长页面中滚动，确认拖拽和滚动的位置正确。指示条不应出现在 Claude 收到的截图里。
+6. Claude 操作期间，点指示条上的「停止」或按 ⌃⌥⌘.。指示条变为「已暂停」，Claude 的下一步操作收到 `preempted_by_human` 并停下。点「让 Agent 继续」后 Claude 可以继续。
+7. 在控制端用 KoKo 进入同一台被控端的桌面，在 Claude 操作时移动鼠标。Agent 应立即暂停，远控窗口顶栏显示「Agent 已暂停」。只观看不操作时，两个会话互不影响。
+8. 查看被控端的 `~/.koko/audit.log`，每条 Agent 请求一行，不包含输入的文字。
+9. 被控端点「断开 Agent」，再让 Claude 截图。已信任的 Agent 应自动重连，被控端不再询问。
+10. 被控端「清除信任」后再截图，Claude 应收到 `not_paired` 一类的结果，重新配对需要再次确认。
+11. 用第二个 Agent 身份（`--identity` 指向另一个文件）在第一个 Agent 连接期间配对，应收到 `agent_busy`。
+
+M1 时以只读方式配对的 Agent，需要更多权限时会收到 `scope_denied`。让 Claude 用该设备的 `device_id` 和 `scope: agent_safe` 再次调用 `koko_pair`，被控端确认后即可操作。
 
 ### 命令行配对
 

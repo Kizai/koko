@@ -438,9 +438,25 @@ private struct ConnectionView: View {
             }
             if let agent = connection.agentSession {
                 HStack {
-                    Label("Agent「\(agent.name)」已连接，可\(agentAccessTitle(agent.scope))", systemImage: "sparkles")
-                        .font(.callout)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label("Agent「\(agent.name)」已连接，可\(agentAccessTitle(agent.scope))", systemImage: "sparkles")
+                            .font(.callout)
+                        switch connection.agentControl {
+                        case "active":
+                            Text("正在操作这台 Mac。移动鼠标、按键或按 ⌃⌥⌘. 都会让它暂停。")
+                                .font(.caption).foregroundStyle(.orange)
+                        case "paused":
+                            Text("已暂停，等你允许后才能继续操作。").font(.caption).foregroundStyle(.secondary)
+                        default:
+                            EmptyView()
+                        }
+                    }
                     Spacer()
+                    switch connection.agentControl {
+                    case "active": Button("停止") { Task { await connection.stopAgent() } }
+                    case "paused": Button("让 Agent 继续") { Task { await connection.resumeAgent() } }
+                    default: EmptyView()
+                    }
                     Button("断开 Agent") { Task { await connection.endAgentSession() } }
                 }
             }

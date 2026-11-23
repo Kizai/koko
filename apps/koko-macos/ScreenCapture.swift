@@ -30,7 +30,7 @@ private final class FrameOutput: NSObject, SCStreamOutput, @unchecked Sendable {
 }
 
 func screenCaptureSource(
-    displayID: CGDirectDisplayID?, edge: Int
+    displayID: CGDirectDisplayID?, edge: Int, excludingWindows excluded: [CGWindowID] = []
 ) async throws -> (SCContentFilter, SCStreamConfiguration) {
     guard CGPreflightScreenCaptureAccess() else { throw ScreenCaptureError.permissionRequired }
     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -39,7 +39,8 @@ func screenCaptureSource(
         throw ScreenCaptureError.displayUnavailable
     }
 
-    let filter = SCContentFilter(display: display, excludingWindows: [])
+    let filter = SCContentFilter(display: display,
+                                 excludingWindows: content.windows.filter { excluded.contains($0.windowID) })
     let config = SCStreamConfiguration()
     let mode = CGDisplayCopyDisplayMode(screen)
     let width = mode?.pixelWidth ?? display.width
@@ -60,9 +61,10 @@ func captureScreen(
 
 /// Encodes PNG when `quality` is nil, JPEG otherwise, and reports the encoded image size.
 func captureScreenImage(
-    displayID: CGDirectDisplayID?, edge: Int, quality: Int?, showsCursor: Bool
+    displayID: CGDirectDisplayID?, edge: Int, quality: Int?, showsCursor: Bool, excludingWindows: [CGWindowID] = []
 ) async throws -> (data: Data, width: Int, height: Int) {
-    let (filter, config) = try await screenCaptureSource(displayID: displayID, edge: edge)
+    let (filter, config) = try await screenCaptureSource(displayID: displayID, edge: edge,
+                                                         excludingWindows: excludingWindows)
     config.showsCursor = showsCursor
 
     let image: CGImage

@@ -19,8 +19,13 @@ use koko_proto::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::{
     Host,
+    arbiter::{AGENT_IDLE, Arbiter, HUMAN_GRACE},
+    audit::Audit,
     desktop::{AppDesktop, AppDesktopRequests, RemoteHost},
     session::{Sessions, report_end},
     trust::{Trust, TrustRecord},
@@ -153,6 +158,7 @@ impl ProtocolHandler for Pairing {
 /// Pairing decisions for one listening host. Every state change is reported on stdout for the app.
 struct HostState {
     sessions: watch::Sender<Sessions>,
+    arbiter: Arc<Arbiter>,
     trust: Trust,
     open: bool,
     pending: Option<(u64, PairRequest)>,
@@ -275,6 +281,7 @@ impl HostState {
                 }
                 if ended.agent.is_some() {
                     report_end(PeerKind::Agent);
+                    self.arbiter.reset();
                 }
                 println!("Trusted devices: 0");
                 return;
@@ -285,7 +292,16 @@ impl HostState {
                     .send_if_modified(|sessions| sessions.agent.take().is_some())
                 {
                     report_end(PeerKind::Agent);
+                    self.arbiter.reset();
                 }
+                return;
+            }
+            "stop-agent" => {
+                self.arbiter.stop();
+                return;
+            }
+            "resume-agent" => {
+                self.arbiter.resume();
                 return;
             }
             _ => {}
@@ -332,7 +348,9 @@ pub(crate) async fn serve(
         return Err("pairing requires an IPv4 listen address".into());
     }
 
-    let trust = Trust::load(app.map(|(file, _)| file.parent().unwrap_or_else(|| Path::new("."))))?;
+    let directory = app.map(|(file, _)| file.parent().unwrap_or_else(|| Path::new(".")));
+    let trust = Trust::load(directory)?;
+    let arbiter = Arc::new(Arbiter::new(HUMAN_GRACE, AGENT_IDLE));
     let endpoint = bind_host(key, address).await?;
     let address = endpoint.bound_sockets()[0];
     let code = InviteCode::generate();
@@ -355,6 +373,8 @@ pub(crate) async fn serve(
             RemoteHost {
                 sessions: sessions.clone(),
                 app_desktop: app.is_some().then_some(app_desktop),
+                arbiter: arbiter.clone(),
+                audit: directory.map(Audit::new),
                 pointer: tokio::sync::Mutex::new(()),
                 #[cfg(unix)]
                 video: tokio::sync::Mutex::new(()),
@@ -382,6 +402,7 @@ pub(crate) async fn serve(
 
     let mut state = HostState {
         sessions,
+        arbiter,
         trust,
         open: true,
         pending: None,
@@ -391,6 +412,7 @@ pub(crate) async fn serve(
     let expires = tokio::time::sleep(INVITE_LIFETIME);
     tokio::pin!(interrupt, expires);
     let mut app_desktops = AppDesktopRequests::default();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             biased;
@@ -399,6 +421,7 @@ pub(crate) async fn serve(
                 break;
             }
             _ = &mut expires, if state.open => state.expire_code(),
+            _ = tick.tick() => state.arbiter.expire(),
             Some(request) = incoming.recv() => state.request(request),
             Some(request) = desktop_requests.recv() => app_desktops.request(request),
             command = commands.recv() => {
@@ -465,6 +488,7 @@ mod tests {
             incoming,
             state: HostState {
                 sessions,
+                arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::ZERO)),
                 trust: Trust::load(Some(directory.path()))?,
                 open: true,
                 pending: None,
@@ -535,7 +559,8 @@ mod tests {
                 request_pairing(controller.clone(), target, try_code.as_ref()),
                 approve,
             );
-            assert_eq!(paired?, address);
+            // A host bound to 0.0.0.0 may answer on any local interface, so only the port is fixed.
+            assert_eq!(paired?.port(), address.port());
             check_host(controller, host_id, address).await
         })
         .await??;
