@@ -3,24 +3,24 @@ use std::fmt;
 use std::io::{self, BufRead};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iroh::{
-    EndpointId, SecretKey,
+    EndpointAddr, EndpointId, SecretKey,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use koko_p2p::{
     bind_host,
-    pairing::{INVITE_LIFETIME, InviteCode, direct_invite, listening_target, publish_invite},
+    pairing::{VerificationCode, device_id, direct_invite, listening_target, publish_host},
 };
 use koko_proto::{
     ALPN, CONTROL_READY, CONTROL_REQUEST, HumanResult, MAX_HELP_REASON, MAX_PAIR_REQUEST,
-    PAIR_ALPN, PAIR_VERSION, PairGranted, PairHello, PeerKind, REMOTE_ALPN, Scope,
+    PAIR_ALPN, PAIR_CODE_REQUIRED, PAIR_VERSION, PairGranted, PairHello, PeerKind, REMOTE_ALPN,
+    Scope,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-
-use std::sync::Arc;
-use std::time::Duration;
 
 use crate::{
     Host,
@@ -35,6 +35,62 @@ use crate::{
 const DECLINED: &str = "pairing declined or expired";
 const AGENT_BUSY: &str = "agent_busy";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeMode {
+    Temporary,
+    Custom,
+    Both,
+}
+
+impl CodeMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "temporary" => Some(Self::Temporary),
+            "custom" => Some(Self::Custom),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    fn allows_temporary(self) -> bool {
+        matches!(self, Self::Temporary | Self::Both)
+    }
+
+    fn allows_custom(self) -> bool {
+        matches!(self, Self::Custom | Self::Both)
+    }
+}
+
+struct Codes {
+    mode: CodeMode,
+    temporary: VerificationCode,
+    custom: Option<VerificationCode>,
+}
+
+impl Codes {
+    fn new() -> Self {
+        Self {
+            mode: CodeMode::Both,
+            temporary: VerificationCode::generate(),
+            custom: None,
+        }
+    }
+
+    fn matches(&self, supplied: &VerificationCode) -> bool {
+        (self.mode.allows_temporary() && self.temporary.matches(supplied))
+            || (self.mode.allows_custom()
+                && self
+                    .custom
+                    .as_ref()
+                    .is_some_and(|code| code.matches(supplied)))
+    }
+
+    fn refresh_temporary(&mut self) -> VerificationCode {
+        self.temporary = VerificationCode::generate();
+        self.temporary.clone()
+    }
+}
+
 struct AgentRequest {
     name: String,
     scope: Scope,
@@ -43,8 +99,10 @@ struct AgentRequest {
 struct PairRequest {
     peer: EndpointId,
     by_code: bool,
+    quiet: bool,
     /// None for people, including every client that predates pairing version 2.
     agent: Option<AgentRequest>,
+    human_name: String,
     decision: oneshot::Sender<Result<Scope, &'static str>>,
 }
 
@@ -58,14 +116,14 @@ impl PairRequest {
     fn describe(&self) -> String {
         let (kind, name) = match &self.agent {
             Some(agent) => (PeerKind::Agent, agent.name.as_str()),
-            None => (PeerKind::Human, ""),
+            None => (PeerKind::Human, self.human_name.as_str()),
         };
         serde_json::json!({"kind": kind, "name": name, "scope": self.scope()}).to_string()
     }
 }
 
 struct Pairing {
-    code: InviteCode,
+    codes: Arc<Mutex<Codes>>,
     requests: mpsc::Sender<PairRequest>,
 }
 
@@ -82,7 +140,7 @@ impl ProtocolHandler for Pairing {
             .read_to_end(MAX_PAIR_REQUEST)
             .await
             .map_err(AcceptError::from_err)?;
-        let (by_code, agent, versioned) = if bytes.first() == Some(&b'{') {
+        let (by_code, quiet, agent, human_name, versioned) = if bytes.first() == Some(&b'{') {
             let Some(hello) = serde_json::from_slice::<PairHello>(&bytes)
                 .ok()
                 .filter(PairHello::valid)
@@ -90,33 +148,42 @@ impl ProtocolHandler for Pairing {
                 connection.close(1u32.into(), b"invalid pairing request");
                 return Ok(());
             };
-            let by_code = match hello.code.as_deref().map(str::parse::<InviteCode>) {
+            let by_code = match hello.code.as_deref().map(str::parse::<VerificationCode>) {
                 None => false,
-                Some(Ok(code)) if self.code.matches(code.bytes()) => true,
+                Some(Ok(code)) if self.codes.lock().unwrap().matches(&code) => true,
                 Some(_) => {
                     connection.close(1u32.into(), b"invalid pairing code");
                     return Ok(());
                 }
             };
+            let name = hello.name.trim().to_owned();
             let agent = (hello.kind == PeerKind::Agent).then(|| AgentRequest {
-                name: hello.name.trim().to_owned(),
+                name: name.clone(),
                 scope: hello.scope,
             });
-            (by_code, agent, true)
+            (by_code, hello.quiet, agent, name, true)
         } else {
-            let by_code = self.code.matches(&bytes);
-            if !by_code && bytes != CONTROL_REQUEST {
+            let by_code = if bytes == CONTROL_REQUEST {
+                false
+            } else if let Ok(text) = std::str::from_utf8(&bytes)
+                && let Ok(code) = text.parse::<VerificationCode>()
+                && self.codes.lock().unwrap().matches(&code)
+            {
+                true
+            } else {
                 connection.close(1u32.into(), b"invalid pairing code");
                 return Ok(());
-            }
-            (by_code, None, false)
+            };
+            (by_code, false, None, String::new(), false)
         };
 
         let (decision, response) = oneshot::channel();
         let request = PairRequest {
             peer: connection.remote_id(),
             by_code,
+            quiet,
             agent,
+            human_name,
             decision,
         };
         if self.requests.try_send(request).is_err() {
@@ -162,7 +229,8 @@ struct HostState {
     arbiter: Arc<Arbiter>,
     outbox: Arc<Outbox>,
     trust: Trust,
-    open: bool,
+    codes: Arc<Mutex<Codes>>,
+    target: Option<EndpointAddr>,
     pending: Option<(u64, PairRequest)>,
     request_number: u64,
 }
@@ -180,9 +248,7 @@ impl HostState {
                     let _ = request.decision.send(Err(DECLINED));
                     return;
                 }
-                (self.open && request.by_code)
-                    || (!request.by_code
-                        && trusted.is_some_and(|record| record.kind == PeerKind::Human))
+                request.by_code || trusted.is_some_and(|record| record.kind == PeerKind::Human)
             }
             Some(agent) => {
                 if sessions
@@ -196,7 +262,7 @@ impl HostState {
                     let _ = request.decision.send(Err(DECLINED));
                     return;
                 }
-                // A connection code only finds the host. An agent's first pairing is always confirmed.
+                // A verification code only finds the host. An agent's first pairing is always confirmed.
                 trusted.is_some_and(|record| {
                     record.kind == PeerKind::Agent && agent.scope <= record.scope
                 })
@@ -205,6 +271,8 @@ impl HostState {
         if approved {
             let scope = request.scope();
             self.approve(request, scope, false);
+        } else if request.agent.is_none() && request.quiet {
+            let _ = request.decision.send(Err(PAIR_CODE_REQUIRED));
         } else if (request.agent.is_some() || !request.by_code)
             && self
                 .pending
@@ -228,7 +296,7 @@ impl HostState {
         if remember {
             let (kind, name) = match &request.agent {
                 Some(agent) => (PeerKind::Agent, agent.name.as_str()),
-                None => (PeerKind::Human, ""),
+                None => (PeerKind::Human, request.human_name.as_str()),
             };
             match self
                 .trust
@@ -254,18 +322,17 @@ impl HostState {
                 );
             }
         }
-        if self.open {
-            self.open = false;
-            println!("Pair code used");
-        }
         self.pending = None;
         let _ = request.decision.send(Ok(scope));
     }
 
-    fn expire_code(&mut self) {
-        if self.open {
-            self.open = false;
-            println!("Pair code expired");
+    fn refresh_temporary_code(&self) {
+        let code = self.codes.lock().unwrap().refresh_temporary();
+        println!("Pair code: {code}");
+        if let Some(target) = &self.target
+            && let Some(direct) = direct_invite(target, &code)
+        {
+            println!("Pair invite: {direct}");
         }
     }
 
@@ -287,6 +354,10 @@ impl HostState {
                     self.arbiter.reset();
                 }
                 println!("Trusted devices: 0");
+                return;
+            }
+            "refresh-code" => {
+                self.refresh_temporary_code();
                 return;
             }
             "end-agent" => {
@@ -317,6 +388,22 @@ impl HostState {
                 return;
             }
             _ => {}
+        }
+        if let Some(mode) = line.strip_prefix("code-mode ") {
+            if let Some(mode) = CodeMode::parse(mode.trim()) {
+                self.codes.lock().unwrap().mode = mode;
+            }
+            return;
+        }
+        if let Some(raw) = line.strip_prefix("custom-code ") {
+            let trimmed = raw.trim();
+            let mut codes = self.codes.lock().unwrap();
+            if trimmed.is_empty() {
+                codes.custom = None;
+            } else if let Ok(code) = trimmed.parse::<VerificationCode>() {
+                codes.custom = Some(code);
+            }
+            return;
         }
         // The person at the host dropped files to send to the controller.
         if let Some(offer) = line.strip_prefix("outbox ") {
@@ -394,20 +481,22 @@ pub(crate) async fn serve(
     let outbox = Arc::new(Outbox::default());
     let endpoint = bind_host(key, address).await?;
     let address = endpoint.bound_sockets()[0];
-    let code = InviteCode::generate();
-    let display_code = code.to_string();
-    let direct = direct_invite(&listening_target(endpoint.id(), address)?, &code);
-    let advertisement =
-        match publish_invite(endpoint.id(), address, &code, app.map(|(_, name)| name)) {
-            Ok(advertisement) => Some(advertisement),
-            Err(error) => {
-                eprintln!("Discovery unavailable: {error}");
-                None
-            }
-        };
+    let target = listening_target(endpoint.id(), address)?;
+    let codes = Arc::new(Mutex::new(Codes::new()));
+    let display_code = codes.lock().unwrap().temporary.to_string();
+    let direct = direct_invite(&target, &codes.lock().unwrap().temporary);
+    let advertisement = match publish_host(endpoint.id(), address, app.map(|(_, name)| name)) {
+        Ok(advertisement) => Some(advertisement),
+        Err(error) => {
+            eprintln!("Discovery unavailable: {error}");
+            None
+        }
+    };
     let (sessions, authorized) = watch::channel(Sessions::default());
+    let mut session_changes = sessions.subscribe();
     let (requests, mut incoming) = mpsc::channel(1);
     let (app_desktop, mut desktop_requests) = AppDesktop::channel();
+    let host_device_id = device_id(endpoint.id());
     let router = Router::builder(endpoint)
         .accept(
             REMOTE_ALPN,
@@ -423,10 +512,17 @@ pub(crate) async fn serve(
             },
         )
         .accept(ALPN, Host { authorized })
-        .accept(PAIR_ALPN, Pairing { code, requests })
+        .accept(
+            PAIR_ALPN,
+            Pairing {
+                codes: codes.clone(),
+                requests,
+            },
+        )
         .spawn();
 
     println!("Listening on {address}");
+    println!("Device ID: {host_device_id}");
     println!("Trusted devices: {}", trust.len());
     println!("Pair code: {display_code}");
     if let Some(direct) = direct {
@@ -447,13 +543,14 @@ pub(crate) async fn serve(
         arbiter,
         outbox,
         trust,
-        open: true,
+        codes,
+        target: Some(target),
         pending: None,
         request_number: 0,
     };
+    let mut had_human = false;
     let interrupt = tokio::signal::ctrl_c();
-    let expires = tokio::time::sleep(INVITE_LIFETIME);
-    tokio::pin!(interrupt, expires);
+    tokio::pin!(interrupt);
     let mut app_desktops = AppDesktopRequests::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -463,8 +560,14 @@ pub(crate) async fn serve(
                 result?;
                 break;
             }
-            _ = &mut expires, if state.open => state.expire_code(),
             _ = tick.tick() => state.arbiter.expire(),
+            Ok(()) = session_changes.changed() => {
+                let has_human = session_changes.borrow_and_update().human.is_some();
+                if had_human && !has_human {
+                    state.refresh_temporary_code();
+                }
+                had_human = has_human;
+            }
             Some(request) = incoming.recv() => state.request(request),
             Some(request) = desktop_requests.recv() => app_desktops.request(request),
             command = commands.recv() => {
@@ -492,7 +595,8 @@ mod tests {
     use koko_p2p::{
         check_host,
         pairing::{
-            PairingOptions, lan_request, request_agent_pairing, request_pairing, resolve_invite,
+            HumanPairing, PairingOptions, lan_request, request_agent_pairing,
+            request_human_pairing, request_pairing, resolve_invite,
         },
     };
     use tokio::time::timeout;
@@ -516,11 +620,17 @@ mod tests {
         let address = endpoint.bound_sockets()[0];
         let (sessions, authorized) = watch::channel(Sessions::default());
         let (requests, incoming) = mpsc::channel(1);
-        let code = InviteCode::generate();
-        let display = code.to_string();
+        let codes = Arc::new(Mutex::new(Codes::new()));
+        let display = codes.lock().unwrap().temporary.to_string();
         let router = Router::builder(endpoint)
             .accept(ALPN, Host { authorized })
-            .accept(PAIR_ALPN, Pairing { code, requests })
+            .accept(
+                PAIR_ALPN,
+                Pairing {
+                    codes: codes.clone(),
+                    requests,
+                },
+            )
             .spawn();
         let directory = tempfile::tempdir()?;
         Ok(TestHost {
@@ -534,7 +644,8 @@ mod tests {
                 arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::ZERO)),
                 outbox: Default::default(),
                 trust: Trust::load(Some(directory.path()))?,
-                open: true,
+                codes,
+                target: None,
                 pending: None,
                 request_number: 0,
             },
@@ -549,7 +660,7 @@ mod tests {
         scope: Scope,
     ) -> impl Future<Output = Result<(SocketAddr, Scope), Box<dyn Error>>> + use<> {
         let target = EndpointAddr::new(host.id).with_ip_addr(host.address);
-        let code = code.map(|code| code.parse::<InviteCode>().unwrap());
+        let code = code.map(|code| code.parse::<VerificationCode>().unwrap());
         let agent = agent.clone();
         async move {
             request_agent_pairing(
@@ -575,17 +686,17 @@ mod tests {
         let address = SocketAddr::from((Ipv4Addr::LOCALHOST, bind.port()));
         let (sessions, authorized) = watch::channel(Sessions::default());
         let (requests, mut incoming) = mpsc::channel(1);
-        let code = InviteCode::generate();
+        let codes = Arc::new(Mutex::new(Codes::new()));
         let invitation = lan_request(
             &EndpointAddr::new(host_id)
                 .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)))
                 .with_ip_addr(address),
         );
-        let (try_code, target) = resolve_invite(&invitation).await?;
+        let (try_code, target) = resolve_invite(&invitation)?;
         assert!(try_code.is_none());
         let router = Router::builder(endpoint)
             .accept(ALPN, Host { authorized })
-            .accept(PAIR_ALPN, Pairing { code, requests })
+            .accept(PAIR_ALPN, Pairing { codes, requests })
             .spawn();
 
         timeout(Duration::from_secs(10), async {
@@ -613,6 +724,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quiet_human_pairing_requires_a_code_and_supports_custom_codes()
+    -> Result<(), Box<dyn Error>> {
+        let mut host = test_host().await?;
+        let controller = SecretKey::generate();
+        let target = EndpointAddr::new(host.id).with_ip_addr(host.address);
+
+        timeout(Duration::from_secs(10), async {
+            let quiet_no_code = request_human_pairing(
+                controller.clone(),
+                target.clone(),
+                HumanPairing {
+                    name: "MacBook",
+                    code: None,
+                    quiet: true,
+                },
+                PairingOptions::default(),
+            );
+            let answer = async {
+                host.state.request(host.incoming.recv().await.unwrap());
+                assert!(host.state.pending.is_none());
+            };
+            let (result, ()) = tokio::join!(quiet_no_code, answer);
+            assert!(format!("{:?}", result.unwrap_err()).contains(PAIR_CODE_REQUIRED));
+
+            host.state.command("custom-code MYCODE88");
+            host.state.command("code-mode custom");
+            let custom: VerificationCode = "mycode88".parse().unwrap();
+            let by_custom = request_human_pairing(
+                controller.clone(),
+                target.clone(),
+                HumanPairing {
+                    name: "MacBook",
+                    code: Some(&custom),
+                    quiet: true,
+                },
+                PairingOptions::default(),
+            );
+            let accept = async { host.state.request(host.incoming.recv().await.unwrap()) };
+            let (paired, ()) = tokio::join!(by_custom, accept);
+            assert_eq!(paired?.port(), host.address.port());
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        host.router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn an_agent_is_confirmed_once_then_reconnects_by_trust() -> Result<(), Box<dyn Error>> {
         let mut host = test_host().await?;
         let agent = SecretKey::generate();
@@ -636,7 +795,6 @@ mod tests {
                 host.state.sessions.borrow().scope(agent.public()),
                 Some(Scope::Observer)
             );
-            assert!(!host.state.open, "an approval uses up the connection code");
 
             // After the host restarts its session, the trusted agent reconnects without a prompt.
             host.state.sessions.send_replace(Sessions::default());
@@ -688,9 +846,8 @@ mod tests {
             assert!(format!("{:?}", paired.unwrap_err()).contains(AGENT_BUSY));
 
             let target = EndpointAddr::new(host.id).with_ip_addr(host.address);
-            let code = host.code.parse::<InviteCode>()?;
+            let code = host.code.parse::<VerificationCode>()?;
             let reopen = async {
-                host.state.open = true;
                 host.state.request(host.incoming.recv().await.unwrap());
             };
             let (paired, ()) =

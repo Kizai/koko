@@ -677,7 +677,8 @@ fn execute(command: RemoteCommand) -> RemoteReply {
             unreachable!("session commands are handled by the host")
         }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
-        RemoteCommand::Capture { .. }
+        RemoteCommand::Wallpaper
+        | RemoteCommand::Capture { .. }
         | RemoteCommand::UiTree { .. }
         | RemoteCommand::Displays
         | RemoteCommand::ClipboardPull { .. }

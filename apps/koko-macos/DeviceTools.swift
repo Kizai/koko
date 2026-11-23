@@ -15,7 +15,7 @@ struct DeviceToolRequest: Identifiable {
     init(_ action: Action, host: NearbyHost, name: String, preferredAddress: String?) {
         self.action = action
         self.name = name
-        let advertised = host.request.split(separator: "/").last?.split(separator: ",").map(String.init) ?? []
+        let advertised = host.endpointAddresses
         var addresses = [String]()
         for endpoint in [preferredAddress].compactMap({ $0 }) + advertised {
             guard let ip = endpoint.split(separator: ":").first.map(String.init),

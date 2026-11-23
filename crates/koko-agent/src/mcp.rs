@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, SecretKey};
-use koko_p2p::pairing::{PairingOptions, discover_hosts, request_agent_pairing, resolve_invite};
+use koko_p2p::pairing::{
+    PairingOptions, VerificationCode, discover_hosts, find_device, parse_device_id,
+    request_agent_pairing, resolve_invite,
+};
 use koko_p2p::remote::RemoteClient;
 use koko_proto::{
     APPROVAL_TIMEOUT, HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON,
@@ -626,10 +629,22 @@ impl KokoMcp {
         };
         let (code, target, previous) = match (params.code_or_invite, params.device_id) {
             (Some(input), _) => {
-                let (code, target) = resolve_invite(&input)
-                    .await
-                    .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
-                (code, target, None)
+                if input.trim().starts_with("koko://") {
+                    let (code, target) = resolve_invite(&input)
+                        .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
+                    (code, target, None)
+                } else if let Some(id) = parse_device_id(&input) {
+                    let discovered = find_device(&id, None)
+                        .await
+                        .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
+                    (None, discovered.target, None)
+                } else if let Ok(code) = input.parse::<VerificationCode>() {
+                    return Err(invalid(format!(
+                        "Give a 9-digit device ID or direct invite alongside verification code {code}."
+                    )));
+                } else {
+                    return Err(invalid("Expected a 9-digit device ID or direct invite."));
+                }
             }
             (None, Some(device)) => {
                 let record = self.record(device_id(&device)?).await?;

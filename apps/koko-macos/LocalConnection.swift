@@ -61,18 +61,40 @@ private struct PeerDescription: Decodable {
 struct PairedHost: Decodable, Equatable {
     let hostID: String
     let address: String
+    var deviceID: String? = nil
+    var name: String? = nil
+    var os: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case hostID = "host_id"
-        case address
+        case deviceID = "device_id"
+        case address, name, os
     }
 }
 
-struct NearbyHost: Decodable, Identifiable {
+struct NearbyHost: Decodable, Identifiable, Equatable {
     let id: String
+    var deviceID: String? = nil
     let label: String
     let request: String
     let os: String?
+    var isOnline: Bool = true
+    var knownAddresses: [String] = []
+    var lastConnectedAt: Date? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case deviceID = "device_id"
+        case label, request, os
+    }
+
+    var endpointAddresses: [String] {
+        if !request.isEmpty,
+           let list = request.split(separator: "/").last?.split(separator: ",").map(String.init) {
+            return list
+        }
+        return knownAddresses
+    }
 
     var platformName: String {
         switch os {
@@ -392,8 +414,15 @@ final class LocalConnection: ObservableObject {
     static let frameRates = [30, 60, 90, 120, 144, 165, 240]
     @Published var listenPort = UserDefaults.standard.string(forKey: "listenPort") ?? "4444"
     @Published var inviteInput = ""
+    @Published var partnerDeviceID = ""
+    @Published var partnerCode = ""
     @Published private(set) var controllerID = ""
     @Published private(set) var hostID = ""
+    @Published private(set) var hostDeviceID = ""
+    @Published var verificationMode = VerificationCodeMode(
+        rawValue: UserDefaults.standard.string(forKey: "verificationCodeMode") ?? ""
+    ) ?? .both
+    @Published private(set) var customVerificationCode = KeychainCode.load()
     @Published private(set) var isChecking = false
     @Published private(set) var isHosting = false {
         didSet { KeepAwake.shared.update(hosting: isHosting) }
@@ -404,6 +433,7 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
     @Published private(set) var pendingPair: PendingPair?
+    @Published private(set) var codePromptHostID: String?
     @Published private(set) var agentSession: AgentSession? {
         didSet { updateAgentIndicator() }
     }
@@ -443,6 +473,11 @@ final class LocalConnection: ObservableObject {
     private var detectedUpgradePermissionLoss = false
     @Published private(set) var isScanning = false
     @Published private var discoveredHosts: [NearbyHost] = []
+    @Published private(set) var rememberedDevices: [DeviceRecord] = DeviceHistoryStore.loadRecords()
+    @Published private(set) var deviceCovers: [String: NSImage] = {
+        let records = DeviceHistoryStore.loadRecords()
+        return DeviceHistoryStore.loadCovers(for: records.map(\.id))
+    }()
     @Published private(set) var deviceNames = UserDefaults.standard.dictionary(forKey: "deviceNames") as? [String: String] ?? [:] {
         didSet { UserDefaults.standard.set(deviceNames, forKey: "deviceNames") }
     }
@@ -450,6 +485,7 @@ final class LocalConnection: ObservableObject {
         didSet { UserDefaults.standard.set(hiddenDevices, forKey: "hiddenDevices") }
     }
     @Published var selectedNearbyHostID: String?
+    @Published var showAllDevices = false
     @Published private(set) var session: PairedHost?
     @Published private(set) var isViewOnly = false
     @Published private(set) var remoteFrame: NSImage?
@@ -474,7 +510,23 @@ final class LocalConnection: ObservableObject {
     let localHostName = Host.current().localizedName ?? "此 Mac"
 
     var nearbyHosts: [NearbyHost] {
-        discoveredHosts.filter { !hiddenDevices.contains($0.id) }
+        let online = discoveredHosts.filter { !hiddenDevices.contains($0.id) }
+        let onlineIDs = Set(online.map(\.id))
+        let offline = rememberedDevices
+            .filter { !onlineIDs.contains($0.id) && !hiddenDevices.contains($0.id) && $0.id != hostID }
+            .map { record in
+                NearbyHost(
+                    id: record.id,
+                    deviceID: record.deviceID,
+                    label: record.name,
+                    request: "",
+                    os: record.os,
+                    isOnline: false,
+                    knownAddresses: record.addresses,
+                    lastConnectedAt: record.lastConnectedAt
+                )
+            }
+        return online + offline
     }
 
     private let identityDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -642,15 +694,13 @@ final class LocalConnection: ObservableObject {
         case "Pair approved":
             endHostDesktop()
             isSharingWithPeer = true
-            connectionCode = ""
-            directInvite = ""
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "远程协助已授权，控制端可查看与操作。")
         case "Session closed":
             endHostDesktop()
             isSharingWithPeer = false
             hostPointer.release()
-            hostNotice = ConnectionNotice(message: "远程会话已结束。仍可从局域网重新连接。")
+            hostNotice = ConnectionNotice(message: "远程会话已结束。")
         case "Pair declined", "Pair request ended":
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
@@ -677,9 +727,17 @@ final class LocalConnection: ObservableObject {
                 trustedDeviceCount = count
             } else if line.hasPrefix("Trust storage failed: ") {
                 hostNotice = ConnectionNotice(message: "无法保存设备信任。请检查 Koko 的数据目录。", isError: true)
+            } else if line.hasPrefix("Device ID: ") {
+                hostDeviceID = String(line.dropFirst("Device ID: ".count))
+                let mode = verificationMode
+                let custom = customVerificationCode
+                Task {
+                    await sendHost("code-mode \(mode.rawValue)")
+                    if !custom.isEmpty { await sendHost("custom-code \(custom)") }
+                }
             } else if line.hasPrefix("Pair code: ") {
                 connectionCode = String(line.dropFirst("Pair code: ".count))
-                hostNotice = ConnectionNotice(message: "连接码 5 分钟内有效，授权一次后失效。")
+                hostNotice = nil
             } else if line.hasPrefix("Pair invite: ") {
                 directInvite = String(line.dropFirst("Pair invite: ".count))
             } else if line.hasPrefix("Pair request: ") {
@@ -817,6 +875,11 @@ final class LocalConnection: ObservableObject {
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
                 let settings = VideoSettings(display: display, edge: edge, quality: quality, fps: fps)
                 Task { await streamDesktopVideo(settings, socket: socket) }
+            case "wallpaper":
+                let shot = try await captureWallpaper()
+                screenPermission = .granted
+                return RemoteReply(status: "image", image: shot.data.base64EncodedString(),
+                                   width: shot.width, height: shot.height, format: "jpeg")
             case "screenshot", "capture":
                 guard !isCapturingScreen else { return RemoteReply(status: "error", code: "capture_busy") }
                 isCapturingScreen = true
@@ -981,6 +1044,31 @@ final class LocalConnection: ObservableObject {
         deviceNames[host.id] = label.isEmpty ? nil : label
     }
 
+    func refreshTemporaryCode() async {
+        await sendHost("refresh-code")
+    }
+
+    func setVerificationMode(_ mode: VerificationCodeMode) async {
+        verificationMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "verificationCodeMode")
+        await sendHost("code-mode \(mode.rawValue)")
+    }
+
+    func saveCustomVerificationCode(_ code: String) async {
+        let cleaned = code.filter { $0.isLetter || $0.isNumber }.uppercased()
+        customVerificationCode = cleaned
+        KeychainCode.save(cleaned)
+        await sendHost("custom-code \(cleaned)")
+    }
+
+    func removeDeviceRecord(_ id: String) {
+        rememberedDevices.removeAll { $0.id == id }
+        DeviceHistoryStore.saveRecords(rememberedDevices)
+        deviceCovers.removeValue(forKey: id)
+        DeviceHistoryStore.removeCover(for: id)
+        if selectedNearbyHostID == id { selectedNearbyHostID = nil }
+    }
+
     func hide(_ host: NearbyHost) {
         hiddenDevices.append(host.id)
         if selectedNearbyHostID == host.id { selectedNearbyHostID = nil }
@@ -1025,10 +1113,48 @@ final class LocalConnection: ObservableObject {
     }
 
     func verify(code: String, viewOnly: Bool = false) async {
+        await connect(target: code, verificationCode: nil, quiet: false, knownHost: nil, viewOnly: viewOnly)
+    }
+
+    func connectByDeviceID(_ rawID: String, code: String, viewOnly: Bool = false) async {
+        let trimmedTarget = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = trimmedTarget.filter(\.isWholeNumber)
+        let known = rememberedDevices.first { $0.deviceID == digits || $0.id == trimmedTarget }
+        await connect(
+            target: trimmedTarget,
+            verificationCode: trimmedCode.isEmpty ? nil : trimmedCode,
+            quiet: true,
+            knownHost: known,
+            viewOnly: viewOnly
+        )
+    }
+
+    func openSavedDevice(_ host: NearbyHost, code: String? = nil, viewOnly: Bool = false) async {
+        let trimmedCode = code?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = !host.request.isEmpty ? host.request : (host.deviceID ?? host.id)
+        let known = rememberedDevices.first { $0.id == host.id }
+        await connect(
+            target: target,
+            verificationCode: trimmedCode?.isEmpty == false ? trimmedCode : nil,
+            quiet: true,
+            knownHost: known,
+            viewOnly: viewOnly
+        )
+    }
+
+    private func connect(
+        target: String,
+        verificationCode: String?,
+        quiet: Bool,
+        knownHost: DeviceRecord?,
+        viewOnly: Bool
+    ) async {
         isChecking = true
         cancelRequested = false
-        controllerNotice = ConnectionNotice(message: code.hasPrefix("koko://request/")
-            ? "正在连接局域网设备…" : "正在使用授权码连接…")
+        codePromptHostID = nil
+        controllerNotice = ConnectionNotice(message: target.hasPrefix("koko://request/")
+            ? "正在连接局域网设备…" : "正在连接设备…")
         defer {
             checkProcess = nil
             isChecking = false
@@ -1036,7 +1162,12 @@ final class LocalConnection: ObservableObject {
 
         do {
             let defaults = UserDefaults.standard
-            var arguments = ["pair", keyPath(for: .controller), code]
+            var arguments = ["pair", keyPath(for: .controller), target, "--name", localHostName]
+            if let verificationCode { arguments.append(contentsOf: ["--code", verificationCode]) }
+            if quiet { arguments.append("--quiet") }
+            if let knownHost, !knownHost.addresses.isEmpty {
+                arguments.append(contentsOf: ["--known", "\(knownHost.id)/\(knownHost.addresses.joined(separator: ","))"])
+            }
             if defaults.object(forKey: "preferLAN") as? Bool ?? true { arguments.append("--prefer-lan") }
             if defaults.object(forKey: "enhancedConnections") as? Bool ?? true { arguments.append("--enhanced") }
             let command = try LocalCommand(.controller, arguments: arguments)
@@ -1048,21 +1179,68 @@ final class LocalConnection: ObservableObject {
             isViewOnly = viewOnly
             session = host
             controllerNotice = nil
+            recordConnectedHost(host, fallbackRecord: knownHost)
+            Task { await fetchWallpaper(for: host) }
         } catch {
             let message = error.localizedDescription
             if cancelRequested {
-                controllerNotice = ConnectionNotice(message: "已取消配对。")
-            } else if message.contains("Koko host not found") {
-                controllerNotice = ConnectionNotice(message: "找不到被控端。请核对连接码。通过组网连接时，可以改用被控端的直连邀请。", isError: true)
+                controllerNotice = ConnectionNotice(message: "已取消连接。")
+            } else if message.contains("code_required") {
+                if let id = selectedNearbyHostID {
+                    codePromptHostID = id
+                }
+                controllerNotice = ConnectionNotice(message: "请输入该设备的验证码以完成连接。", isError: true)
+            } else if message.contains("invalid pairing code") {
+                if let id = selectedNearbyHostID {
+                    codePromptHostID = id
+                }
+                controllerNotice = ConnectionNotice(message: "验证码不正确，请核对后重试。", isError: true)
+            } else if message.contains("Koko device not found") || message.contains("Koko host not found") {
+                controllerNotice = ConnectionNotice(message: "未找到该设备。请确认双方在同一局域网且对方已开启远程协助，或改用直连邀请。", isError: true)
             } else if message.contains("direct invite") {
                 controllerNotice = ConnectionNotice(message: "直连邀请格式无效，请在被控端重新复制。", isError: true)
             } else if message.contains("pairing declined or expired") || message.contains("pairing unavailable") {
                 controllerNotice = ConnectionNotice(message: "请求被拒绝、已过期或被控端正在处理另一请求。", isError: true)
-            } else if message.contains("connection code") {
-                controllerNotice = ConnectionNotice(message: "请输入被控端显示的 10 位连接码。", isError: true)
+            } else if message.contains("verification code") {
+                controllerNotice = ConnectionNotice(message: "请输入 6–16 位字母或数字验证码。", isError: true)
             } else {
                 controllerNotice = ConnectionNotice(message: message, isError: true)
             }
+        }
+    }
+
+    private func recordConnectedHost(_ host: PairedHost, fallbackRecord: DeviceRecord?) {
+        let discovered = discoveredHosts.first { $0.id == host.hostID }
+        let name = discovered?.label ?? host.name ?? fallbackRecord?.name ?? "KoKo \(host.hostID.prefix(8))"
+        let os = discovered?.os ?? host.os ?? fallbackRecord?.os
+        let deviceID = discovered?.deviceID ?? host.deviceID ?? fallbackRecord?.deviceID ?? ""
+        var addresses = [host.address]
+        for addr in (discovered?.endpointAddresses ?? []) + (fallbackRecord?.addresses ?? []) where !addresses.contains(addr) {
+            addresses.append(addr)
+        }
+        let record = DeviceRecord(
+            id: host.hostID,
+            deviceID: deviceID,
+            name: name,
+            os: os,
+            addresses: Array(addresses.prefix(6)),
+            lastConnectedAt: Date()
+        )
+        rememberedDevices.removeAll { $0.id == host.hostID }
+        rememberedDevices.insert(record, at: 0)
+        DeviceHistoryStore.saveRecords(rememberedDevices)
+    }
+
+    private func fetchWallpaper(for host: PairedHost) async {
+        do {
+            let reply = try await remote(RemoteAction(action: "wallpaper"), session: host)
+            if reply.status == "image", let encoded = reply.image,
+               let data = Data(base64Encoded: encoded),
+               let image = DeviceHistoryStore.saveCover(data, for: host.hostID) {
+                deviceCovers[host.hostID] = image
+            }
+        } catch {
+            // Cover image is optional; keep existing cover or fallback backdrop.
         }
     }
 

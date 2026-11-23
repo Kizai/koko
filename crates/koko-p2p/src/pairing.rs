@@ -3,13 +3,13 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::str::FromStr;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::presets};
 use koko_proto::{
-    CONTROL_READY, CONTROL_REQUEST, MAX_PAIR_REPLY, PAIR_ALPN, PAIR_VERSION, PairGranted,
-    PairHello, PeerKind, Scope,
+    MAX_PAIR_REPLY, PAIR_ALPN, PAIR_VERSION, PairGranted, PairHello, PeerKind, Scope,
 };
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::time::timeout;
@@ -17,66 +17,80 @@ use tokio::time::timeout;
 const SERVICE: &str = "_koko-pair._udp.local.";
 const DIRECT_INVITE_PREFIX: &str = "koko://pair/v1/";
 const LAN_REQUEST_PREFIX: &str = "koko://request/v1/";
+/// Letters and digits that cannot be mistaken for one another, for generated codes.
 const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
-pub const CODE_LENGTH: usize = 10;
-pub const INVITE_LIFETIME: Duration = Duration::from_secs(5 * 60);
+pub const TEMPORARY_CODE_LENGTH: usize = 8;
+/// Lengths accepted for any code, including one the host owner chose.
+pub const CODE_LENGTHS: RangeInclusive<usize> = 6..=16;
+/// How long a lookup by device ID listens for the host on the local network.
+const FIND_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub struct InviteCode([u8; CODE_LENGTH]);
+/// A verification code: ASCII letters and digits, compared without case, spaces or dashes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerificationCode(String);
 
-impl InviteCode {
+impl VerificationCode {
     pub fn generate() -> Self {
         let random = SecretKey::generate().to_bytes();
-        Self(std::array::from_fn(|index| {
-            ALPHABET[usize::from(random[index] & 31)]
-        }))
+        Self(
+            random[..TEMPORARY_CODE_LENGTH]
+                .iter()
+                .map(|byte| char::from(ALPHABET[usize::from(byte & 31)]))
+                .collect(),
+        )
     }
 
-    fn discovery_proof(&self, host: EndpointId) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"koko/lan-pair/1");
-        hasher.update(host.as_bytes());
-        hasher.update(&self.0);
-        hasher.finalize().to_hex().to_string()
+    /// Compares hashes, so the time taken does not reveal how much of a guess was right.
+    pub fn matches(&self, other: &Self) -> bool {
+        blake3::hash(self.0.as_bytes()) == blake3::hash(other.0.as_bytes())
     }
 
-    pub fn matches(&self, supplied: &[u8]) -> bool {
-        blake3::hash(&self.0) == blake3::hash(supplied)
-    }
-
-    pub fn bytes(&self) -> &[u8] {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl fmt::Display for InviteCode {
+impl fmt::Display for VerificationCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (first, last) = self.0.split_at(5);
-        write!(
-            formatter,
-            "{}-{}",
-            std::str::from_utf8(first).unwrap(),
-            std::str::from_utf8(last).unwrap()
-        )
+        formatter.write_str(&self.0)
     }
 }
 
-impl FromStr for InviteCode {
+impl FromStr for VerificationCode {
     type Err = &'static str;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let code: [u8; CODE_LENGTH] = value
-            .bytes()
-            .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'-')
-            .map(|byte| byte.to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| "expected a 10-character Koko connection code")?;
-        if code.iter().all(|byte| ALPHABET.contains(byte)) {
+        let code: String = value
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != '-')
+            .map(|ch| ch.to_ascii_uppercase())
+            .collect();
+        if CODE_LENGTHS.contains(&code.len()) && code.chars().all(|ch| ch.is_ascii_alphanumeric()) {
             Ok(Self(code))
         } else {
-            Err("invalid characters in Koko connection code")
+            Err("expected a 6-16 character verification code of letters and digits")
         }
     }
+}
+
+/// The 9-digit number people type to reach a host. It comes from the host key, so it never
+/// changes and a controller can check it against the key the host proves in QUIC.
+pub fn device_id(host: EndpointId) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"koko/device-id/1");
+    hasher.update(host.as_bytes());
+    let hash = hasher.finalize();
+    let number = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+    (100_000_000 + number % 900_000_000).to_string()
+}
+
+/// Accepts a device ID written with or without spaces, such as `253 153 157`.
+pub fn parse_device_id(input: &str) -> Option<String> {
+    let digits: String = input.chars().filter(|ch| !ch.is_whitespace()).collect();
+    (digits.len() == 9
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && !digits.starts_with('0'))
+    .then_some(digits)
 }
 
 pub fn listening_target(host: EndpointId, bind: SocketAddr) -> io::Result<EndpointAddr> {
@@ -92,7 +106,7 @@ pub fn listening_target(host: EndpointId, bind: SocketAddr) -> io::Result<Endpoi
     Ok(EndpointAddr::from_parts(host, addresses))
 }
 
-pub fn direct_invite(target: &EndpointAddr, code: &InviteCode) -> Option<String> {
+pub fn direct_invite(target: &EndpointAddr, code: &VerificationCode) -> Option<String> {
     (!target.is_empty()).then(|| format!("{DIRECT_INVITE_PREFIX}{code}/{}", target_path(target)))
 }
 
@@ -108,9 +122,10 @@ fn target_path(target: &EndpointAddr) -> String {
     format!("{}/{}", target.id, addresses.join(","))
 }
 
-pub async fn resolve_invite(
+/// Reads a direct invite, which carries a code, or a LAN request, which does not.
+pub fn resolve_invite(
     input: &str,
-) -> Result<(Option<InviteCode>, EndpointAddr), Box<dyn Error>> {
+) -> Result<(Option<VerificationCode>, EndpointAddr), Box<dyn Error>> {
     let input = input.trim();
     if let Some(invite) = input.strip_prefix(DIRECT_INVITE_PREFIX) {
         let (code, target) = invite.split_once('/').ok_or("invalid direct invite")?;
@@ -118,9 +133,7 @@ pub async fn resolve_invite(
     } else if let Some(target) = input.strip_prefix(LAN_REQUEST_PREFIX) {
         Ok((None, parse_target(target)?))
     } else {
-        let code = input.parse()?;
-        let target = discover_invite(&code).await?;
-        Ok((Some(code), target))
+        Err("expected a KoKo direct invite".into())
     }
 }
 
@@ -143,17 +156,16 @@ fn parse_target(input: &str) -> Result<EndpointAddr, Box<dyn Error>> {
     ))
 }
 
-pub fn publish_invite(
+/// Announces the host on the local network. Codes are never published; the device ID is
+/// derived from the announced key.
+pub fn publish_host(
     host: EndpointId,
     bind: SocketAddr,
-    code: &InviteCode,
     label: Option<&str>,
 ) -> Result<ServiceDaemon, Box<dyn Error>> {
-    let proof = code.discovery_proof(host);
-    let name = format!("koko-{}", &proof[..16]);
+    let name = format!("koko-{}", device_id(host));
     let mut properties = vec![
         ("id", host.to_string()),
-        ("proof", proof),
         ("os", std::env::consts::OS.to_owned()),
     ];
     if let Some(label) = label {
@@ -188,33 +200,22 @@ pub fn publish_invite(
     Ok(daemon)
 }
 
-async fn discover_invite(code: &InviteCode) -> Result<EndpointAddr, Box<dyn Error>> {
-    let daemon = ServiceDaemon::new()?;
-    let events = daemon.browse(SERVICE)?;
-    let found = timeout(Duration::from_secs(8), async {
-        while let Ok(event) = events.recv_async().await {
-            if let ServiceEvent::ServiceResolved(service) = event
-                && let Some(target) = discovered_target(&service)
-                && service.get_property_val_str("proof")
-                    == Some(code.discovery_proof(target.id).as_str())
-            {
-                return Some(target);
-            }
-        }
-        None
-    })
-    .await;
-    let _ = daemon.shutdown();
-    found
-        .ok()
-        .flatten()
-        .ok_or_else(|| "Koko host not found for this code".into())
-}
-
 pub struct DiscoveredHost {
     pub target: EndpointAddr,
     pub name: Option<String>,
     pub os: Option<String>,
+}
+
+impl DiscoveredHost {
+    fn add(&mut self, service: &ResolvedService, target: EndpointAddr) {
+        self.target.addrs.extend(target.addrs);
+        if let Some(os) = service.get_property_val_str("os") {
+            self.os = Some(os.to_owned());
+        }
+        if let Some(label) = service.get_property_val_str("name") {
+            self.name = Some(label.to_owned());
+        }
+    }
 }
 
 pub async fn discover_hosts() -> Result<Vec<DiscoveredHost>, Box<dyn Error>> {
@@ -226,24 +227,65 @@ pub async fn discover_hosts() -> Result<Vec<DiscoveredHost>, Box<dyn Error>> {
             if let ServiceEvent::ServiceResolved(service) = event
                 && let Some(target) = discovered_target(&service)
             {
-                let host = hosts.entry(target.id).or_insert_with(|| DiscoveredHost {
-                    target: EndpointAddr::new(target.id),
-                    name: None,
-                    os: None,
-                });
-                host.target.addrs.extend(target.addrs);
-                if let Some(os) = service.get_property_val_str("os") {
-                    host.os = Some(os.to_owned());
-                }
-                if let Some(label) = service.get_property_val_str("name") {
-                    host.name = Some(label.to_owned());
-                }
+                hosts
+                    .entry(target.id)
+                    .or_insert_with(|| DiscoveredHost {
+                        target: EndpointAddr::new(target.id),
+                        name: None,
+                        os: None,
+                    })
+                    .add(&service, target);
             }
         }
     })
     .await;
     let _ = daemon.shutdown();
     Ok(hosts.into_values().collect())
+}
+
+/// Finds the host with this device ID on the local network. When it does not answer there,
+/// falls back to `known`, the addresses a controller remembers from an earlier connection.
+pub async fn find_device(
+    device: &str,
+    known: Option<EndpointAddr>,
+) -> Result<DiscoveredHost, Box<dyn Error>> {
+    let known = known.filter(|target| device_id(target.id) == device);
+    let daemon = ServiceDaemon::new()?;
+    let events = daemon.browse(SERVICE)?;
+    let found = timeout(FIND_TIMEOUT, async {
+        while let Ok(event) = events.recv_async().await {
+            if let ServiceEvent::ServiceResolved(service) = event
+                && let Some(target) = discovered_target(&service)
+                && device_id(target.id) == device
+            {
+                let mut host = DiscoveredHost {
+                    target: EndpointAddr::new(target.id),
+                    name: None,
+                    os: None,
+                };
+                host.add(&service, target);
+                return Some(host);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    let _ = daemon.shutdown();
+    match (found, known) {
+        (Some(mut host), Some(known)) => {
+            host.target.addrs.extend(known.addrs);
+            Ok(host)
+        }
+        (Some(host), None) => Ok(host),
+        (None, Some(known)) => Ok(DiscoveredHost {
+            target: known,
+            name: None,
+            os: None,
+        }),
+        (None, None) => Err("Koko device not found".into()),
+    }
 }
 
 fn discovered_target(service: &ResolvedService) -> Option<EndpointAddr> {
@@ -321,23 +363,52 @@ impl PairingOptions {
     }
 }
 
+/// How a person's controller asks a host to let it in.
+pub struct HumanPairing<'a> {
+    /// This controller's name, shown to the host owner when they are asked.
+    pub name: &'a str,
+    pub code: Option<&'a VerificationCode>,
+    /// Refuse with `code_required` instead of asking the host owner.
+    pub quiet: bool,
+}
+
 pub async fn request_pairing(
     key: SecretKey,
     target: EndpointAddr,
-    code: Option<&InviteCode>,
+    code: Option<&VerificationCode>,
 ) -> Result<SocketAddr, Box<dyn Error>> {
-    request_pairing_with_options(key, target, code, PairingOptions::default()).await
+    let pairing = HumanPairing {
+        name: "KoKo",
+        code,
+        quiet: false,
+    };
+    request_human_pairing(key, target, pairing, PairingOptions::default()).await
 }
 
-pub async fn request_pairing_with_options(
+/// Pairs a person's controller. A valid code or the host's trust lets it in at once;
+/// otherwise the host owner is asked, unless the request is quiet.
+pub async fn request_human_pairing(
     key: SecretKey,
     target: EndpointAddr,
-    code: Option<&InviteCode>,
+    pairing: HumanPairing<'_>,
     options: PairingOptions,
 ) -> Result<SocketAddr, Box<dyn Error>> {
-    let payload = code.map_or(CONTROL_REQUEST, |code| &code.0);
-    let (address, reply) = exchange(key, target, payload, CONTROL_READY.len(), options).await?;
-    if reply != CONTROL_READY {
+    let hello = PairHello {
+        v: PAIR_VERSION,
+        kind: PeerKind::Human,
+        name: pairing.name.to_owned(),
+        scope: Scope::Human,
+        code: pairing.code.map(ToString::to_string),
+        quiet: pairing.quiet,
+    };
+    if !hello.valid() {
+        return Err("invalid controller name".into());
+    }
+    let payload = serde_json::to_vec(&hello)?;
+    let (address, reply) = exchange(key, target, &payload, MAX_PAIR_REPLY, options).await?;
+    let granted: PairGranted =
+        serde_json::from_slice(&reply).map_err(|_| "invalid Koko pairing response")?;
+    if granted.v != PAIR_VERSION || granted.scope != Scope::Human {
         return Err("invalid Koko pairing response".into());
     }
     Ok(address)
@@ -348,7 +419,7 @@ pub async fn request_pairing_with_options(
 pub async fn request_agent_pairing(
     key: SecretKey,
     target: EndpointAddr,
-    code: Option<&InviteCode>,
+    code: Option<&VerificationCode>,
     name: &str,
     scope: Scope,
     options: PairingOptions,
@@ -359,6 +430,7 @@ pub async fn request_agent_pairing(
         name: name.to_owned(),
         scope,
         code: code.map(ToString::to_string),
+        quiet: false,
     };
     if !hello.valid() {
         return Err("invalid agent name or scope".into());
@@ -405,7 +477,32 @@ async fn exchange(
 
 #[cfg(test)]
 mod tests {
+    use koko_proto::MAX_PAIR_REQUEST;
+
     use super::*;
+
+    #[test]
+    fn device_ids_are_stable_nine_digit_numbers() {
+        let host = SecretKey::generate().public();
+        let id = device_id(host);
+        assert_eq!(id, device_id(host));
+        assert_eq!(
+            parse_device_id(&format!("{} {} {}", &id[..3], &id[3..6], &id[6..])),
+            Some(id)
+        );
+        assert_eq!(parse_device_id("12345678"), None);
+        assert_eq!(parse_device_id("012345678"), None);
+    }
+
+    #[test]
+    fn codes_ignore_case_spaces_and_dashes() {
+        let generated = VerificationCode::generate();
+        assert_eq!(generated.as_str().len(), TEMPORARY_CODE_LENGTH);
+        let typed: VerificationCode = "ab12-cd 34".parse().unwrap();
+        assert!(typed.matches(&"AB12CD34".parse().unwrap()));
+        assert!("abc12".parse::<VerificationCode>().is_err(), "too short");
+        assert!("abc12!".parse::<VerificationCode>().is_err(), "punctuation");
+    }
 
     #[test]
     fn lan_preference_uses_the_interface_netmask() {
@@ -435,22 +532,25 @@ mod tests {
     async fn enhanced_pairing_retries_handshake_but_honors_decline() -> Result<(), Box<dyn Error>> {
         let host = crate::bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
         let target = EndpointAddr::new(host.id()).with_ip_addr(host.bound_sockets()[0]);
-        let client = request_pairing_with_options(
-            SecretKey::generate(),
-            target,
-            None,
-            PairingOptions {
-                enhanced: true,
-                ..Default::default()
-            },
-        );
+        let pairing = HumanPairing {
+            name: "Studio",
+            code: None,
+            quiet: false,
+        };
+        let options = PairingOptions {
+            enhanced: true,
+            ..Default::default()
+        };
+        let client = request_human_pairing(SecretKey::generate(), target, pairing, options);
         let server = async {
             host.accept().await.unwrap().refuse();
             let connection = host.accept().await.unwrap().await.unwrap();
             let (_send, mut recv) = connection.accept_bi().await.unwrap();
+            let hello: PairHello =
+                serde_json::from_slice(&recv.read_to_end(MAX_PAIR_REQUEST).await.unwrap()).unwrap();
             assert_eq!(
-                recv.read_to_end(CODE_LENGTH).await.unwrap(),
-                CONTROL_REQUEST
+                (hello.kind, hello.name.as_str()),
+                (PeerKind::Human, "Studio")
             );
             connection.close(1u32.into(), b"pairing declined or expired");
         };

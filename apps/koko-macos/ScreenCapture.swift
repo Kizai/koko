@@ -59,6 +59,31 @@ func captureScreen(
     try await captureScreenImage(displayID: displayID, edge: edge, quality: quality, showsCursor: showsCursor).data
 }
 
+func captureWallpaper(
+    edge: Int = 1280, quality: Int = 80
+) async throws -> (data: Data, width: Int, height: Int) {
+    guard CGPreflightScreenCaptureAccess() else { throw ScreenCaptureError.permissionRequired }
+    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    let screen = CGMainDisplayID()
+    guard let display = content.displays.first(where: { $0.displayID == screen }) else {
+        throw ScreenCaptureError.displayUnavailable
+    }
+    // Normal app windows sit at layer >= 0; desktop/wallpaper windows live at negative levels.
+    let excluded = content.windows.filter { $0.windowLayer >= 0 }
+    let filter = SCContentFilter(display: display, excludingWindows: excluded)
+    let config = SCStreamConfiguration()
+    let mode = CGDisplayCopyDisplayMode(screen)
+    let width = mode?.pixelWidth ?? display.width
+    let height = mode?.pixelHeight ?? display.height
+    let scale = min(1, Double(edge) / Double(max(width, height)))
+    config.width = max(1, Int(Double(width) * scale))
+    config.height = max(1, Int(Double(height) * scale))
+    config.pixelFormat = kCVPixelFormatType_32BGRA
+    config.capturesAudio = false
+    config.showsCursor = false
+    return try await encodeScreenImage(filter: filter, config: config, quality: quality)
+}
+
 /// Encodes PNG when `quality` is nil, JPEG otherwise, and reports the encoded image size.
 func captureScreenImage(
     displayID: CGDirectDisplayID?, edge: Int, quality: Int?, showsCursor: Bool, excludingWindows: [CGWindowID] = []
@@ -66,6 +91,12 @@ func captureScreenImage(
     let (filter, config) = try await screenCaptureSource(displayID: displayID, edge: edge,
                                                          excludingWindows: excludingWindows)
     config.showsCursor = showsCursor
+    return try await encodeScreenImage(filter: filter, config: config, quality: quality)
+}
+
+private func encodeScreenImage(
+    filter: SCContentFilter, config: SCStreamConfiguration, quality: Int?
+) async throws -> (data: Data, width: Int, height: Int) {
 
     let image: CGImage
     if #available(macOS 14, *) {

@@ -69,7 +69,14 @@ pub struct PairHello {
     pub scope: Scope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Asks the host to refuse at once with `PAIR_CODE_REQUIRED` instead of asking its owner,
+    /// when neither a code nor trust lets this client in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
+
+/// The close reason for a quiet pairing request that needs a verification code.
+pub const PAIR_CODE_REQUIRED: &str = "code_required";
 
 impl PairHello {
     pub fn valid(&self) -> bool {
@@ -221,6 +228,9 @@ pub enum RemoteCommand {
         timeout_s: u16,
     },
     Screenshot,
+    /// The desktop picture of the main display without any windows, as a JPEG `image` reply,
+    /// so a controller can show it as the device's cover.
+    Wallpaper,
     Displays,
     UiTree {
         max_nodes: u16,
@@ -560,6 +570,7 @@ impl RemoteCommand {
                 | Self::Displays
                 | Self::UiTree { .. }
                 | Self::Screenshot
+                | Self::Wallpaper
                 | Self::Capture { .. }
                 | Self::Video { .. }
                 | Self::Disconnect
@@ -636,6 +647,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
         | RemoteCommand::Hello
         | RemoteCommand::ReleaseControl
         | RemoteCommand::Screenshot
+        | RemoteCommand::Wallpaper
         | RemoteCommand::Displays
         | RemoteCommand::Key { .. } => true,
     }
@@ -659,6 +671,7 @@ mod tests {
         assert!(!pointer.allowed_for(Scope::Observer));
         assert!(pointer.allowed_for(Scope::AgentSafe));
         assert!(RemoteCommand::Displays.allowed_for(Scope::Observer));
+        assert!(RemoteCommand::Wallpaper.allowed_for(Scope::Observer));
         assert!(!RemoteCommand::ReleaseControl.allowed_for(Scope::Observer));
         let clipboard = RemoteCommand::ClipboardPull {
             transfer: "x".into(),

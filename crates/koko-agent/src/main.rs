@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use iroh::EndpointAddr;
 use koko_p2p::pairing::{
-    PairingOptions, discover_hosts, lan_request, request_pairing_with_options, resolve_invite,
+    HumanPairing, PairingOptions, VerificationCode, device_id, discover_hosts, find_device,
+    lan_request, parse_device_id, request_human_pairing, resolve_invite,
 };
 use koko_p2p::remote::{RemoteClient, send_command};
 use koko_p2p::{check_host, load_identity, load_or_create_identity};
@@ -34,7 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             pair(
                 &koko_directory()?.join("controller.key"),
                 code,
-                Default::default(),
+                PairArgs::default(),
             )
             .await?;
         }
@@ -66,16 +67,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let key = load_or_create_identity(&identity)?;
             mcp::serve(key, &identity, name).await?;
         }
-        [command, file, code, flags @ ..] if command == "pair" => {
-            let mut options = PairingOptions::default();
-            for flag in flags {
+        [command, file, target, flags @ ..] if command == "pair" => {
+            let mut args = PairArgs::default();
+            let mut flags = flags.iter();
+            while let Some(flag) = flags.next() {
                 match flag.as_str() {
-                    "--prefer-lan" => options.prefer_lan = true,
-                    "--enhanced" => options.enhanced = true,
+                    "--prefer-lan" => args.options.prefer_lan = true,
+                    "--enhanced" => args.options.enhanced = true,
+                    "--quiet" => args.quiet = true,
+                    "--code" => {
+                        let value = flags.next().ok_or("--code needs a value")?;
+                        args.code = Some(value.parse()?);
+                    }
+                    "--name" => {
+                        let value = flags.next().ok_or("--name needs a value")?;
+                        args.name = value.trim().to_owned();
+                    }
+                    "--known" => {
+                        let value = flags.next().ok_or("--known needs host_id/ip:port")?;
+                        args.known = Some(parse_known(value)?);
+                    }
                     _ => return Err(format!("unknown pairing option: {flag}").into()),
                 }
             }
-            pair(Path::new(file), code, options).await?;
+            pair(Path::new(file), target, args).await?;
         }
         [command] if command == "discover" => {
             let devices: Vec<_> = discover_hosts()
@@ -85,6 +100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let target = device.target;
                     serde_json::json!({
                         "id": target.id.to_string(),
+                        "device_id": device_id(target.id),
                         "os": device.os,
                         "label": device.name.unwrap_or_else(|| format!("Koko {}", target.id.fmt_short())),
                         "request": lan_request(&target),
@@ -244,12 +260,65 @@ fn koko_directory() -> Result<PathBuf, Box<dyn Error>> {
     Ok(directory)
 }
 
-async fn pair(path: &Path, input: &str, options: PairingOptions) -> Result<(), Box<dyn Error>> {
+struct PairArgs {
+    options: PairingOptions,
+    code: Option<VerificationCode>,
+    name: String,
+    quiet: bool,
+    known: Option<EndpointAddr>,
+}
+
+impl Default for PairArgs {
+    fn default() -> Self {
+        Self {
+            options: PairingOptions::default(),
+            code: None,
+            name: "KoKo".into(),
+            quiet: false,
+            known: None,
+        }
+    }
+}
+
+fn parse_known(value: &str) -> Result<EndpointAddr, Box<dyn Error>> {
+    let (host, addresses) = value.split_once('/').ok_or("invalid --known target")?;
+    let mut target = EndpointAddr::new(host.parse()?);
+    for address in addresses.split(',').filter(|item| !item.is_empty()) {
+        target = target.with_ip_addr(address.parse()?);
+    }
+    Ok(target)
+}
+
+async fn pair(path: &Path, input: &str, args: PairArgs) -> Result<(), Box<dyn Error>> {
     let key = load_or_create_identity(path)?;
-    let (code, target) = resolve_invite(input).await?;
+    let (invite_code, target, name, os) = if input.trim().starts_with("koko://") {
+        let (code, target) = resolve_invite(input)?;
+        (code, target, None, None)
+    } else if let Some(id) = parse_device_id(input) {
+        let discovered = find_device(&id, args.known).await?;
+        (None, discovered.target, discovered.name, discovered.os)
+    } else {
+        return Err("expected a 9-digit device ID or KoKo direct invite".into());
+    };
     let host = target.id;
-    let address = request_pairing_with_options(key, target, code.as_ref(), options).await?;
-    println!(r#"{{"status":"paired","host_id":"{host}","address":"{address}"}}"#);
+    let code = args.code.or(invite_code);
+    let pairing = HumanPairing {
+        name: &args.name,
+        code: code.as_ref(),
+        quiet: args.quiet,
+    };
+    let address = request_human_pairing(key, target, pairing, args.options).await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "paired",
+            "host_id": host.to_string(),
+            "device_id": device_id(host),
+            "address": address.to_string(),
+            "name": name,
+            "os": os,
+        })
+    );
     Ok(())
 }
 
