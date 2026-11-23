@@ -191,11 +191,24 @@ KOKO_NOTARY_PROFILE="koko-notary" \
 
 ### 发布应用内更新
 
-首次安装继续使用 DMG。0.1.20 起的应用会从所选 GitHub Release 加载该版本的 `appcast.xml`，显示下载进度并在解压前校验 ZIP 的 Ed25519 签名。用户可以取消下载，准备就绪后点「安装并重新启动」。重启会结束当前会话。macOS 在安装位置需要更高权限时会提示授权。
+首次安装继续使用 DMG。0.1.21 起的应用会从所选 GitHub Release 加载该版本的 `appcast.xml`，显示下载进度并在解压前校验 ZIP 的 Ed25519 签名。用户可以取消下载，准备就绪后点「安装并重新启动」。重启会结束当前会话。macOS 在安装位置需要更高权限时会提示授权。
 
 构建脚本从 Sparkle 官方发行页下载固定版本并校验 SHA-256。公开签名构建默认生成更新附件。内测发布可执行 `KOKO_UPDATE_ASSETS=1 ./scripts/build-macos.sh --allow-ad-hoc`。把 DMG 与同目录下 `updates/<版本>/` 中的 `Koko-<版本>.zip` 和 `appcast.xml` 一起上传到 `v<版本>` 的 GitHub Release。
 
-KoKo 的更新私钥保存在发布机登录钥匙串的 `io.github.kizai.koko.updates` 账户条目中，客户端的 `SUPublicEDKey` 固定了对应公钥。更换发布机时使用 Sparkle 的 `generate_keys` 安全迁移同一密钥。自行构建分支并独立发布时应使用自己的发布仓库与密钥。[Sparkle 发布说明](https://sparkle-project.org/documentation/publishing/)
+KoKo 的更新私钥保存在发布机登录钥匙串中，服务名为 `https://sparkle-project.org`、账户为 `io.github.kizai.koko.updates`，客户端的 `SUPublicEDKey` 固定了对应公钥。0.1.21 因原私钥遗失换用了新密钥，0.1.20 及更早版本无法应用内升级到 0.1.21，需要手动安装一次 DMG。
+
+更新私钥和[自签名证书](#创建自签名身份)一样只有一份，两者都要备份。在发布机上导出私钥（导出的文件就是明文私钥，保存到加密存储后删除原文件）：
+
+```bash
+"$(./scripts/macos-installer/sparkle.sh)/bin/generate_keys" --account io.github.kizai.koko.updates -x ~/Documents/KoKo-Sparkle-Update-Key.txt
+```
+
+在另一台发布机上导入前，先在「钥匙串访问」中搜索 `io.github.kizai.koko.updates`，删除旧条目，再导入并核对公钥与 `Info.plist` 一致：
+
+```bash
+"$(./scripts/macos-installer/sparkle.sh)/bin/generate_keys" --account io.github.kizai.koko.updates -f ~/Documents/KoKo-Sparkle-Update-Key.txt
+"$(./scripts/macos-installer/sparkle.sh)/bin/generate_keys" --account io.github.kizai.koko.updates -p
+```自行构建分支并独立发布时应使用自己的发布仓库与密钥。[Sparkle 发布说明](https://sparkle-project.org/documentation/publishing/)
 
 ## 复测
 
