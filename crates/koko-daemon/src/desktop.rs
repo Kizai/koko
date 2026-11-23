@@ -9,8 +9,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use koko_proto::{
-    HumanResult, MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope,
-    VIDEO_ERROR, valid_remote_command,
+    APPROVAL_TIMEOUT, HumanResult, MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand,
+    RemoteReply, Scope, VIDEO_ERROR, valid_remote_command,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -26,6 +26,16 @@ pub(crate) struct DesktopRequest {
     command: RemoteCommand,
     reply: oneshot::Sender<RemoteReply>,
     video_socket: Option<String>,
+    from: Origin,
+}
+
+/// Who sent a desktop request, so the app can apply the agent policy to agents only.
+#[derive(Clone, Copy, PartialEq)]
+enum Origin {
+    Person,
+    Agent,
+    /// An agent input the person at the host already allowed.
+    ApprovedAgent,
 }
 
 #[derive(Debug)]
@@ -44,10 +54,15 @@ impl AppDesktop {
     }
 
     async fn run(&self, command: RemoteCommand) -> RemoteReply {
-        self.request(command, None).await
+        self.request(command, None, Origin::Person).await
     }
 
-    async fn request(&self, command: RemoteCommand, video_socket: Option<String>) -> RemoteReply {
+    async fn request(
+        &self,
+        command: RemoteCommand,
+        video_socket: Option<String>,
+        from: Origin,
+    ) -> RemoteReply {
         let (reply, response) = oneshot::channel();
         let clipboard = matches!(command, RemoteCommand::Clipboard { .. });
         match tokio::time::timeout(command.desktop_timeout(), async {
@@ -56,6 +71,7 @@ impl AppDesktop {
                     command,
                     reply,
                     video_socket,
+                    from,
                 })
                 .await
                 .ok()?;
@@ -81,6 +97,12 @@ impl AppDesktopRequests {
             serde_json::to_value(&request.command).expect("desktop command is serializable");
         if let Some(socket) = request.video_socket {
             command["video_socket"] = socket.into();
+        }
+        if request.from != Origin::Person {
+            command["actor"] = "agent".into();
+        }
+        if request.from == Origin::ApprovedAgent {
+            command["approved"] = true.into();
         }
         println!("Desktop request: {} {command}", self.number);
         self.pending.insert(self.number, request.reply);
@@ -153,6 +175,7 @@ impl RemoteHost {
                 (Some(_), Ok(command)) if scope != Scope::Human => Some(command.clone()),
                 _ => None,
             };
+            let mut approved = false;
             let reply = match command {
                 Ok(command) if !command.allowed_for(scope) => RemoteReply::error("scope_denied"),
                 Ok(command @ RemoteCommand::Video { .. }) => {
@@ -246,6 +269,10 @@ impl RemoteHost {
                         self.arbiter.human_input();
                     }
                     let Some(app) = &self.app_desktop else {
+                        // Without the app there is no policy check, so agents may not send input.
+                        if agent && command.is_agent_input() {
+                            break 'run RemoteReply::error("desktop_unavailable");
+                        }
                         break 'run tokio::task::spawn_blocking(move || execute(command))
                             .await
                             .unwrap_or_else(|_| RemoteReply::error("desktop_unavailable"));
@@ -267,7 +294,16 @@ impl RemoteHost {
                             connection.close(1u32.into(), b"peer not authorized");
                             return Ok(());
                         }
-                        reply = app.run(command) => reply,
+                        reply = async {
+                            if agent && command.is_agent_input() {
+                                self.run_agent_input(app, command).await
+                            } else {
+                                (app.run(command).await, false)
+                            }
+                        } => {
+                            approved = reply.1;
+                            reply.0
+                        }
                     };
                     if let RemoteReply::Displays { control, .. } = &mut reply {
                         *control = Some(self.arbiter.control());
@@ -277,7 +313,7 @@ impl RemoteHost {
                 _ => RemoteReply::error("invalid_command"),
             };
             if let (Some(audit), Some(command)) = (&self.audit, &audited) {
-                audit.record(peer, command, &reply);
+                audit.record(peer, command, &reply, approved);
             }
             send.write_all(&serde_json::to_vec(&reply).map_err(AcceptError::from_err)?)
                 .await
@@ -285,6 +321,38 @@ impl RemoteHost {
             send.finish()?;
         }
         Ok(())
+    }
+
+    /// Runs an agent's input through the app's policy. A risky input waits for the person at the
+    /// host, then runs once more marked as approved. Returns whether a person approved it.
+    async fn run_agent_input(
+        &self,
+        app: &AppDesktop,
+        command: RemoteCommand,
+    ) -> (RemoteReply, bool) {
+        let reply = app.request(command.clone(), None, Origin::Agent).await;
+        let RemoteReply::ApprovalRequired { reason } = reply else {
+            return (reply, false);
+        };
+        let decision = match self.arbiter.request_approval() {
+            Ok(decision) => decision,
+            Err(code) => return (RemoteReply::error(code), false),
+        };
+        println!(
+            "Agent approval: {}",
+            serde_json::json!({ "reason": reason })
+        );
+        match tokio::time::timeout(APPROVAL_TIMEOUT, decision).await {
+            Ok(Ok(true)) => (
+                app.request(command, None, Origin::ApprovedAgent).await,
+                true,
+            ),
+            Ok(_) => (RemoteReply::error("approval_declined"), false),
+            Err(_) => {
+                self.arbiter.approval_timed_out();
+                (RemoteReply::error("approval_timeout"), false)
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -310,7 +378,11 @@ impl RemoteHost {
         let path = directory.path().join("v");
         let listener = UnixListener::bind(&path).map_err(AcceptError::from_err)?;
         if let RemoteReply::Error { code } = app
-            .request(command, Some(path.to_string_lossy().into_owned()))
+            .request(
+                command,
+                Some(path.to_string_lossy().into_owned()),
+                Origin::Person,
+            )
             .await
         {
             return send_video_error(send, &code).await;
@@ -743,6 +815,110 @@ mod tests {
         ));
         assert_eq!(arbiter.control(), ControlState::Active);
         client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_risky_agent_input_runs_only_after_approval() -> Result<(), Box<dyn Error>> {
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let agent = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions {
+            human: None,
+            agent: Some((agent.public(), Scope::AgentSafe)),
+        });
+        let arbiter = Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60)));
+        let (app_desktop, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(app_desktop),
+                    arbiter: arbiter.clone(),
+                    audit: None,
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let client = RemoteClient::connect(agent.clone(), host.clone()).await?;
+        let quit = RemoteCommand::Pointer {
+            display: 1,
+            events: vec![PointerEvent::KeyDown {
+                code: 12,
+                flags: 0x10,
+                repeat: false,
+            }],
+            source_os: None,
+        };
+
+        for allow in [true, false] {
+            let app = async {
+                let first = requests.recv().await.unwrap();
+                assert!(first.from == Origin::Agent);
+                first
+                    .reply
+                    .send(RemoteReply::ApprovalRequired {
+                        reason: "Press ⌘Q".into(),
+                    })
+                    .unwrap();
+                while arbiter.control() != ControlState::AwaitingApproval {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                arbiter.decide(allow);
+                if allow {
+                    let second = requests.recv().await.unwrap();
+                    assert!(second.from == Origin::ApprovedAgent);
+                    second.reply.send(RemoteReply::Ok).unwrap();
+                }
+            };
+            let (reply, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(client.send(&quit), app)
+            })
+            .await?;
+            match (allow, reply?) {
+                (true, RemoteReply::Ok) => {}
+                (false, RemoteReply::Error { code }) if code == "approval_declined" => {}
+                (_, other) => panic!("unexpected reply {other:?}"),
+            }
+            assert_eq!(arbiter.control(), ControlState::Active);
+        }
+        client.close().await;
+        router.shutdown().await?;
+
+        // Without the app nothing could check the policy, so agent input is refused.
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let (sessions, _) = watch::channel(Sessions {
+            human: None,
+            agent: Some((agent.public(), Scope::AgentSafe)),
+        });
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: None,
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let reply = send_command(
+            agent,
+            host,
+            &RemoteCommand::Text {
+                text: "rm -rf ~\n".into(),
+            },
+        )
+        .await?;
+        assert!(matches!(reply, RemoteReply::Error { code } if code == "desktop_unavailable"));
         router.shutdown().await?;
         Ok(())
     }

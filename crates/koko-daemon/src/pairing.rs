@@ -304,6 +304,10 @@ impl HostState {
                 self.arbiter.resume();
                 return;
             }
+            "approval allow" | "approval deny" => {
+                self.arbiter.decide(line == "approval allow");
+                return;
+            }
             // The app saw someone use this Mac's own keyboard or mouse.
             "local-input" => {
                 self.arbiter.human_input();

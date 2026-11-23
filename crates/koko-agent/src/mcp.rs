@@ -11,8 +11,8 @@ use iroh::{EndpointId, SecretKey};
 use koko_p2p::pairing::{PairingOptions, discover_hosts, request_agent_pairing, resolve_invite};
 use koko_p2p::remote::RemoteClient;
 use koko_proto::{
-    HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON, MAX_UI_NODES, MouseButton,
-    RemoteCommand, RemoteReply, Scope, UiNode,
+    APPROVAL_TIMEOUT, HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON,
+    MAX_UI_NODES, MouseButton, RemoteCommand, RemoteReply, Scope, UiNode,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -38,6 +38,8 @@ in KoKo on the host Mac and call koko_pair; the host owner approves the first pa
 Take a screenshot with koko_screenshot, or read the controls with koko_get_ui_tree, then use \
 koko_mouse with an element_id or with pixel coordinates from the screenshot, and koko_keyboard. The host owner sees when you are in control and can stop you at any time. \
 If a result says preempted_by_human, stop and tell the user; do not retry until they ask. \
+Risky actions, such as quitting apps, deleting, paying, sending, or typing in Terminal or System \
+Settings, wait up to 2 minutes for the host owner to approve them. \
 Call koko_request_human when a step needs a person, such as signing in or confirming a payment. \
 Call koko_release_control when you finish.";
 
@@ -71,6 +73,18 @@ impl Failure {
                 "The host Mac has not allowed KoKo to control the mouse and keyboard. Ask the user to grant Accessibility on the host.",
             ),
             "input_failed" => Self::new("input_failed", "The host could not send that input."),
+            "approval_declined" => Self::new(
+                "approval_declined",
+                "The host owner declined this risky action. Do not try it another way; tell the user what you wanted to do and why.",
+            ),
+            "approval_timeout" => Self::new(
+                "approval_timeout",
+                "Nobody approved this risky action within 2 minutes, so it was not performed. Ask the user before trying again.",
+            ),
+            "awaiting_approval" => Self::new(
+                "awaiting_approval",
+                "Another action is waiting for the host owner's approval. Wait for it to finish.",
+            ),
             "awaiting_human" => Self::new(
                 "awaiting_human",
                 "A request for help is still open on this host. Wait for its answer before acting.",
@@ -370,8 +384,14 @@ impl KokoMcp {
         };
         // Requests share the connection on separate streams; a request for help may wait minutes.
         drop(clients);
+        // An agent's input may wait for the person at the host to approve it.
+        let limit = if command.is_agent_input() {
+            APPROVAL_TIMEOUT + command.desktop_timeout() * 2 + Duration::from_secs(5)
+        } else {
+            command.desktop_timeout() + Duration::from_secs(3)
+        };
         let result = client
-            .send(command)
+            .send_within(command, limit)
             .await
             .map_err(|error| format!("{error:?}"));
         if result.is_err() {

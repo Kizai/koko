@@ -157,9 +157,13 @@ struct RemoteAction: Codable {
     var format: String? = nil
     var cursor: Bool? = nil
     var maxNodes: Int? = nil
+    /// Set by the daemon on input from an agent, and `approved` once the person allowed it.
+    var actor: String? = nil
+    var approved: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events, format, cursor
+        case actor, approved
         case maxNodes = "max_nodes"
         case sourceOS = "source_os"
         case videoSocket = "video_socket"
@@ -194,10 +198,11 @@ private struct RemoteReply: Codable {
     var app: String? = nil
     var nodes: [UINode]? = nil
     var truncated: Bool? = nil
+    var reason: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case status, packet, clipboard, png, code, image, displays, direct, video, width, height, format, control
-        case app, nodes, truncated
+        case app, nodes, truncated, reason
         case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
@@ -392,6 +397,7 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var agentControl = "idle" {
         didSet {
             if agentControl != "awaiting_human" { agentHelp = nil }
+            if agentControl != "awaiting_approval" { agentApproval = nil }
             updateAgentIndicator()
             watchLocalInput()
         }
@@ -400,7 +406,15 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var agentHelp: String? {
         didSet { updateAgentIndicator() }
     }
+    /// What a risky agent input would do, while it waits for the person's decision.
+    @Published private(set) var agentApproval: String? {
+        didSet { updateAgentIndicator() }
+    }
+    /// Kinds of risky input the person allowed for the rest of this agent session.
+    private var agentAllowances: Set<String> = []
+    private var pendingApprovalRule: String?
     private var localInputWatch: Task<Void, Never>?
+    private var agentPolicyFile: URL { identityDirectory.appendingPathComponent("agent-policy.json") }
     /// What the remote host reports about an agent while this Mac is controlling it.
     @Published private(set) var remoteAgentControl = "idle"
     private let agentIndicator = AgentIndicator()
@@ -567,6 +581,7 @@ final class LocalConnection: ObservableObject {
         agentIndicator.onStop = { [weak self] in Task { await self?.sendHost("stop-agent") } }
         agentIndicator.onResume = { [weak self] in Task { await self?.sendHost("resume-agent") } }
         agentIndicator.onAnswer = { [weak self] result in Task { await self?.answerAgentHelp(result) } }
+        agentIndicator.onDecide = { [weak self] choice in Task { await self?.decideAgentApproval(choice) } }
 
         do {
             let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -609,10 +624,11 @@ final class LocalConnection: ObservableObject {
         case "Agent session closed":
             agentSession = nil
             agentControl = "idle"
-        case "Agent control: idle", "Agent control: active", "Agent control: paused",
-             "Agent control: awaiting_human":
-            agentControl = String(line.dropFirst("Agent control: ".count))
+            agentAllowances = []
             hostNotice = ConnectionNotice(message: "Agent 会话已结束。")
+        case "Agent control: idle", "Agent control: active", "Agent control: paused",
+             "Agent control: awaiting_human", "Agent control: awaiting_approval":
+            agentControl = String(line.dropFirst("Agent control: ".count))
         case "Pair code expired":
             connectionCode = ""
             directInvite = ""
@@ -639,6 +655,12 @@ final class LocalConnection: ObservableObject {
                     }
                     pendingPair = request
                 }
+            } else if line.hasPrefix("Agent approval: ") {
+                struct Approval: Decodable { let reason: String }
+                if let approval = try? JSONDecoder().decode(Approval.self, from: Data(line.dropFirst("Agent approval: ".count).utf8)) {
+                    agentApproval = approval.reason
+                    NSApp.requestUserAttention(.criticalRequest)
+                }
             } else if line.hasPrefix("Agent help: ") {
                 struct Help: Decodable { let reason: String }
                 if let help = try? JSONDecoder().decode(Help.self, from: Data(line.dropFirst("Agent help: ".count).utf8)) {
@@ -650,6 +672,7 @@ final class LocalConnection: ObservableObject {
                 if fields.count == 2,
                    let peer = try? JSONDecoder().decode(PeerDescription.self, from: Data(fields[1].utf8)) {
                     agentSession = AgentSession(fingerprint: String(fields[0]), name: peer.name, scope: peer.scope)
+                    agentAllowances = []
                     pendingPair = nil
                     hostNotice = ConnectionNotice(message: "Agent「\(peer.name)」已连接，可\(agentAccessTitle(peer.scope))。")
                 }
@@ -679,6 +702,20 @@ final class LocalConnection: ObservableObject {
     }
 
     private func executeDesktopAction(_ action: RemoteAction) async -> RemoteReply {
+        if action.actor == "agent", action.approved != true, ["pointer", "text"].contains(action.action) {
+            let policy: AgentPolicy
+            do {
+                policy = try AgentPolicy.load(from: agentPolicyFile)
+            } catch {
+                policy = AgentPolicy()
+                hostNotice = ConnectionNotice(message: "agent-policy.json 格式有误，已改用默认的高危操作规则。", isError: true)
+            }
+            if let hit = policy.check(action, frontmost: NSWorkspace.shared.frontmostApplication),
+               !agentAllowances.contains(hit.rule) {
+                pendingApprovalRule = hit.rule
+                return RemoteReply(status: "approval_required", reason: hit.summary)
+            }
+        }
         do {
             switch action.action {
             case "clipboard":
@@ -809,8 +846,16 @@ final class LocalConnection: ObservableObject {
         await sendHost(note.isEmpty ? "agent-help \(result)" : "agent-help \(result) \(note)")
     }
 
+    /// Decides a risky agent input: once, session (allow this kind until the agent disconnects) or deny.
+    func decideAgentApproval(_ choice: String) async {
+        if choice == "session", let rule = pendingApprovalRule { agentAllowances.insert(rule) }
+        pendingApprovalRule = nil
+        await sendHost(choice == "deny" ? "approval deny" : "approval allow")
+    }
+
     private func updateAgentIndicator() {
-        agentIndicator.update(control: agentControl, agentName: agentSession?.name, help: agentHelp)
+        agentIndicator.update(control: agentControl, agentName: agentSession?.name,
+                              help: agentControl == "awaiting_approval" ? agentApproval : agentHelp)
     }
 
     /// While an agent operates, someone using this Mac's own mouse or keyboard takes control back.
@@ -818,11 +863,12 @@ final class LocalConnection: ObservableObject {
         localInputWatch?.cancel()
         localInputWatch = nil
         guard agentControl == "active" else { return }
+        let start = DispatchTime.now().uptimeNanoseconds
         localInputWatch = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard let self, self.agentControl == "active" else { return }
-                if localInputSinceInjection(within: 0.5) {
+                if localInputSinceInjection(within: 0.5, since: start) {
                     await self.sendHost("local-input")
                     return
                 }

@@ -101,7 +101,12 @@ pub enum ControlState {
     Paused,
     /// The agent asked a person for help and waits for the answer.
     AwaitingHuman,
+    /// A risky input waits for the person at the host to allow or decline it.
+    AwaitingApproval,
 }
+
+/// How long a risky agent input waits for the host's decision before it counts as declined.
+pub const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How a person answered an agent's request for help.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +374,10 @@ pub enum RemoteReply {
         packet: ClipboardPacket,
     },
     Ok,
+    /// Sent by the host app to the daemon only: this agent input needs the person's approval.
+    ApprovalRequired {
+        reason: String,
+    },
     Human {
         result: HumanResult,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,12 +465,10 @@ impl RemoteCommand {
         )
     }
 
-    /// Input an agent may send while it holds control.
+    /// Input an agent may send while it holds control. The older `click` and `key` commands are
+    /// left to people because they bypass the host app's checks when no app is running.
     pub fn is_agent_input(&self) -> bool {
-        matches!(
-            self,
-            Self::Pointer { .. } | Self::Click { .. } | Self::Key { .. } | Self::Text { .. }
-        )
+        matches!(self, Self::Pointer { .. } | Self::Text { .. })
     }
 
     /// Whether a person sending this takes control away from an agent. A bare release is not input.
@@ -470,7 +477,7 @@ impl RemoteCommand {
             Self::Pointer { events, .. } => events
                 .iter()
                 .any(|event| !matches!(event, PointerEvent::Release)),
-            Self::Clipboard { .. } => true,
+            Self::Clipboard { .. } | Self::Click { .. } | Self::Key { .. } => true,
             _ => self.is_agent_input(),
         }
     }

@@ -35,7 +35,18 @@ impl RemoteClient {
     }
 
     pub async fn send(&self, command: &RemoteCommand) -> Result<RemoteReply, Box<dyn Error>> {
-        timeout(command.desktop_timeout() + Duration::from_secs(3), async {
+        self.send_within(command, command.desktop_timeout() + Duration::from_secs(3))
+            .await
+    }
+
+    /// Sends a command and waits up to `limit` for the reply, for commands the host may hold
+    /// while a person decides.
+    pub async fn send_within(
+        &self,
+        command: &RemoteCommand,
+        limit: Duration,
+    ) -> Result<RemoteReply, Box<dyn Error>> {
+        timeout(limit, async {
             let mut recv = self.open_command(command).await?;
             Ok(serde_json::from_slice(
                 &recv.read_to_end(MAX_REMOTE_REPLY).await?,

@@ -21,8 +21,15 @@ impl Audit {
         }
     }
 
-    pub(crate) fn record(&self, peer: EndpointId, command: &RemoteCommand, reply: &RemoteReply) {
-        if let Err(error) = self.append(peer, command, reply) {
+    /// `approved` marks input that the person at the host allowed after a policy rule matched.
+    pub(crate) fn record(
+        &self,
+        peer: EndpointId,
+        command: &RemoteCommand,
+        reply: &RemoteReply,
+        approved: bool,
+    ) {
+        if let Err(error) = self.append(peer, command, reply, approved) {
             eprintln!("Audit log failed: {error}");
         }
     }
@@ -32,6 +39,7 @@ impl Audit {
         peer: EndpointId,
         command: &RemoteCommand,
         reply: &RemoteReply,
+        approved: bool,
     ) -> io::Result<()> {
         let mut entry = serde_json::json!({
             "time": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs()),
@@ -56,6 +64,9 @@ impl Audit {
             // The agent's own explanation of why it needs a person, kept for the host owner.
             RemoteCommand::RequestHuman { reason, .. } => entry["reason"] = reason.as_str().into(),
             _ => {}
+        }
+        if approved {
+            entry["approved_by_person"] = true.into();
         }
         if fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() > MAX_LOG) {
             fs::rename(&self.path, self.path.with_extension("log.1"))?;
@@ -85,6 +96,7 @@ mod tests {
                 text: "secret password".into(),
             },
             &RemoteReply::error("preempted_by_human"),
+            false,
         );
         let log = fs::read_to_string(directory.path().join("audit.log"))?;
         assert!(log.contains(r#""action":"text""#), "{log}");

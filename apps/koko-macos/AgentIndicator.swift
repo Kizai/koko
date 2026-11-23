@@ -10,6 +10,8 @@ final class AgentIndicator {
     var onResume: () -> Void = {}
     /// Answers a request for help with resolved, taken_over or declined.
     var onAnswer: (String) -> Void = { _ in }
+    /// Decides a risky input: once, session or deny.
+    var onDecide: (String) -> Void = { _ in }
     private var panel: NSPanel?
     private var hotKey: EventHotKeyRef?
     private var handler: EventHandlerRef?
@@ -21,7 +23,7 @@ final class AgentIndicator {
     }
 
     func update(control: String, agentName: String?, help: String?) {
-        guard let agentName, ["active", "paused", "awaiting_human"].contains(control) else {
+        guard let agentName, ["active", "paused", "awaiting_human", "awaiting_approval"].contains(control) else {
             hide()
             return
         }
@@ -29,7 +31,8 @@ final class AgentIndicator {
         self.panel = panel
         let content = NSHostingView(rootView: AgentBar(
             name: agentName, control: control, help: help, stop: { [weak self] in self?.onStop() },
-            resume: { [weak self] in self?.onResume() }, answer: { [weak self] in self?.onAnswer($0) }
+            resume: { [weak self] in self?.onResume() }, answer: { [weak self] in self?.onAnswer($0) },
+            decide: { [weak self] in self?.onDecide($0) }
         ))
         panel.contentView = content
         panel.setContentSize(content.fittingSize)
@@ -89,11 +92,13 @@ private struct AgentBar: View {
     let stop: () -> Void
     let resume: () -> Void
     let answer: (String) -> Void
+    let decide: (String) -> Void
 
     private var tint: Color {
         switch control {
         case "paused": Color.secondary.opacity(0.4)
         case "awaiting_human": Color.blue
+        case "awaiting_approval": Color.red
         default: Color.orange
         }
     }
@@ -105,6 +110,19 @@ private struct AgentBar: View {
                 Image(systemName: "pause.circle.fill").foregroundStyle(.secondary)
                 Text("Agent「\(name)」已暂停").font(.callout.weight(.medium))
                 Button("让 Agent 继续", action: resume)
+            case "awaiting_approval":
+                Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent「\(name)」想要执行高危操作").font(.callout.weight(.medium))
+                    if let help {
+                        Text(help).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(3).frame(maxWidth: 420, alignment: .leading)
+                    }
+                }
+                Button("允许一次") { decide("once") }
+                Button("本次会话都允许") { decide("session") }
+                    .help("这个 Agent 断开前，同类操作不再询问")
+                Button("拒绝", role: .destructive) { decide("deny") }
             case "awaiting_human":
                 Image(systemName: "hand.raised.fill").foregroundStyle(.blue)
                 VStack(alignment: .leading, spacing: 2) {

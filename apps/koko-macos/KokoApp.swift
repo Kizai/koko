@@ -454,6 +454,10 @@ private struct ConnectionView: View {
                                 .font(.caption).foregroundStyle(.orange)
                         case "paused":
                             Text("已暂停，等你允许后才能继续操作。").font(.caption).foregroundStyle(.secondary)
+                        case "awaiting_approval":
+                            Text("等你确认高危操作：\(connection.agentApproval ?? "")")
+                                .font(.caption).foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
                         case "awaiting_human":
                             Text("请你协助：\(connection.agentHelp ?? "")")
                                 .font(.caption).foregroundStyle(.blue)
@@ -469,6 +473,15 @@ private struct ConnectionView: View {
                     default: EmptyView()
                     }
                     Button("断开 Agent") { Task { await connection.endAgentSession() } }
+                }
+                if connection.agentControl == "awaiting_approval" {
+                    HStack {
+                        Spacer()
+                        Button("允许一次") { Task { await connection.decideAgentApproval("once") } }
+                        Button("本次会话都允许") { Task { await connection.decideAgentApproval("session") } }
+                        Button("拒绝") { Task { await connection.decideAgentApproval("deny") } }
+                            .buttonStyle(.borderedProminent)
+                    }
                 }
                 if connection.agentControl == "awaiting_human" {
                     HStack {

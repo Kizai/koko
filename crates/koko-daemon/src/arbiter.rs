@@ -11,6 +11,7 @@ pub(crate) const AGENT_IDLE: Duration = Duration::from_secs(60);
 
 pub(crate) const PREEMPTED: &str = "preempted_by_human";
 pub(crate) const AWAITING_HUMAN: &str = "awaiting_human";
+pub(crate) const AWAITING_APPROVAL: &str = "awaiting_approval";
 
 /// A person's answer to an agent's request for help, with an optional note for the agent.
 pub(crate) type Answer = (HumanResult, Option<String>);
@@ -29,6 +30,7 @@ struct State {
     human_input: Option<Instant>,
     agent_input: Instant,
     help: Option<oneshot::Sender<Answer>>,
+    approval: Option<oneshot::Sender<bool>>,
 }
 
 impl Arbiter {
@@ -41,6 +43,7 @@ impl Arbiter {
                 human_input: None,
                 agent_input: Instant::now(),
                 help: None,
+                approval: None,
             }),
         }
     }
@@ -55,6 +58,7 @@ impl Arbiter {
         match state.control {
             ControlState::Paused => return Err(PREEMPTED),
             ControlState::AwaitingHuman => return Err(AWAITING_HUMAN),
+            ControlState::AwaitingApproval => return Err(AWAITING_APPROVAL),
             ControlState::Idle => {
                 if state
                     .human_input
@@ -75,7 +79,10 @@ impl Arbiter {
     pub(crate) fn human_input(&self) {
         let mut state = self.state.lock().unwrap();
         state.human_input = Some(Instant::now());
-        if state.control == ControlState::Active {
+        if let Some(approval) = state.approval.take() {
+            let _ = approval.send(false);
+            set(&mut state, ControlState::Paused);
+        } else if state.control == ControlState::Active {
             set(&mut state, ControlState::Paused);
         }
     }
@@ -86,6 +93,9 @@ impl Arbiter {
         let mut state = self.state.lock().unwrap();
         if let Some(help) = state.help.take() {
             let _ = help.send((HumanResult::TakenOver, None));
+        }
+        if let Some(approval) = state.approval.take() {
+            let _ = approval.send(false);
         }
         set(&mut state, ControlState::Paused);
     }
@@ -102,9 +112,10 @@ impl Arbiter {
         let mut state = self.state.lock().unwrap();
         if matches!(
             state.control,
-            ControlState::Active | ControlState::AwaitingHuman
+            ControlState::Active | ControlState::AwaitingHuman | ControlState::AwaitingApproval
         ) {
             state.help = None;
+            state.approval = None;
             set(&mut state, ControlState::Idle);
         }
     }
@@ -113,6 +124,7 @@ impl Arbiter {
     pub(crate) fn reset(&self) {
         let mut state = self.state.lock().unwrap();
         state.help = None;
+        state.approval = None;
         set(&mut state, ControlState::Idle);
     }
 
@@ -129,6 +141,7 @@ impl Arbiter {
         match state.control {
             ControlState::Paused => return Err(PREEMPTED),
             ControlState::AwaitingHuman => return Err(AWAITING_HUMAN),
+            ControlState::AwaitingApproval => return Err(AWAITING_APPROVAL),
             ControlState::Idle | ControlState::Active => {}
         }
         let (answer, receiver) = oneshot::channel();
@@ -152,6 +165,41 @@ impl Arbiter {
         }
     }
 
+    /// Holds a risky input until the person decides. Only an agent in control gets this far.
+    pub(crate) fn request_approval(&self) -> Result<oneshot::Receiver<bool>, &'static str> {
+        let mut state = self.state.lock().unwrap();
+        match state.control {
+            ControlState::Active => {}
+            ControlState::AwaitingApproval => return Err(AWAITING_APPROVAL),
+            ControlState::AwaitingHuman => return Err(AWAITING_HUMAN),
+            ControlState::Idle | ControlState::Paused => return Err(PREEMPTED),
+        }
+        let (decision, receiver) = oneshot::channel();
+        state.approval = Some(decision);
+        set(&mut state, ControlState::AwaitingApproval);
+        Ok(receiver)
+    }
+
+    /// The person allowed or declined the input. Either way the agent keeps control.
+    pub(crate) fn decide(&self, allow: bool) {
+        let mut state = self.state.lock().unwrap();
+        let Some(approval) = state.approval.take() else {
+            return;
+        };
+        let _ = approval.send(allow);
+        state.agent_input = Instant::now();
+        set(&mut state, ControlState::Active);
+    }
+
+    /// Nobody decided in time; the input counts as declined and the agent keeps control.
+    pub(crate) fn approval_timed_out(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.approval.take().is_some() {
+            state.agent_input = Instant::now();
+            set(&mut state, ControlState::Active);
+        }
+    }
+
     /// Nobody answered in time, so control goes back to the agent.
     pub(crate) fn help_timed_out(&self) {
         let mut state = self.state.lock().unwrap();
@@ -172,6 +220,7 @@ fn set(state: &mut State, control: ControlState) {
                 ControlState::Active => "active",
                 ControlState::Paused => "paused",
                 ControlState::AwaitingHuman => "awaiting_human",
+                ControlState::AwaitingApproval => "awaiting_approval",
             }
         );
     }
@@ -242,5 +291,29 @@ mod tests {
         let _answer = arbiter.request_help().unwrap();
         arbiter.help_timed_out();
         assert_eq!(arbiter.control(), ControlState::Active);
+    }
+
+    #[test]
+    fn a_risky_input_waits_for_the_person() {
+        let arbiter = Arbiter::new(Duration::ZERO, Duration::from_secs(60));
+        assert_eq!(arbiter.request_approval().unwrap_err(), PREEMPTED);
+        arbiter.agent_input().unwrap();
+
+        let mut decision = arbiter.request_approval().unwrap();
+        assert_eq!(arbiter.agent_input(), Err(AWAITING_APPROVAL));
+        arbiter.decide(true);
+        assert_eq!(decision.try_recv(), Ok(true));
+        assert_eq!(arbiter.control(), ControlState::Active);
+
+        let mut decision = arbiter.request_approval().unwrap();
+        arbiter.decide(false);
+        assert_eq!(decision.try_recv(), Ok(false));
+        assert_eq!(arbiter.control(), ControlState::Active);
+
+        // A person who acts while a decision is pending takes over instead.
+        let mut decision = arbiter.request_approval().unwrap();
+        arbiter.human_input();
+        assert_eq!(decision.try_recv(), Ok(false));
+        assert_eq!(arbiter.control(), ControlState::Paused);
     }
 }

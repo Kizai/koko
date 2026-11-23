@@ -15,7 +15,8 @@ struct DesktopRegression {
         try checkRemoteTitleBar()
         try await checkHelperPipes()
         try await checkDeniedClipboardFile()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出和文件访问被拒绝测试")
+        try checkAgentPolicy()
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、文件访问被拒绝和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {

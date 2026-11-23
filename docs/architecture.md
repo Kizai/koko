@@ -84,7 +84,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | `observer` | Agent | `hello`、`displays`、`ui_tree`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。 |
 | `agent_safe` | Agent | `observer` 的命令，加上 `pointer`、`click`、`key`、`text` 和 `release_control`。输入还要经过控制权仲裁。剪贴板仍只对人类开放。 |
 
-Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）判定。控制权有四种状态：`idle` 时 Agent 的下一条输入取得控制权，3 秒内有过人类输入则拒绝；`active` 时 Agent 可以操作，人类控制端的键鼠或剪贴板请求、被控端的「停止」或 ⌃⌥⌘. 都会转为 `paused`；`paused` 时 Agent 的输入返回 `preempted_by_human`，直到被控端的人点「让 Agent 继续」；`awaiting_human` 时 Agent 发出的 `request_human` 正在等人回答，Agent 的输入返回 `awaiting_human`，人回答「已完成」或超时后回到 `active`，回答「我来接管」「拒绝」或点「停止」后转为 `paused`。被控 Mac 本机的实体键鼠由应用检测后以 `local-input` 告知 daemon，效果等同人类控制端的输入。Agent 60 秒没有输入、发送 `release_control` 或会话结束时，控制权回到 `idle`。Agent 发出的每条请求会写入 `~/.koko/audit.log`，不含截图和输入的文本。
+Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）判定。控制权有五种状态：`idle` 时 Agent 的下一条输入取得控制权，3 秒内有过人类输入则拒绝；`active` 时 Agent 可以操作，人类控制端的键鼠或剪贴板请求、被控端的「停止」或 ⌃⌥⌘. 都会转为 `paused`；`paused` 时 Agent 的输入返回 `preempted_by_human`，直到被控端的人点「让 Agent 继续」；`awaiting_human` 时 Agent 发出的 `request_human` 正在等人回答，Agent 的输入返回 `awaiting_human`，人回答「已完成」或超时后回到 `active`，回答「我来接管」「拒绝」或点「停止」后转为 `paused`；`awaiting_approval` 时一条 Agent 输入命中了被控端应用的高危操作规则，正等人「允许一次」「本次会话都允许」或「拒绝」，决定后回到 `active`，2 分钟无人回应按拒绝处理。规则见 [Agent 与 MCP 设计规范](./agent.md#高危操作审批)。被控 Mac 本机的实体键鼠由应用检测后以 `local-input` 告知 daemon，效果等同人类控制端的输入。Agent 60 秒没有输入、发送 `release_control` 或会话结束时，控制权回到 `idle`。Agent 发出的每条请求会写入 `~/.koko/audit.log`，不含截图和输入的文本。
 
 「观看模式」只在控制端停止发送键鼠和剪贴板请求，被控端不区分人类会话的观看与控制。
 
@@ -109,7 +109,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 `pointer` 事件包括 `move`、`down`、`up`、`scroll`、`key_down`、`key_up` 和 `release`。按键使用 Mac 虚拟键码与 Core Graphics 修饰位右移 16 位。daemon 同一时间只允许一条连接发送 `pointer`，另一条连接会收到 `pointer_busy`，以保证按下、拖动和抬起的顺序。视频订阅同样只允许一个，新的订阅在旧订阅结束前收到 `video_busy`。
 
-失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`awaiting_human`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板请求因可能等待 macOS 文件访问确认而等待 120 秒。
+失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`awaiting_human`、`awaiting_approval`、`approval_declined`、`approval_timeout`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板请求因可能等待 macOS 文件访问确认而等待 120 秒。
 
 以图形版模式运行时，所有命令都交给 `Koko.app`。单独运行 `koko-daemon serve-pair` 时，`screenshot`、`click`、`key` 和 `text` 由同目录的 `koko-desktop` 执行，其余命令返回 `desktop_unavailable`。
 
@@ -139,11 +139,12 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `Agent session: <公钥短标识> <JSON>`、`Agent session closed` | Agent 会话开始与结束，JSON 含 `name` 和 `scope` |
 | `Agent control: idle`、`active`、`paused`、`awaiting_human` | Agent 控制权变化，应用据此显示屏幕顶部的指示条 |
 | `Agent help: <JSON>` | Agent 请人协助，JSON 含 `reason` 和 `timeout_s` |
+| `Agent approval: <JSON>` | 一条 Agent 输入等待批准，JSON 含 `reason` |
 | `Pair declined`、`Pair request ended`、`Pair code used` | 申请被拒绝、申请方已离开、连接码因批准而失效 |
 | `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径 |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
-应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`local-input`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
 控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠和剪贴板各保持一个进程，按行收发 JSON；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
 
@@ -173,7 +174,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 ## 2. 系统总体架构（Human + Agent 双模拓扑）
 
-> 实现状态：下图是目标拓扑。MCP Server 与被控端的控制权仲裁已实现；`koko-client` 和四通道尚未实现，高危审批尚未实现。当前拓扑见[进程与模块](#进程与模块)。
+> 实现状态：下图是目标拓扑。MCP Server、被控端的控制权仲裁和高危审批已实现；`koko-client` 和四通道尚未实现。当前拓扑见[进程与模块](#进程与模块)。
 
 Koko 的核心思想是**“一套 P2P 加密通道，同时服务人类视觉与 AI 工具调用”**。本地侧（Controller）运行极简 MCP Server 与旁观 UI；远端侧（Host）运行 `koko-daemon`，负责采集、注入与权限仲裁。
 
@@ -246,14 +247,14 @@ flowchart LR
 
 ## 4. `koko-agent`（MCP 工具集）与人机协同仲裁
 
-> 实现状态：M1 与 M2 已实现：Agent 身份、首次确认与信任重连、`observer` 与 `agent_safe` 作用域、控制权仲裁与人工抢占、被控端指示条和审计日志，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`。M3 的人工求助与本机实体输入检测、M4 的界面树与按元素操作也已实现。高危审批尚未实现。
+> 实现状态：M1 与 M2 已实现：Agent 身份、首次确认与信任重连、`observer` 与 `agent_safe` 作用域、控制权仲裁与人工抢占、被控端指示条和审计日志，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`。M3 的人工求助与本机实体输入检测、M4 的界面树与按元素操作、M5 的高危操作审批也已实现。
 
 完整设计见 [Agent 与 MCP 设计规范](./agent.md)，包括 Agent 身份与配对、作用域、控制权状态机、截图坐标映射、键名规范、MCP 工具、协议扩展和里程碑。要点如下：
 
 - `koko-agent mcp` 在控制端以 stdio 提供 MCP，使用独立的 Agent 密钥直连被控端。被控端依据公钥识别 Agent，作用域、租约和抢占都在 daemon 判定。
 - 被控端同时允许一个人类会话和一个 Agent 会话，人可以看着 Agent 操作。人的输入或被控端的「停止」会吊销 Agent 的租约，后续请求返回 `preempted_by_human`。
 - MCP 工具包括 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`，以及读取前台应用界面树的 `koko_get_ui_tree`。
-- 高危操作审批（`ApprovalPending`）安排在策略阶段，本阶段先保证作用域、人工接管和审计。
+- 高危操作审批（`awaiting_approval`）已实现：被控端应用按快捷键、前台应用和点击处控件名称判定，命中时挂起输入等人决定。
 
 ## 5. Rust Workspace 目录与分阶段落地计划
 
@@ -293,7 +294,7 @@ koko/
 
 ### 5.2 务实的四阶段里程碑
 
-> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占、人工求助与界面树已实现；高危审批、NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
+> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占、人工求助、界面树与高危审批已实现；NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
 
 | 阶段 | 核心目标 | 验收标准（可演示 Demo） |
 | :--- | :--- | :--- |

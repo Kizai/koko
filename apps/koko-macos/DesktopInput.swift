@@ -11,13 +11,15 @@ private func inject(_ event: CGEvent) {
     event.post(tap: .cghidEventTap)
 }
 
-/// Whether this Mac's own keyboard or mouse was used within `seconds`, after KoKo's last event.
-/// Comparing the two times works whether or not macOS counts KoKo's posted events as HID activity.
-func localInputSinceInjection(within seconds: Double) -> Bool {
+/// Whether this Mac's own keyboard or mouse was used within `seconds`, after both KoKo's last
+/// event and `start` (uptime nanoseconds). Comparing the times works whether or not macOS counts
+/// KoKo's posted events as HID activity, and ignores the click that let the agent continue.
+func localInputSinceInjection(within seconds: Double, since start: UInt64) -> Bool {
     let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+    let now = DispatchTime.now().uptimeNanoseconds
     let injected = lastInjectedInput.withLock { $0 }
-    let sinceInjection = Double(DispatchTime.now().uptimeNanoseconds &- injected) / 1e9
-    return idle < seconds && idle + 0.15 < sinceInjection
+    let quiet = Double(now &- max(injected, start)) / 1e9
+    return idle < seconds && idle + 0.15 < quiet
 }
 
 enum DesktopError: String, Error {
