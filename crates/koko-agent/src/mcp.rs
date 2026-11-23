@@ -11,8 +11,8 @@ use iroh::{EndpointId, SecretKey};
 use koko_p2p::pairing::{PairingOptions, discover_hosts, request_agent_pairing, resolve_invite};
 use koko_p2p::remote::RemoteClient;
 use koko_proto::{
-    HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON, MouseButton, RemoteCommand,
-    RemoteReply, Scope,
+    HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON, MAX_UI_NODES, MouseButton,
+    RemoteCommand, RemoteReply, Scope, UiNode,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -26,6 +26,7 @@ use tokio::sync::Mutex;
 
 use crate::input::{Gesture, key_events, mouse_events, to_protocol};
 use crate::registry::{HostRecord, Registry};
+use crate::tree::{element_center, format_tree};
 
 const DEFAULT_EDGE: u16 = 1280;
 const JPEG_QUALITY: u8 = 80;
@@ -34,8 +35,8 @@ const SETTLE: Duration = Duration::from_millis(600);
 const INSTRUCTIONS: &str = "KoKo lets you see and operate Macs whose owners paired them with you. \
 Call koko_list_devices first. If no device is paired, ask the user for the connection code shown \
 in KoKo on the host Mac and call koko_pair; the host owner approves the first pairing. \
-Take a screenshot with koko_screenshot, then use koko_mouse and koko_keyboard with pixel coordinates \
-from that screenshot. The host owner sees when you are in control and can stop you at any time. \
+Take a screenshot with koko_screenshot, or read the controls with koko_get_ui_tree, then use \
+koko_mouse with an element_id or with pixel coordinates from the screenshot, and koko_keyboard. The host owner sees when you are in control and can stop you at any time. \
 If a result says preempted_by_human, stop and tell the user; do not retry until they ask. \
 Call koko_request_human when a step needs a person, such as signing in or confirming a payment. \
 Call koko_release_control when you finish.";
@@ -171,6 +172,8 @@ struct State {
     clients: Mutex<HashMap<EndpointId, RemoteClient>>,
     screenshots: AtomicU64,
     shots: std::sync::Mutex<VecDeque<Shot>>,
+    /// The latest accessibility tree read from each device; element ids index into it.
+    trees: std::sync::Mutex<HashMap<EndpointId, Vec<UiNode>>>,
 }
 
 #[derive(Clone)]
@@ -215,10 +218,13 @@ pub struct MouseParams {
     /// Device ID from koko_list_devices.
     pub device_id: String,
     pub action: MouseAction,
+    /// Element [id] from the latest koko_get_ui_tree; acts on the element's center.
+    /// Use this or x and y. Not for drag.
+    pub element_id: Option<u32>,
     /// X in pixels of the screenshot, from the left edge.
-    pub x: u32,
+    pub x: Option<u32>,
     /// Y in pixels of the screenshot, from the top edge.
-    pub y: u32,
+    pub y: Option<u32>,
     /// Drag end X in screenshot pixels. Required for drag.
     pub to_x: Option<u32>,
     /// Drag end Y in screenshot pixels. Required for drag.
@@ -245,6 +251,14 @@ pub struct KeyboardParams {
     pub keys: Option<Vec<String>>,
     /// Return a new screenshot after the keys settle.
     pub screenshot_after: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct TreeParams {
+    /// Device ID from koko_list_devices.
+    pub device_id: String,
+    /// Most elements to return, from 1 to 1000. Defaults to 300.
+    pub max_nodes: Option<u16>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -294,6 +308,7 @@ impl KokoMcp {
                 clients: Mutex::new(HashMap::new()),
                 screenshots: AtomicU64::new(0),
                 shots: std::sync::Mutex::new(VecDeque::new()),
+                trees: std::sync::Mutex::new(HashMap::new()),
             }),
             tool_router: Self::tool_router(),
         }
@@ -420,6 +435,37 @@ impl KokoMcp {
     }
 }
 
+/// Turns a mouse action into a gesture. `drag_to` is the end point already mapped from the screenshot.
+fn gesture_for(
+    action: MouseAction,
+    dx: Option<i32>,
+    dy: Option<i32>,
+    drag_to: Option<(u16, u16)>,
+) -> Result<Gesture, Failure> {
+    Ok(match action {
+        MouseAction::Move => Gesture::Move,
+        MouseAction::Click => Gesture::Click(MouseButton::Left),
+        MouseAction::RightClick => Gesture::Click(MouseButton::Right),
+        MouseAction::MiddleClick => Gesture::Click(MouseButton::Middle),
+        MouseAction::DoubleClick => Gesture::DoubleClick,
+        MouseAction::Drag => Gesture::Drag {
+            to: drag_to.ok_or_else(|| invalid("drag needs to_x and to_y."))?,
+        },
+        MouseAction::Scroll => {
+            let clamp = |value: Option<i32>| {
+                value
+                    .unwrap_or(0)
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+            };
+            let (dx, dy) = (clamp(dx), clamp(dy));
+            if dx == 0 && dy == 0 {
+                return Err(invalid("scroll needs a non-zero dx or dy."));
+            }
+            Gesture::Scroll { dx, dy }
+        }
+    })
+}
+
 fn invalid(message: impl Into<String>) -> Failure {
     Failure::new("invalid_input", message)
 }
@@ -501,7 +547,18 @@ impl KokoMcp {
     }
 
     #[tool(
-        description = "Move, click, double-click, right-click, drag or scroll on a paired KoKo host. Coordinates are pixels in a screenshot from koko_screenshot. Your first input takes control of the host; a person's input takes it back."
+        description = "List the buttons, fields, links and text of the frontmost app on a paired KoKo host, from macOS accessibility. Cheaper and more precise than a screenshot for finding controls; each line has an [id] usable as element_id in koko_mouse. Password field values are never included.",
+        annotations(read_only_hint = true)
+    )]
+    async fn koko_get_ui_tree(
+        &self,
+        Parameters(params): Parameters<TreeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish(self.ui_tree(params).await)
+    }
+
+    #[tool(
+        description = "Move, click, double-click, right-click, drag or scroll on a paired KoKo host. Target an element by element_id from koko_get_ui_tree, or give x and y in pixels of a screenshot from koko_screenshot. Your first input takes control of the host; a person's input takes it back."
     )]
     async fn koko_mouse(
         &self,
@@ -740,8 +797,73 @@ impl KokoMcp {
         Ok(CallToolResult::success(content))
     }
 
+    async fn ui_tree(&self, params: TreeParams) -> Result<CallToolResult, Failure> {
+        let id = device_id(&params.device_id)?;
+        self.record(id).await?;
+        let max_nodes = params.max_nodes.unwrap_or(300);
+        if !(1..=MAX_UI_NODES).contains(&max_nodes) {
+            return Err(invalid("max_nodes must be from 1 to 1000."));
+        }
+        let (app, nodes, truncated) = match self
+            .request(id, &RemoteCommand::UiTree { max_nodes })
+            .await?
+        {
+            RemoteReply::UiTree {
+                app,
+                nodes,
+                truncated,
+            } => (app, nodes, truncated),
+            RemoteReply::Error { code } => return Err(Failure::from_host(&code)),
+            _ => return Err(Failure::from_host("invalid_command")),
+        };
+        let text = format_tree(&app, &nodes, truncated);
+        self.state.trees.lock().unwrap().insert(id, nodes);
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
     async fn mouse(&self, params: MouseParams) -> Result<CallToolResult, Failure> {
         let id = device_id(&params.device_id)?;
+        if let Some(element) = params.element_id {
+            if params.x.is_some()
+                || params.y.is_some()
+                || matches!(params.action, MouseAction::Drag)
+            {
+                return Err(invalid(
+                    "Use element_id alone, without x and y. Drag needs screenshot coordinates.",
+                ));
+            }
+            let node = self
+                .state
+                .trees
+                .lock()
+                .unwrap()
+                .get(&id)
+                .and_then(|nodes| nodes.get(element as usize).cloned())
+                .ok_or_else(|| {
+                    Failure::new(
+                        "unknown_element",
+                        "That element_id is not in the latest koko_get_ui_tree result for this device. Read the tree again.",
+                    )
+                })?;
+            let gesture = gesture_for(params.action, params.dx, params.dy, None)?;
+            let command = RemoteCommand::Pointer {
+                display: node.display,
+                events: mouse_events(element_center(&node), gesture),
+                source_os: None,
+            };
+            return self
+                .act(
+                    id,
+                    command,
+                    node.display,
+                    DEFAULT_EDGE,
+                    params.screenshot_after,
+                )
+                .await;
+        }
+        let (Some(x), Some(y)) = (params.x, params.y) else {
+            return Err(invalid("Give element_id, or x and y from a screenshot."));
+        };
         let shot = self.shot(id, params.screenshot_id.as_deref())?;
         let point = |x: u32, y: u32| {
             to_protocol(x, shot.width)
@@ -756,34 +878,15 @@ impl KokoMcp {
                     )
                 })
         };
-        let gesture = match params.action {
-            MouseAction::Move => Gesture::Move,
-            MouseAction::Click => Gesture::Click(MouseButton::Left),
-            MouseAction::RightClick => Gesture::Click(MouseButton::Right),
-            MouseAction::MiddleClick => Gesture::Click(MouseButton::Middle),
-            MouseAction::DoubleClick => Gesture::DoubleClick,
-            MouseAction::Drag => {
-                let (Some(x), Some(y)) = (params.to_x, params.to_y) else {
-                    return Err(invalid("drag needs to_x and to_y."));
-                };
-                Gesture::Drag { to: point(x, y)? }
-            }
-            MouseAction::Scroll => {
-                let clamp = |value: Option<i32>| {
-                    value
-                        .unwrap_or(0)
-                        .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
-                };
-                let (dx, dy) = (clamp(params.dx), clamp(params.dy));
-                if dx == 0 && dy == 0 {
-                    return Err(invalid("scroll needs a non-zero dx or dy."));
-                }
-                Gesture::Scroll { dx, dy }
-            }
+        let drag_to = match (params.action, params.to_x, params.to_y) {
+            (MouseAction::Drag, Some(x), Some(y)) => Some(point(x, y)?),
+            (MouseAction::Drag, _, _) => return Err(invalid("drag needs to_x and to_y.")),
+            _ => None,
         };
+        let gesture = gesture_for(params.action, params.dx, params.dy, drag_to)?;
         let command = RemoteCommand::Pointer {
             display: shot.display,
-            events: mouse_events(point(params.x, params.y)?, gesture),
+            events: mouse_events(point(x, y)?, gesture),
             source_os: None,
         };
         self.act(
@@ -931,6 +1034,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "koko_get_ui_tree",
                 "koko_keyboard",
                 "koko_list_devices",
                 "koko_mouse",

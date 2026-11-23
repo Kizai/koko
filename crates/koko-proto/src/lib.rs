@@ -131,6 +131,39 @@ impl std::str::FromStr for HumanResult {
 }
 
 pub const MAX_HELP_REASON: usize = 500;
+pub const MAX_UI_NODES: u16 = 1000;
+
+/// One element of the frontmost app's accessibility tree, flattened in depth-first order.
+/// The frame is normalized to 0-9999 on the display that holds the element's center.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UiNode {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Omitted for password fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Index of the nearest included ancestor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u32>,
+    #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub focused: bool,
+    pub display: u32,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+fn enabled() -> bool {
+    true
+}
+
+fn is_enabled(enabled: &bool) -> bool {
+    *enabled
+}
 pub const HELP_TIMEOUT_SECONDS: std::ops::RangeInclusive<u16> = 10..=600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +190,9 @@ pub enum RemoteCommand {
     },
     Screenshot,
     Displays,
+    UiTree {
+        max_nodes: u16,
+    },
     Capture {
         display: u32,
         edge: u16,
@@ -366,6 +402,13 @@ pub enum RemoteReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control: Option<ControlState>,
     },
+    UiTree {
+        app: String,
+        nodes: Vec<UiNode>,
+        /// More elements matched than `max_nodes` allowed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated: bool,
+    },
     Error {
         code: String,
     },
@@ -405,6 +448,7 @@ impl RemoteCommand {
             self,
             Self::Hello
                 | Self::Displays
+                | Self::UiTree { .. }
                 | Self::Screenshot
                 | Self::Capture { .. }
                 | Self::Video { .. }
@@ -475,6 +519,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
                 && (1..=32).contains(&events.len())
                 && events.iter().all(PointerEvent::valid)
         }
+        RemoteCommand::UiTree { max_nodes } => (1..=MAX_UI_NODES).contains(max_nodes),
         RemoteCommand::RequestHuman { reason, timeout_s } => {
             !reason.trim().is_empty()
                 && reason.chars().count() <= MAX_HELP_REASON
@@ -525,5 +570,28 @@ mod tests {
             source_os: None,
         };
         assert!(!release.is_human_input());
+    }
+
+    #[test]
+    fn decodes_the_tree_the_mac_app_sends() {
+        // Shaped like Swift's JSONEncoder output: every field present, keys in any order.
+        let reply: RemoteReply = serde_json::from_str(
+            r#"{"status":"ui_tree","app":"System Settings","nodes":[
+                {"display":1,"enabled":true,"focused":false,"role":"Window","label":"Privacy","y":519,"x":2896,"height":6364,"width":4894},
+                {"focused":true,"width":658,"role":"SecureTextField","parent":0,"enabled":false,"display":1,"height":386,"x":3002,"y":1558}
+            ]}"#,
+        )
+        .unwrap();
+        let RemoteReply::UiTree {
+            app,
+            nodes,
+            truncated,
+        } = reply
+        else {
+            panic!("expected a tree");
+        };
+        assert_eq!((app.as_str(), truncated), ("System Settings", false));
+        assert_eq!(nodes[1].parent, Some(0));
+        assert!(nodes[1].focused && !nodes[1].enabled && nodes[1].value.is_none());
     }
 }

@@ -81,7 +81,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | 作用域 | 授予对象 | 允许的命令 |
 | --- | --- | --- |
 | `human` | 人类控制端 | 全部命令 |
-| `observer` | Agent | `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。 |
+| `observer` | Agent | `hello`、`displays`、`ui_tree`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。 |
 | `agent_safe` | Agent | `observer` 的命令，加上 `pointer`、`click`、`key`、`text` 和 `release_control`。输入还要经过控制权仲裁。剪贴板仍只对人类开放。 |
 
 Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）判定。控制权有四种状态：`idle` 时 Agent 的下一条输入取得控制权，3 秒内有过人类输入则拒绝；`active` 时 Agent 可以操作，人类控制端的键鼠或剪贴板请求、被控端的「停止」或 ⌃⌥⌘. 都会转为 `paused`；`paused` 时 Agent 的输入返回 `preempted_by_human`，直到被控端的人点「让 Agent 继续」；`awaiting_human` 时 Agent 发出的 `request_human` 正在等人回答，Agent 的输入返回 `awaiting_human`，人回答「已完成」或超时后回到 `active`，回答「我来接管」「拒绝」或点「停止」后转为 `paused`。被控 Mac 本机的实体键鼠由应用检测后以 `local-input` 告知 daemon，效果等同人类控制端的输入。Agent 60 秒没有输入、发送 `release_control` 或会话结束时，控制权回到 `idle`。Agent 发出的每条请求会写入 `~/.koko/audit.log`，不含截图和输入的文本。
@@ -96,6 +96,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | --- | --- | --- |
 | `hello` | 无 | `hello`，含本连接的 `kind`（`human` 或 `agent`）、`scope` 和控制权状态 `control` |
 | `release_control` | 无 | `ok`，Agent 交还控制权 |
+| `ui_tree` | `max_nodes`（1–1000） | `ui_tree`，含前台应用名 `app`、展平的界面元素列表 `nodes` 和是否截断 `truncated`；元素边框按所在显示器归一化到 0–9999，密码框不含值 |
 | `request_human` | `reason`（最多 500 字符）、`timeout_s`（10–600） | `human`，含 `result`（`resolved`、`declined`、`taken_over` 或 `timeout`）和可选的 `note`；等人回答期间保持请求打开 |
 | `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
@@ -245,13 +246,13 @@ flowchart LR
 
 ## 4. `koko-agent`（MCP 工具集）与人机协同仲裁
 
-> 实现状态：M1 与 M2 已实现：Agent 身份、首次确认与信任重连、`observer` 与 `agent_safe` 作用域、控制权仲裁与人工抢占、被控端指示条和审计日志，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`。M3 的人工求助与本机实体输入检测也已实现。界面树和高危审批尚未实现。
+> 实现状态：M1 与 M2 已实现：Agent 身份、首次确认与信任重连、`observer` 与 `agent_safe` 作用域、控制权仲裁与人工抢占、被控端指示条和审计日志，以及 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`。M3 的人工求助与本机实体输入检测、M4 的界面树与按元素操作也已实现。高危审批尚未实现。
 
 完整设计见 [Agent 与 MCP 设计规范](./agent.md)，包括 Agent 身份与配对、作用域、控制权状态机、截图坐标映射、键名规范、MCP 工具、协议扩展和里程碑。要点如下：
 
 - `koko-agent mcp` 在控制端以 stdio 提供 MCP，使用独立的 Agent 密钥直连被控端。被控端依据公钥识别 Agent，作用域、租约和抢占都在 daemon 判定。
 - 被控端同时允许一个人类会话和一个 Agent 会话，人可以看着 Agent 操作。人的输入或被控端的「停止」会吊销 Agent 的租约，后续请求返回 `preempted_by_human`。
-- MCP 工具包括 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`，界面树 `koko_get_ui_tree` 安排在 Phase 3。
+- MCP 工具包括 `koko_list_devices`、`koko_pair`、`koko_screenshot`、`koko_mouse`、`koko_keyboard`、`koko_request_human`、`koko_release_control`，以及读取前台应用界面树的 `koko_get_ui_tree`。
 - 高危操作审批（`ApprovalPending`）安排在策略阶段，本阶段先保证作用域、人工接管和审计。
 
 ## 5. Rust Workspace 目录与分阶段落地计划
@@ -292,7 +293,7 @@ koko/
 
 ### 5.2 务实的四阶段里程碑
 
-> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占与人工求助已实现；界面树、NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
+> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占、人工求助与界面树已实现；高危审批、NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
 
 | 阶段 | 核心目标 | 验收标准（可演示 Demo） |
 | :--- | :--- | :--- |

@@ -378,6 +378,7 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
         RemoteCommand::Capture { .. }
+        | RemoteCommand::UiTree { .. }
         | RemoteCommand::Displays
         | RemoteCommand::Clipboard { .. }
         | RemoteCommand::Pointer { .. }

@@ -2,7 +2,7 @@
 
 [返回文档目录](./README.md)
 
-本文定义 KoKo 的核心能力：AI Agent 通过 MCP 识别并操作已授权的远程 Mac，被控端的人可以随时看到、停止和接管。M1 只读 MCP、M2 Agent 操作和 M3 人工协作已实现，M4 起仍是设计稿，各里程碑的状态见[里程碑与验收](#里程碑与验收)。现有协议见[架构设计的当前实现](./architecture.md#当前实现macos-内测版)，交付顺序见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)的工作项 4 和 6。
+本文定义 KoKo 的核心能力：AI Agent 通过 MCP 识别并操作已授权的远程 Mac，被控端的人可以随时看到、停止和接管。M1 只读 MCP、M2 Agent 操作、M3 人工协作和 M4 界面树已实现，M5 策略与审批仍是设计稿，各里程碑的状态见[里程碑与验收](#里程碑与验收)。现有协议见[架构设计的当前实现](./architecture.md#当前实现macos-内测版)，交付顺序见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)的工作项 4 和 6。
 
 ## 目标与边界
 
@@ -59,7 +59,7 @@
 | 命令 | `observer` | `agent_safe` | `human` |
 | --- | --- | --- | --- |
 | `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect` | ✓ | ✓ | ✓ |
-| `ui_tree`（Phase 3） | ✓ | ✓ | ✓ |
+| `ui_tree` | ✓ | ✓ | ✓ |
 | `pointer`、`click`、`key`、`text` | — | 持有控制权时 | ✓ |
 | `release_control`、`request_human` | — | ✓ | — |
 | `clipboard` | — | — | ✓ |
@@ -125,13 +125,15 @@ Agent 使用它看到的截图里的像素坐标。`koko-agent` 为每张截图�
 
 动作未指定 `screenshot_id` 时，使用该设备最近一张截图，动作作用在那张截图的显示器上。还没有截图时返回 `screenshot_required`，坐标超出截图范围时返回 `out_of_bounds`。当前版本不检测截图之后显示器分辨率的变化；分辨率变化后，Agent 需要重新截图才能点准。
 
-### 界面树（Phase 3）
+### 界面树
 
-- 被控端用 `AXUIElement` 读取前台应用的界面元素，使用已授予的辅助功能权限。
-- 每个节点包含角色、标题或标签、值、是否可用、是否聚焦、归一化到显示器的 0–9999 边框，以及 `element_id`。`element_id` 在下一次读取界面树之前有效。
-- 只保留可见且可交互或含文字的节点，默认最多 500 个节点。
+- 被控端 `Koko.app` 用 `AXUIElement` 读取前台应用的界面元素（`apps/koko-macos/UITree.swift`），使用已授予的辅助功能权限，在后台线程执行。
+- 按深度优先展平成列表，每个节点包含角色（去掉 `AX` 前缀，如 `Button`、`TextField`）、标签（标题、描述或占位文字）、值、上级节点序号、是否可用、是否聚焦、所在显示器，以及在该显示器上归一化到 0–9999 的边框。
+- 只保留中心落在某块显示器上的节点，并且要么是可交互控件，要么带文字；没有文字的容器、行和单元格会被跳过，菜单栏整体跳过，Agent 可以用快捷键打开菜单。标签和值超过 200 字符会截断。
+- 默认最多 300 个节点，上限 1000。对每个应用的单次消息等待 0.5 秒，整体最多遍历 6000 个元素、耗时 2 秒，超出时返回已读取的部分并标记 `truncated`。
 - 密码框（`AXSecureTextField`）不返回值。
-- 动作可以用 `element_id` 代替坐标。具体是点击元素中心还是执行 `AXPress`，在 Phase 3 验证后决定。
+- 在开发机上用 Finder、系统设置和 Chrome 实测：读取耗时 0.16–2 秒，系统设置 75 个节点、Chrome 158 个节点，Finder 的长文件列表在时间预算内截断。
+- `element_id` 是节点在 MCP Server 最近一次读取结果中的序号，只保存在 `koko-agent`，被控端不保存状态，下一次读取界面树后旧序号失效。按元素操作时，`koko-agent` 用节点边框的中心点生成普通的 `pointer` 点击，和坐标点击走同一条仲裁、指示条和审计路径。没有采用 `AXPress`，因为不少控件不支持它，而且它不移动鼠标，人在旁观时看不到 Agent 点了哪里。界面在读取后发生变化时，点击可能落空，Agent 应重新读取。
 
 ### 动作后截图
 
@@ -192,11 +194,11 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | `koko_list_devices` | 无 | 设备 ID、名称、系统类型、是否在线、作用域、控制权状态 | 无。在线状态取自已有连接或 2 秒内的 mDNS 发现结果 |
 | `koko_pair` | `code_or_invite`；或已配对设备的 `device_id`，用于再次申请（例如提高权限）。可选 `scope`：`agent_safe`（默认）或 `observer` | 设备信息和被授予的作用域。首次配对等待被控端确认，最长 90 秒；已信任时立即返回 | 首次配对需被控端确认 |
 | `koko_screenshot` | `device_id`，可选 `display`、`max_edge`（默认 1280）、`format`、`cursor` | 图像，以及 `screenshot_id`、显示器、尺寸和显示器列表 | `observer` |
-| `koko_mouse` | `device_id`、`action`、`x`、`y`，可选 `to_x`、`to_y`、`dx`、`dy`、`screenshot_id`、`screenshot_after` | 状态，可附截图 | `agent_safe` 和控制权 |
+| `koko_mouse` | `device_id`、`action`，以及 `element_id`（来自 `koko_get_ui_tree`）或截图坐标 `x`、`y`；可选 `to_x`、`to_y`、`dx`、`dy`、`screenshot_id`、`screenshot_after`。拖拽只支持截图坐标 | 状态，可附截图 | `agent_safe` 和控制权 |
 | `koko_keyboard` | `device_id`，`text` 或 `keys`，可选 `screenshot_after` | 状态，可附截图 | `agent_safe` 和控制权 |
 | `koko_request_human` | `device_id`、`reason`（最多 500 字符），可选 `timeout_s`（10–600，默认 300） | `resolved`、`declined`、`taken_over` 或 `timeout`，人的附言，以及给 Agent 的下一步建议。调用会一直等到有结果；若 MCP 客户端自己的工具调用超时更短，应调小 `timeout_s` | `agent_safe` |
 | `koko_release_control` | `device_id` | 状态 | `agent_safe` |
-| `koko_get_ui_tree`（Phase 3） | `device_id`，可选 `display`、`max_nodes` | 精简界面树 | `observer` |
+| `koko_get_ui_tree` | `device_id`，可选 `max_nodes`（1–1000，默认 300） | 前台应用的精简界面树，每行一个元素，形如 `[3] Button "登录"`，按缩进表示层级，顶层元素注明显示器 | `observer` |
 
 工具描述和返回给模型的消息使用英文，以兼容更多模型。用户界面仍使用中文。工具结果以 JSON 文本返回，客户端支持时同时提供 `structuredContent`。需要 Agent 停下的结果设置 `isError: true`。
 
@@ -225,7 +227,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | `release_control`（无参数） | Agent 交还控制权，回复 `ok` |
 | `request_human` `{reason, timeout_s}` | 长请求，回复 `human` `{result, note}`，`result` 为 `resolved`、`declined`、`taken_over` 或 `timeout`。客户端的等待时间按 `timeout_s` 放宽。控制权状态新增 `awaiting_human` |
 | daemon 输出 `Agent help: {"reason","timeout_s"}`，接受 `agent-help <result> [附言]` 和 `local-input` | 被控端应用据此显示求助卡片、转达人的回答，以及报告本机实体输入 |
-| `ui_tree`（Phase 3） | 回复精简界面树 |
+| `ui_tree` `{max_nodes}` | 回复 `ui_tree` `{app, nodes, truncated}`，`nodes` 为上文的节点列表 |
 | `capture` 的 `format`、`cursor`；`image` 回复的 `width`、`height`、`format` | 用于截图坐标映射 |
 | `displays` 回复的 `control` | 人类控制端据此显示 Agent 的状态 |
 | 错误码 `scope_denied`、`preempted_by_human`、`agent_busy` | 见上文 |
@@ -260,7 +262,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | M1 只读 MCP（工作项 4，已实现，待实机验收） | Agent 身份、配对 v2、`observer`、设备注册表、`koko_list_devices`、`koko_pair`、`koko_screenshot` | Claude Desktop 配置后能列出设备并截取任意显示器。未授权或作用域不足的 Agent 被拒绝。Agent 首次配对需要被控端确认，信任后重连不再询问，申请更高作用域时重新确认。Agent 与人类控制端同时连接时互不影响，第二个 Agent 收到 `agent_busy`。集成测试用真实 iroh 连接覆盖作用域拒绝、信任重连和 `agent_busy`。 |
 | M2 Agent 操作（工作项 6，已实现，待实机验收） | `agent_safe`、控制权仲裁、`koko_mouse`、`koko_keyboard`、`koko_release_control`、`koko_pair` 的 `scope` 与 `device_id`、指示条与停止、⌃⌥⌘. 快捷键、「让 Agent 继续」、审计日志 | 在测试窗口中点击、拖拽、组合键和文本都正确。点「停止」后，Agent 的请求返回 `preempted_by_human`，直到人让它继续。人类控制端的输入会立即抢占。 |
 | M3 人工协作（工作项 6，已实现，待实机验收） | `koko_request_human`、被控端求助卡片与附言、本机实体输入检测 | 被控端的求助卡片能给出完成、拒绝、接管三种结果，超时结果单独可辨。无人值守时 Agent 照常运行，指示条和审计日志生效。 |
-| M4 界面树 | `koko_get_ui_tree`，按 `element_id` 操作 | 常见应用能按元素操作，密码框的值不会外泄。 |
+| M4 界面树（已实现，待实机验收） | `koko_get_ui_tree`，按 `element_id` 操作 | 常见应用能按元素操作，密码框的值不会外泄。 |
 | M5 策略与审批 | 高危操作规则与单次审批 | 命中规则的请求挂起，直到被控端允许或拒绝。 |
 
 ## 已确认的决定

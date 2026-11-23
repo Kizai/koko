@@ -1,6 +1,7 @@
 mod input;
 mod mcp;
 mod registry;
+mod tree;
 
 use std::error::Error;
 use std::io::{self, BufRead, Read, Write};

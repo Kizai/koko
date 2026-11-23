@@ -156,9 +156,11 @@ struct RemoteAction: Codable {
     var videoSocket: String? = nil
     var format: String? = nil
     var cursor: Bool? = nil
+    var maxNodes: Int? = nil
 
     enum CodingKeys: String, CodingKey {
         case action, transfer, op, packet, x, y, key, text, display, edge, quality, fps, events, format, cursor
+        case maxNodes = "max_nodes"
         case sourceOS = "source_os"
         case videoSocket = "video_socket"
     }
@@ -189,9 +191,13 @@ private struct RemoteReply: Codable {
     var height: Int? = nil
     var format: String? = nil
     var control: String? = nil
+    var app: String? = nil
+    var nodes: [UINode]? = nil
+    var truncated: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
         case status, packet, clipboard, png, code, image, displays, direct, video, width, height, format, control
+        case app, nodes, truncated
         case rttMS = "rtt_ms"
         case hostName = "host_name"
     }
@@ -715,6 +721,15 @@ final class LocalConnection: ObservableObject {
                     ? RemoteReply(status: "frame", png: image)
                     : RemoteReply(status: "image", image: image, width: shot.width, height: shot.height,
                                   format: png ? "png" : "jpeg")
+            case "ui_tree":
+                guard let maxNodes = action.maxNodes, (1...1000).contains(maxNodes) else { throw DesktopError.invalidCommand }
+                guard AXIsProcessTrusted() else { throw DesktopError.inputPermissionRequired }
+                guard let app = NSWorkspace.shared.frontmostApplication else { throw ScreenCaptureError.captureFailed }
+                let pid = app.processIdentifier
+                // Accessibility calls block on the target app, so keep them off the main thread.
+                let tree = await Task.detached { readUITree(pid: pid, maxNodes: maxNodes) }.value
+                return RemoteReply(status: "ui_tree", app: app.localizedName ?? "App", nodes: tree.nodes,
+                                   truncated: tree.truncated ? true : nil)
             case "pointer":
                 guard let display = action.display, let events = action.events else { throw DesktopError.invalidCommand }
                 let mapKeys = action.sourceOS == "windows" && (UserDefaults.standard.object(forKey: "mapWindowsModifiers") as? Bool ?? true)
