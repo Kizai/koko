@@ -1,17 +1,21 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 #[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use iroh::{
     EndpointId,
-    endpoint::{Connection, SendStream},
+    endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
+use koko_p2p::clipboard;
 use koko_proto::{
-    APPROVAL_TIMEOUT, HumanResult, MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand,
-    RemoteReply, Scope, VIDEO_ERROR, valid_remote_command,
+    APPROVAL_TIMEOUT, CLIPBOARD_ERROR, CLIPBOARD_MANIFEST, ClipboardManifest, HumanResult,
+    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope, VIDEO_ERROR,
+    valid_remote_command,
 };
+use tokio::io::AsyncReadExt;
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
@@ -64,7 +68,12 @@ impl AppDesktop {
         from: Origin,
     ) -> RemoteReply {
         let (reply, response) = oneshot::channel();
-        let clipboard = matches!(command, RemoteCommand::Clipboard { .. });
+        let clipboard = matches!(
+            command,
+            RemoteCommand::ClipboardRead { .. }
+                | RemoteCommand::ClipboardTarget { .. }
+                | RemoteCommand::ClipboardPublish { .. }
+        );
         match tokio::time::timeout(command.desktop_timeout(), async {
             self.0
                 .send(DesktopRequest {
@@ -162,10 +171,7 @@ impl RemoteHost {
             return Ok(());
         };
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            let bytes = recv
-                .read_to_end(MAX_REMOTE_REQUEST)
-                .await
-                .map_err(AcceptError::from_err)?;
+            let (bytes, body) = read_header(&mut recv).await?;
             if authorization.borrow().scope(peer) != Some(scope) {
                 connection.close(1u32.into(), b"peer not authorized");
                 return Ok(());
@@ -178,6 +184,41 @@ impl RemoteHost {
             let mut approved = false;
             let reply = match command {
                 Ok(command) if !command.allowed_for(scope) => RemoteReply::error("scope_denied"),
+                Ok(command @ RemoteCommand::ClipboardPull { .. })
+                    if valid_remote_command(&command) =>
+                {
+                    let RemoteCommand::ClipboardPull { transfer } = command else {
+                        unreachable!("matched above")
+                    };
+                    self.arbiter.human_input();
+                    tokio::select! {
+                        biased;
+                        _ = revoked(&authorization, peer, scope) => {
+                            connection.close(1u32.into(), b"peer not authorized");
+                            return Ok(());
+                        }
+                        _ = send.stopped() => continue,
+                        result = self.serve_pull(transfer, &mut send) => result?,
+                    }
+                    let _ = send.finish();
+                    continue;
+                }
+                Ok(command @ RemoteCommand::ClipboardPush { .. })
+                    if valid_remote_command(&command) =>
+                {
+                    let RemoteCommand::ClipboardPush { transfer, manifest } = command else {
+                        unreachable!("matched above")
+                    };
+                    self.arbiter.human_input();
+                    tokio::select! {
+                        biased;
+                        _ = revoked(&authorization, peer, scope) => {
+                            connection.close(1u32.into(), b"peer not authorized");
+                            return Ok(());
+                        }
+                        reply = self.serve_push(transfer, manifest, body, &mut recv) => reply,
+                    }
+                }
                 Ok(command @ RemoteCommand::Video { .. }) => {
                     tokio::select! {
                         biased;
@@ -415,6 +456,137 @@ async fn revoked(authorization: &watch::Receiver<Sessions>, peer: EndpointId, sc
         .await;
 }
 
+impl RemoteHost {
+    /// Asks the app to press Copy, then streams a manifest record and every file's bytes.
+    async fn serve_pull(&self, transfer: String, send: &mut SendStream) -> Result<(), AcceptError> {
+        let Some(app) = &self.app_desktop else {
+            return send_clipboard_error(send, "desktop_unavailable").await;
+        };
+        let (text, paths) = match app.run(RemoteCommand::ClipboardRead { transfer }).await {
+            RemoteReply::ClipboardItems { text, paths } => (text, paths),
+            RemoteReply::Error { code } => return send_clipboard_error(send, &code).await,
+            _ => return send_clipboard_error(send, "clipboard_failed").await,
+        };
+        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+        let (entries, sources) =
+            match tokio::task::spawn_blocking(move || clipboard::collect(&paths)).await {
+                Ok(Ok(listed)) => listed,
+                Ok(Err(error)) => {
+                    return send_clipboard_error(send, clipboard::error_code(&error)).await;
+                }
+                Err(_) => return send_clipboard_error(send, "clipboard_failed").await,
+            };
+        let manifest = ClipboardManifest { text, entries };
+        if !manifest.valid() {
+            return send_clipboard_error(send, "clipboard_unsupported").await;
+        }
+        let header = serde_json::to_vec(&manifest).map_err(AcceptError::from_err)?;
+        clipboard::write_record(send, CLIPBOARD_MANIFEST, &header)
+            .await
+            .map_err(AcceptError::from_err)?;
+        if clipboard::send_files(&manifest.entries, &sources, send, |_| {})
+            .await
+            .is_err()
+        {
+            // The receiver sees the reset and discards what it received.
+            let _ = send.reset(1u32.into());
+        }
+        Ok(())
+    }
+
+    /// Receives pasted files into a fresh folder from the app, then asks the app to paste them.
+    async fn serve_push(
+        &self,
+        transfer: String,
+        manifest: ClipboardManifest,
+        body: Vec<u8>,
+        recv: &mut RecvStream,
+    ) -> RemoteReply {
+        let Some(app) = &self.app_desktop else {
+            return RemoteReply::error("desktop_unavailable");
+        };
+        let mut input = std::io::Cursor::new(body).chain(recv);
+        let mut folder = None;
+        let mut paths = Vec::new();
+        if manifest.entries.is_empty() {
+            let mut extra = [0; 1];
+            if !matches!(input.read(&mut extra).await, Ok(0)) {
+                return RemoteReply::error("clipboard_invalid");
+            }
+        } else {
+            let target = match app
+                .run(RemoteCommand::ClipboardTarget {
+                    transfer: transfer.clone(),
+                })
+                .await
+            {
+                RemoteReply::ClipboardFolder { path } => PathBuf::from(path),
+                RemoteReply::Error { code } => return RemoteReply::Error { code },
+                _ => return RemoteReply::error("clipboard_failed"),
+            };
+            match clipboard::receive_files(&manifest.entries, &mut input, &target, |_| {}).await {
+                Ok(top) => {
+                    paths = top
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                }
+                Err(error) => {
+                    let _ = tokio::fs::remove_dir_all(&target).await;
+                    return RemoteReply::error(clipboard::error_code(&error));
+                }
+            }
+            folder = Some(target);
+        }
+        let reply = app
+            .run(RemoteCommand::ClipboardPublish {
+                transfer,
+                text: manifest.text,
+                paths,
+            })
+            .await;
+        if matches!(reply, RemoteReply::Error { .. })
+            && let Some(folder) = folder
+        {
+            let _ = tokio::fs::remove_dir_all(folder).await;
+        }
+        reply
+    }
+}
+
+/// Reads a request header up to its newline. Requests without a body end at the stream's end
+/// instead, as every request did before clipboard streaming. Returns the header and any body
+/// bytes that arrived with it.
+async fn read_header(recv: &mut RecvStream) -> Result<(Vec<u8>, Vec<u8>), AcceptError> {
+    let mut data = Vec::new();
+    let mut chunk = vec![0; 64 * 1024];
+    let mut scanned = 0;
+    loop {
+        if let Some(end) = data[scanned..].iter().position(|byte| *byte == b'\n') {
+            let body = data.split_off(scanned + end + 1);
+            data.pop();
+            return Ok((data, body));
+        }
+        scanned = data.len();
+        if data.len() > MAX_REMOTE_REQUEST {
+            return Err(AcceptError::from_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request header too large",
+            )));
+        }
+        match recv.read(&mut chunk).await.map_err(AcceptError::from_err)? {
+            Some(read) => data.extend_from_slice(&chunk[..read]),
+            None => return Ok((data, Vec::new())),
+        }
+    }
+}
+
+async fn send_clipboard_error(send: &mut SendStream, code: &str) -> Result<(), AcceptError> {
+    clipboard::write_record(send, CLIPBOARD_ERROR, code.as_bytes())
+        .await
+        .map_err(AcceptError::from_err)
+}
+
 async fn send_video_error(send: &mut SendStream, code: &str) -> Result<(), AcceptError> {
     let size = (code.len() as u32 + 1).to_be_bytes();
     send.write_all(&size).await.map_err(AcceptError::from_err)?;
@@ -452,7 +624,11 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         RemoteCommand::Capture { .. }
         | RemoteCommand::UiTree { .. }
         | RemoteCommand::Displays
-        | RemoteCommand::Clipboard { .. }
+        | RemoteCommand::ClipboardPull { .. }
+        | RemoteCommand::ClipboardPush { .. }
+        | RemoteCommand::ClipboardRead { .. }
+        | RemoteCommand::ClipboardTarget { .. }
+        | RemoteCommand::ClipboardPublish { .. }
         | RemoteCommand::Pointer { .. }
         | RemoteCommand::Video { .. } => {
             return RemoteReply::error("desktop_unavailable");
@@ -688,6 +864,106 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clipboard_files_stream_in_both_directions() -> Result<(), Box<dyn Error>> {
+        use koko_p2p::clipboard::{pull, push};
+
+        const SIZE: usize = 128 * 1024 * 1024;
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let person = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions::human(person.public()));
+        let (app_desktop, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(app_desktop),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+
+        // The host app copied a folder; the controller pastes a large file.
+        let host_files = tempfile::tempdir()?;
+        let folder = host_files.path().join("Project");
+        std::fs::create_dir_all(folder.join("src"))?;
+        std::fs::write(
+            folder.join("src/big.bin"),
+            (0..SIZE).map(|i| (i % 251) as u8).collect::<Vec<_>>(),
+        )?;
+        let pasted = tempfile::tempdir()?;
+        let controller_files = tempfile::tempdir()?;
+        let upload = controller_files.path().join("upload.bin");
+        std::fs::write(&upload, vec![42; SIZE])?;
+
+        let app_folder = folder.clone();
+        let paste_target = pasted.path().join("KoKo-paste");
+        let app = tokio::spawn(async move {
+            let mut published = Vec::new();
+            while let Some(request) = requests.recv().await {
+                let reply = match request.command {
+                    RemoteCommand::ClipboardRead { .. } => RemoteReply::ClipboardItems {
+                        text: None,
+                        paths: vec![app_folder.to_string_lossy().into_owned()],
+                    },
+                    RemoteCommand::ClipboardTarget { .. } => {
+                        std::fs::create_dir(&paste_target).unwrap();
+                        RemoteReply::ClipboardFolder {
+                            path: paste_target.to_string_lossy().into_owned(),
+                        }
+                    }
+                    RemoteCommand::ClipboardPublish { paths, .. } => {
+                        published = paths;
+                        RemoteReply::Ok
+                    }
+                    other => panic!("unexpected {other:?}"),
+                };
+                request.reply.send(reply).unwrap();
+            }
+            published
+        });
+
+        let client = RemoteClient::connect(person, host).await?;
+        let transfer = "01234567-89ab-cdef-0123-456789abcdef";
+        let received_dir = tempfile::tempdir()?;
+        let started = std::time::Instant::now();
+        let received = pull(&client, transfer, received_dir.path(), |_, _| {}).await?;
+        let pull_rate = SIZE as f64 / started.elapsed().as_secs_f64() / 1e6;
+        assert_eq!(received.paths, [received_dir.path().join("Project")]);
+        assert_eq!(
+            std::fs::read(received_dir.path().join("Project/src/big.bin"))?,
+            std::fs::read(folder.join("src/big.bin"))?
+        );
+
+        let started = std::time::Instant::now();
+        push(&client, transfer, None, vec![upload], |_, _| {}).await?;
+        let push_rate = SIZE as f64 / started.elapsed().as_secs_f64() / 1e6;
+        assert_eq!(
+            std::fs::read(pasted.path().join("KoKo-paste/upload.bin"))?.len(),
+            SIZE
+        );
+        eprintln!("loopback clipboard: pull {pull_rate:.0} MB/s, push {push_rate:.0} MB/s");
+
+        client.close().await;
+        router.shutdown().await?;
+        let published = app.await?;
+        assert_eq!(
+            published,
+            [pasted
+                .path()
+                .join("KoKo-paste/upload.bin")
+                .to_string_lossy()
+                .into_owned()]
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_person_preempts_an_operating_agent() -> Result<(), Box<dyn Error>> {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
@@ -919,66 +1195,6 @@ mod tests {
         )
         .await?;
         assert!(matches!(reply, RemoteReply::Error { code } if code == "desktop_unavailable"));
-        router.shutdown().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn clipboard_chunk_requires_current_session_authorization() -> Result<(), Box<dyn Error>>
-    {
-        use koko_proto::{ClipboardOp, ClipboardPacket};
-
-        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
-        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
-        let controller = SecretKey::generate();
-        let (sessions, _) = watch::channel(Sessions::human(controller.public()));
-        let (app_desktop, mut requests) = AppDesktop::channel();
-        let router = Router::builder(endpoint)
-            .accept(
-                koko_proto::REMOTE_ALPN,
-                RemoteHost {
-                    sessions: sessions.clone(),
-                    app_desktop: Some(app_desktop),
-                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
-                    audit: None,
-                    pointer: Mutex::new(()),
-                    #[cfg(unix)]
-                    video: Mutex::new(()),
-                },
-            )
-            .spawn();
-        let client = RemoteClient::connect(controller, host).await?;
-        let command = RemoteCommand::Clipboard {
-            transfer: "01234567-89ab-cdef-0123-456789abcdef".into(),
-            op: ClipboardOp::Write,
-            packet: Some(ClipboardPacket::Data {
-                bytes: "/".repeat(87380) + "/w==",
-            }),
-        };
-        let respond = async {
-            let request = requests.recv().await.unwrap();
-            let RemoteCommand::Clipboard {
-                packet: Some(ClipboardPacket::Data { bytes }),
-                ..
-            } = request.command
-            else {
-                panic!("expected a file chunk");
-            };
-            assert_eq!(bytes.len(), 87384);
-            request.reply.send(RemoteReply::Ok).unwrap();
-        };
-        let (reply, ()) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(client.send(&command), respond)
-        })
-        .await?;
-        assert!(matches!(reply?, RemoteReply::Ok));
-        sessions.send_replace(Sessions::default());
-        assert!(client.send(&command).await.is_err());
-        assert!(matches!(
-            requests.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        client.close().await;
         router.shutdown().await?;
         Ok(())
     }

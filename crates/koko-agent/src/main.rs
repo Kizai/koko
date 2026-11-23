@@ -118,6 +118,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
             client.close().await;
             result?;
         }
+        [command, file, host, address, transfer, folder] if command == "clipboard-pull" => {
+            let key = load_identity(Path::new(file))?;
+            let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
+            let client = RemoteClient::connect(key, target).await?;
+            let mut report = Progress::default();
+            let result =
+                koko_p2p::clipboard::pull(&client, transfer, Path::new(folder), |done, total| {
+                    report.print(done, total)
+                })
+                .await;
+            client.close().await;
+            print_line(&match result {
+                Ok(received) => serde_json::json!({
+                    "status": "done",
+                    "text": received.text,
+                    "paths": received.paths,
+                }),
+                Err(code) => serde_json::json!({"status": "error", "code": code}),
+            });
+        }
+        [command, file, host, address, transfer] if command == "clipboard-push" => {
+            #[derive(serde::Deserialize)]
+            struct Items {
+                text: Option<String>,
+                #[serde(default)]
+                paths: Vec<PathBuf>,
+            }
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take((MAX_REMOTE_REQUEST + 1) as u64)
+                .read_to_end(&mut input)?;
+            let items: Items = serde_json::from_slice(&input)?;
+            let key = load_identity(Path::new(file))?;
+            let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
+            let client = RemoteClient::connect(key, target).await?;
+            let mut report = Progress::default();
+            let result = koko_p2p::clipboard::push(
+                &client,
+                transfer,
+                items.text,
+                items.paths,
+                |done, total| report.print(done, total),
+            )
+            .await;
+            client.close().await;
+            print_line(&match result {
+                Ok(()) => serde_json::json!({"status": "done"}),
+                Err(code) => serde_json::json!({"status": "error", "code": code}),
+            });
+        }
         [command, file, host, address] if command == "remote" => {
             let key = load_identity(Path::new(file))?;
             let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
@@ -134,12 +184,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | mcp [--identity <key-file>] [--name <name>] | remote <key-file> <host-id> <host-ip:port> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
+                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | mcp [--identity <key-file>] [--name <name>] | remote <key-file> <host-id> <host-ip:port> | clipboard-pull <key-file> <host-id> <host-ip:port> <transfer-id> <folder> | clipboard-push <key-file> <host-id> <host-ip:port> <transfer-id> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
                     .into(),
             );
         }
     }
     Ok(())
+}
+
+/// Prints transfer progress as JSON lines, at most five times a second, plus the final count.
+#[derive(Default)]
+struct Progress {
+    last: Option<Instant>,
+}
+
+impl Progress {
+    fn print(&mut self, done: u64, total: u64) {
+        if done == total
+            || self
+                .last
+                .is_none_or(|time| time.elapsed() >= Duration::from_millis(200))
+        {
+            self.last = Some(Instant::now());
+            print_line(&serde_json::json!({"progress": done, "total": total}));
+        }
+    }
+}
+
+fn print_line(value: &serde_json::Value) {
+    let mut output = io::stdout().lock();
+    let _ = writeln!(output, "{value}");
+    let _ = output.flush();
 }
 
 fn koko_directory() -> Result<PathBuf, Box<dyn Error>> {

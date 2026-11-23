@@ -14,9 +14,9 @@ struct DesktopRegression {
         }
         try checkRemoteTitleBar()
         try await checkHelperPipes()
-        try await checkDeniedClipboardFile()
+        try checkClipboardItems()
         try checkAgentPolicy()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、文件访问被拒绝和 Agent 高危操作规则测试")
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {
@@ -115,23 +115,26 @@ struct DesktopRegression {
         }
     }
 
-    @MainActor private static func checkDeniedClipboardFile() async throws {
-        let files = FileManager.default
-        let url = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try Data([1]).write(to: url)
-        defer { try? files.removeItem(at: url) }
-        try files.setAttributes([.posixPermissions: 0], ofItemAtPath: url.path)
+    /// The pasteboard is read as paths or text and filled back from received items; the bytes are streamed in Rust.
+    @MainActor private static func checkClipboardItems() throws {
         let board = NSPasteboard.withUniqueName()
         defer { board.releaseGlobally() }
-        guard board.writeObjects([url as NSURL]) else { throw Failure("无法准备剪贴板文件") }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        board.clearContents()
+        board.writeObjects([folder as NSURL])
+        guard try ClipboardItems.read(from: board).paths == [folder.path] else { throw Failure("复制的文件夹应作为路径交给传输") }
+
+        try ClipboardItems(text: "你好 KoKo").publish(on: board)
+        guard try ClipboardItems.read(from: board) == ClipboardItems(text: "你好 KoKo") else { throw Failure("文字应原样往返") }
+
+        board.clearContents()
         do {
-            let source = try await ClipboardSource.read(from: board)
-            _ = try await source.next()
-        } catch {
-            guard ClipboardError.from(error) == .permission else { throw error }
-            return
-        }
-        throw Failure("读取被拒绝的文件应返回目录权限错误")
+            _ = try ClipboardItems.read(from: board)
+            throw Failure("空的剪贴板不应开始传输")
+        } catch ClipboardError.unsupported {}
     }
 
     @MainActor private static func checkHelperPipes() async throws {

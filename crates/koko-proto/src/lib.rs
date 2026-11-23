@@ -10,7 +10,8 @@ pub const MAX_PAIR_REQUEST: usize = 1024;
 pub const MAX_PAIR_REPLY: usize = 256;
 pub const PAIR_VERSION: u8 = 2;
 pub const MAX_PEER_NAME: usize = 64;
-pub const MAX_REMOTE_REQUEST: usize = 128 * 1024;
+/// A request header; a clipboard push carries its file list here, so it allows long lists.
+pub const MAX_REMOTE_REQUEST: usize = 4 * 1024 * 1024;
 pub const MAX_REMOTE_REPLY: usize = 16 * 1024 * 1024;
 pub const MAX_VIDEO_PACKET: usize = 8 * 1024 * 1024;
 pub const VIDEO_ERROR: u8 = 3;
@@ -181,10 +182,30 @@ pub enum ImageFormat {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RemoteCommand {
-    Clipboard {
+    /// Copies the host's clipboard to the controller. The reply stream carries a manifest record,
+    /// then every file's bytes in manifest order.
+    ClipboardPull {
         transfer: String,
-        op: ClipboardOp,
-        packet: Option<ClipboardPacket>,
+    },
+    /// Pastes onto the host. The request header is followed by every file's bytes in manifest order.
+    ClipboardPush {
+        transfer: String,
+        manifest: ClipboardManifest,
+    },
+    /// Daemon to app only: press Copy and list what the pasteboard holds.
+    ClipboardRead {
+        transfer: String,
+    },
+    /// Daemon to app only: create an empty folder to receive pasted files.
+    ClipboardTarget {
+        transfer: String,
+    },
+    /// Daemon to app only: put received text or files on the pasteboard and press Paste.
+    ClipboardPublish {
+        transfer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        paths: Vec<String>,
     },
     Disconnect,
     Hello,
@@ -231,23 +252,69 @@ pub enum RemoteCommand {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClipboardOp {
-    Copy,
-    Begin,
-    Next,
-    Write,
-    Cancel,
+/// What a clipboard transfer carries: text, or files and folders listed parent first.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClipboardManifest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<ClipboardEntry>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ClipboardPacket {
-    Text { bytes: String },
-    File { name: String, size: u64 },
-    Data { bytes: String },
-    End,
+/// A file or folder, named by a `/`-separated path relative to the transfer's folder.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClipboardEntry {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
+}
+
+fn is_zero(size: &u64) -> bool {
+    *size == 0
+}
+
+pub const MAX_CLIPBOARD_TEXT: usize = 1024 * 1024;
+pub const MAX_CLIPBOARD_ENTRIES: usize = 20_000;
+/// Records on a clipboard pull stream share the video framing: big-endian length, kind, payload.
+pub const CLIPBOARD_MANIFEST: u8 = 1;
+pub const CLIPBOARD_ERROR: u8 = 3;
+
+impl ClipboardManifest {
+    /// Text alone, or entries alone, with every path relative and free of `.` and `..`.
+    pub fn valid(&self) -> bool {
+        let text_ok = self
+            .text
+            .as_ref()
+            .is_none_or(|text| text.len() <= MAX_CLIPBOARD_TEXT && !text.contains('\0'));
+        let one_kind = self.text.is_some() != !self.entries.is_empty();
+        text_ok
+            && one_kind
+            && self.entries.len() <= MAX_CLIPBOARD_ENTRIES
+            && self
+                .entries
+                .iter()
+                .all(|entry| safe_relative_path(&entry.path) && !(entry.dir && entry.size != 0))
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.entries.iter().map(|entry| entry.size).sum()
+    }
+}
+
+/// Rejects absolute paths, empty or `.`/`..` components, NUL and over-long names.
+pub fn safe_relative_path(path: &str) -> bool {
+    let components: Vec<&str> = path.split('/').collect();
+    !path.is_empty()
+        && components.len() <= 64
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && *component != "."
+                && *component != ".."
+                && component.len() <= 255
+                && !component.contains('\0')
+        })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -370,10 +437,18 @@ impl RemoteKey {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RemoteReply {
-    Clipboard {
-        packet: ClipboardPacket,
-    },
     Ok,
+    /// App to daemon only: what Copy put on the host's pasteboard, as absolute paths or text.
+    ClipboardItems {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default)]
+        paths: Vec<String>,
+    },
+    /// App to daemon only: the folder that receives pasted files.
+    ClipboardFolder {
+        path: String,
+    },
     /// Sent by the host app to the daemon only: this agent input needs the person's approval.
     ApprovalRequired {
         reason: String,
@@ -408,6 +483,9 @@ pub enum RemoteReply {
         video: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         clipboard: bool,
+        /// The host streams clipboard files, so any size can be copied and pasted.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clipboard_stream: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control: Option<ControlState>,
     },
@@ -433,7 +511,9 @@ impl RemoteCommand {
     pub fn desktop_timeout(&self) -> std::time::Duration {
         // Clipboard file access may wait for a person to answer a macOS privacy prompt.
         std::time::Duration::from_secs(match self {
-            Self::Clipboard { .. } => 120,
+            Self::ClipboardRead { .. }
+            | Self::ClipboardTarget { .. }
+            | Self::ClipboardPublish { .. } => 120,
             // The host holds the request open until a person answers.
             Self::RequestHuman { timeout_s, .. } => u64::from(*timeout_s) + 5,
             _ => 9,
@@ -477,7 +557,10 @@ impl RemoteCommand {
             Self::Pointer { events, .. } => events
                 .iter()
                 .any(|event| !matches!(event, PointerEvent::Release)),
-            Self::Clipboard { .. } | Self::Click { .. } | Self::Key { .. } => true,
+            Self::ClipboardPull { .. }
+            | Self::ClipboardPush { .. }
+            | Self::Click { .. }
+            | Self::Key { .. } => true,
             _ => self.is_agent_input(),
         }
     }
@@ -485,24 +568,14 @@ impl RemoteCommand {
 
 pub fn valid_remote_command(command: &RemoteCommand) -> bool {
     match command {
-        RemoteCommand::Clipboard {
-            transfer,
-            op,
-            packet,
-        } => {
-            transfer.len() == 36
-                && matches!(
-                    (op, packet),
-                    (ClipboardOp::Write, Some(_))
-                        | (
-                            ClipboardOp::Begin
-                                | ClipboardOp::Copy
-                                | ClipboardOp::Next
-                                | ClipboardOp::Cancel,
-                            None
-                        )
-                )
+        RemoteCommand::ClipboardPull { transfer } => transfer.len() == 36,
+        RemoteCommand::ClipboardPush { transfer, manifest } => {
+            transfer.len() == 36 && manifest.valid()
         }
+        // Only the daemon sends these to its own app.
+        RemoteCommand::ClipboardRead { .. }
+        | RemoteCommand::ClipboardTarget { .. }
+        | RemoteCommand::ClipboardPublish { .. } => false,
         RemoteCommand::Click { x, y } => *x < 10_000 && *y < 10_000,
         RemoteCommand::Capture {
             display,
@@ -564,10 +637,8 @@ mod tests {
         assert!(pointer.allowed_for(Scope::AgentSafe));
         assert!(RemoteCommand::Displays.allowed_for(Scope::Observer));
         assert!(!RemoteCommand::ReleaseControl.allowed_for(Scope::Observer));
-        let clipboard = RemoteCommand::Clipboard {
+        let clipboard = RemoteCommand::ClipboardPull {
             transfer: "x".into(),
-            op: ClipboardOp::Copy,
-            packet: None,
         };
         assert!(!clipboard.allowed_for(Scope::AgentSafe));
         assert!(clipboard.is_human_input());
@@ -577,6 +648,32 @@ mod tests {
             source_os: None,
         };
         assert!(!release.is_human_input());
+    }
+
+    #[test]
+    fn clipboard_manifests_stay_inside_their_folder() {
+        let entry = |path: &str| ClipboardEntry {
+            path: path.into(),
+            size: 1,
+            dir: false,
+        };
+        let files = |paths: &[&str]| ClipboardManifest {
+            text: None,
+            entries: paths.iter().map(|path| entry(path)).collect(),
+        };
+        assert!(files(&["Report.pdf", "Photos/a.jpg"]).valid());
+        for bad in ["/etc/passwd", "../x", "a/../b", "a//b", "", "a/./b"] {
+            assert!(!files(&[bad]).valid(), "{bad}");
+        }
+        assert!(
+            !ClipboardManifest::default().valid(),
+            "a transfer carries something"
+        );
+        let both = ClipboardManifest {
+            text: Some("hi".into()),
+            entries: vec![entry("a")],
+        };
+        assert!(!both.valid());
     }
 
     #[test]

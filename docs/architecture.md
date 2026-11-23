@@ -90,7 +90,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 ### 远控命令
 
-命令和回复都是带标签的 JSON，定义在 `koko-proto`。请求最大 128 KiB，回复最大 16 MiB，坐标按所选显示器归一化到 0–9999。
+命令和回复都是带标签的 JSON，定义在 `koko-proto`。请求头最大 4 MiB，回复最大 16 MiB，坐标按所选显示器归一化到 0–9999。
 
 | `action` | 参数 | 成功回复 |
 | --- | --- | --- |
@@ -98,18 +98,21 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `release_control` | 无 | `ok`，Agent 交还控制权 |
 | `ui_tree` | `max_nodes`（1–1000） | `ui_tree`，含前台应用名 `app`、展平的界面元素列表 `nodes` 和是否截断 `truncated`；元素边框按所在显示器归一化到 0–9999，密码框不含值 |
 | `request_human` | `reason`（最多 500 字符）、`timeout_s`（10–600） | `human`，含 `result`（`resolved`、`declined`、`taken_over` 或 `timeout`）和可选的 `note`；等人回答期间保持请求打开 |
-| `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard` 能力标记和控制权状态 `control` |
+| `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard`、`clipboard_stream` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
 | `video` | `capture` 的参数和 `fps`（30、60、90、120、144、165 或 240） | 二进制视频记录流 |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
-| `clipboard` | `transfer`（UUID）、`op`（`copy`、`begin`、`next`、`write`、`cancel`），`write` 时带 `packet` | `ok` 或 `clipboard` 数据包 |
+| `clipboard_pull` | `transfer`（UUID） | 被控端按下 ⌘C 后，流上先发一条清单记录（文字，或文件与文件夹的相对路径和大小），再按清单顺序连续发送全部文件字节；出错时发错误记录 |
+| `clipboard_push` | `transfer`、`manifest`（同上的清单） | 请求头之后按清单顺序连续发送全部文件字节；被控端写入新建的接收目录后放入剪贴板并按 ⌘V，回复 `ok` |
 | `screenshot` | 无 | `frame`，主屏 Base64 PNG |
 | `click`、`key`、`text` | 主屏比例坐标、常用按键名或最长 2048 字节的文本 | `ok` |
 | `disconnect` | 无 | `ok`，同时撤销本会话授权 |
 
 `pointer` 事件包括 `move`、`down`、`up`、`scroll`、`key_down`、`key_up` 和 `release`。按键使用 Mac 虚拟键码与 Core Graphics 修饰位右移 16 位。daemon 同一时间只允许一条连接发送 `pointer`，另一条连接会收到 `pointer_busy`，以保证按下、拖动和抬起的顺序。视频订阅同样只允许一个，新的订阅在旧订阅结束前收到 `video_busy`。
 
-失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`awaiting_human`、`awaiting_approval`、`approval_declined`、`approval_timeout`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板请求因可能等待 macOS 文件访问确认而等待 120 秒。
+失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`awaiting_human`、`awaiting_approval`、`approval_declined`、`approval_timeout`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板相关的桌面请求因可能等待 macOS 文件访问确认而等待 120 秒。
+
+剪贴板文件在 Rust 中流式传输（`crates/koko-p2p/src/clipboard.rs`）：一次复制或粘贴只用一条 QUIC 流，不再按块往返，也不做 Base64 编码，速度取决于网络和磁盘。请求头以换行结尾，之后是正文；没有正文的请求仍可像以前一样直接结束发送。清单中的路径必须是相对路径，不能含 `.`、`..` 或空段；接收方只在新建的目录中创建文件，字节数与清单不符时整次传输作废。文件夹中的符号链接和特殊文件会被跳过，选中的符号链接本身会被拒绝。被控端的应用只负责按 ⌘C / ⌘V、提供文件路径和接收目录，文件内容由 daemon 读写；控制端由 `koko-agent clipboard-pull` / `clipboard-push` 读写文件，并按行输出进度。
 
 以图形版模式运行时，所有命令都交给 `Koko.app`。单独运行 `koko-daemon serve-pair` 时，`screenshot`、`click`、`key` 和 `text` 由同目录的 `koko-desktop` 执行，其余命令返回 `desktop_unavailable`。
 
@@ -141,12 +144,12 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `Agent help: <JSON>` | Agent 请人协助，JSON 含 `reason` 和 `timeout_s` |
 | `Agent approval: <JSON>` | 一条 Agent 输入等待批准，JSON 含 `reason` |
 | `Pair declined`、`Pair request ended`、`Pair code used` | 申请被拒绝、申请方已离开、连接码因批准而失效 |
-| `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径 |
+| `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
 应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
-控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠和剪贴板各保持一个进程，按行收发 JSON；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
+控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
 
 ### 性能边界
 

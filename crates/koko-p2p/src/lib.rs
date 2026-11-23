@@ -1,5 +1,6 @@
 //! Peer-to-peer transport and connection management for Koko.
 
+pub mod clipboard;
 pub mod pairing;
 pub mod remote;
 

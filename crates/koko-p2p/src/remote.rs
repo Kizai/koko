@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use iroh::{
     Endpoint, EndpointAddr, SecretKey,
-    endpoint::{Connection, QuicTransportConfig, RecvStream, presets},
+    endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, presets},
 };
 use koko_proto::{MAX_REMOTE_REPLY, REMOTE_ALPN, RemoteCommand, RemoteReply};
 use tokio::time::timeout;
@@ -63,6 +63,19 @@ impl RemoteClient {
         send.write_all(&serde_json::to_vec(command)?).await?;
         send.finish()?;
         Ok(recv)
+    }
+
+    /// Opens a stream whose request header is followed by a body the caller writes, such as
+    /// clipboard files. The header ends with a newline, which JSON never contains.
+    pub async fn open_stream(
+        &self,
+        command: &RemoteCommand,
+    ) -> Result<(SendStream, RecvStream), Box<dyn Error>> {
+        let (mut send, recv) = self.connection.open_bi().await?;
+        let mut header = serde_json::to_vec(command)?;
+        header.push(b'\n');
+        send.write_all(&header).await?;
+        Ok((send, recv))
     }
 
     pub fn selected_path(&self) -> Option<(u64, bool)> {
