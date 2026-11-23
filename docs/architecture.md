@@ -103,6 +103,8 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `video` | `capture` 的参数和 `fps`（30、60、90、120、144、165 或 240） | 二进制视频记录流 |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
 | `clipboard_pull` | `transfer`（UUID） | 被控端按下 ⌘C 后，流上先发一条清单记录（文字，或文件与文件夹的相对路径和大小），再按清单顺序连续发送全部文件字节；出错时发错误记录 |
+| `outbox_wait` | 无 | 最多等待 25 秒，返回被控端待发送的文件批次 `outbox`（`offers` 含批次 ID 和顶层名称）；有新批次时立即返回，超时返回空列表 |
+| `outbox_pull` | `offer`（批次 ID） | 与 `clipboard_pull` 相同的流：清单记录后连续发送文件字节；每个批次只能拉取一次，已被拉走或已失效时发 `outbox_gone` 错误记录 |
 | `clipboard_push` | `transfer`、`manifest`（同上的清单） | 请求头之后按清单顺序连续发送全部文件字节；被控端写入新建的接收目录后放入剪贴板并按 ⌘V，回复 `ok` |
 | `screenshot` | 无 | `frame`，主屏 Base64 PNG |
 | `click`、`key`、`text` | 主屏比例坐标、常用按键名或最长 2048 字节的文本 | `ok` |
@@ -143,13 +145,14 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `Agent control: idle`、`active`、`paused`、`awaiting_human` | Agent 控制权变化，应用据此显示屏幕顶部的指示条 |
 | `Agent help: <JSON>` | Agent 请人协助，JSON 含 `reason` 和 `timeout_s` |
 | `Agent approval: <JSON>` | 一条 Agent 输入等待批准，JSON 含 `reason` |
+| `Outbox queued <批次>`、`Outbox sent <批次>`、`Outbox failed <批次> <错误码>`、`Outbox refused` | 被控端发送文件的进展；没有人类控制端在线时拒绝入队 |
 | `Pair declined`、`Pair request ended`、`Pair code used` | 申请被拒绝、申请方已离开、连接码因批准而失效 |
 | `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
-应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
-控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
+控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
 
 ### 性能边界
 

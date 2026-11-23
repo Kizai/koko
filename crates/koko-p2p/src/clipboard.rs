@@ -240,19 +240,17 @@ pub struct Received {
     pub paths: Vec<PathBuf>,
 }
 
-/// Copies the host's clipboard into `folder`, which must be new and empty. Errors are the codes
-/// people see, such as `clipboard_file_permission`, or the connection's own message.
+/// Receives a `clipboard_pull` or `outbox_pull` stream into `folder`, which must be new and
+/// empty. Errors are the codes people see, such as `clipboard_file_permission`, or the
+/// connection's own message.
 pub async fn pull(
     client: &RemoteClient,
-    transfer: &str,
+    command: &RemoteCommand,
     folder: &Path,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Received, String> {
-    let command = RemoteCommand::ClipboardPull {
-        transfer: transfer.to_owned(),
-    };
     let (mut send, mut recv) = client
-        .open_stream(&command)
+        .open_stream(command)
         .await
         .map_err(|error| format!("{error:?}"))?;
     send.finish().map_err(|error| format!("{error:?}"))?;

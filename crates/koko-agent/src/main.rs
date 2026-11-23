@@ -119,24 +119,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             result?;
         }
         [command, file, host, address, transfer, folder] if command == "clipboard-pull" => {
-            let key = load_identity(Path::new(file))?;
-            let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
-            let client = RemoteClient::connect(key, target).await?;
-            let mut report = Progress::default();
-            let result =
-                koko_p2p::clipboard::pull(&client, transfer, Path::new(folder), |done, total| {
-                    report.print(done, total)
-                })
-                .await;
-            client.close().await;
-            print_line(&match result {
-                Ok(received) => serde_json::json!({
-                    "status": "done",
-                    "text": received.text,
-                    "paths": received.paths,
-                }),
-                Err(code) => serde_json::json!({"status": "error", "code": code}),
-            });
+            let request = RemoteCommand::ClipboardPull {
+                transfer: transfer.clone(),
+            };
+            receive_into(file, host, address, &request, folder).await?;
+        }
+        [command, file, host, address, offer, folder] if command == "outbox-pull" => {
+            let request = RemoteCommand::OutboxPull {
+                offer: offer.clone(),
+            };
+            receive_into(file, host, address, &request, folder).await?;
         }
         [command, file, host, address, transfer] if command == "clipboard-push" => {
             #[derive(serde::Deserialize)]
@@ -184,11 +176,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => {
             return Err(
-                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | mcp [--identity <key-file>] [--name <name>] | remote <key-file> <host-id> <host-ip:port> | clipboard-pull <key-file> <host-id> <host-ip:port> <transfer-id> <folder> | clipboard-push <key-file> <host-id> <host-ip:port> <transfer-id> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
+                "usage: koko-agent --version | identity <key-file> | check <key-file> <host-id> <host-ip:port> | pair <code-or-invite> | pair <key-file> <code-or-invite> [--prefer-lan] [--enhanced] | discover | mcp [--identity <key-file>] [--name <name>] | remote <key-file> <host-id> <host-ip:port> | clipboard-pull <key-file> <host-id> <host-ip:port> <transfer-id> <folder> | clipboard-push <key-file> <host-id> <host-ip:port> <transfer-id> | outbox-pull <key-file> <host-id> <host-ip:port> <offer-id> <folder> | remote-stream <key-file> <host-id> <host-ip:port> | remote-video <key-file> <host-id> <host-ip:port> <video-request-json>"
                     .into(),
             );
         }
     }
+    Ok(())
+}
+
+/// Receives copied or offered files into `folder`, printing progress and then the result as JSON.
+async fn receive_into(
+    file: &str,
+    host: &str,
+    address: &str,
+    request: &RemoteCommand,
+    folder: &str,
+) -> Result<(), Box<dyn Error>> {
+    let key = load_identity(Path::new(file))?;
+    let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);
+    let client = RemoteClient::connect(key, target).await?;
+    let mut report = Progress::default();
+    let result = koko_p2p::clipboard::pull(&client, request, Path::new(folder), |done, total| {
+        report.print(done, total)
+    })
+    .await;
+    client.close().await;
+    print_line(&match result {
+        Ok(received) => serde_json::json!({
+            "status": "done",
+            "text": received.text,
+            "paths": received.paths,
+        }),
+        Err(code) => serde_json::json!({"status": "error", "code": code}),
+    });
     Ok(())
 }
 

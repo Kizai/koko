@@ -20,6 +20,7 @@ struct KokoSettingsView: View {
     @AppStorage("mapWindowsModifiers") private var mapWindowsModifiers = true
     @AppStorage(KeepAwake.key) private var keepAwake = KeepAwake.Mode.never.rawValue
     @AppStorage(CloseAction.key) private var closeAction = CloseAction.menuBar.rawValue
+    @AppStorage("dragSendPanel") private var dragSendPanel = true
     @ViewState private var launchAtLogin = LaunchAtLogin.isEnabled
     @ViewState private var loginNeedsApproval = LaunchAtLogin.needsApproval
     @ViewState private var loginError: String?
@@ -76,6 +77,16 @@ struct KokoSettingsView: View {
                         Picker("关闭窗口时", selection: $closeAction) {
                             ForEach(CloseAction.allCases) { Text($0.title).tag($0.rawValue) }
                         }
+                    }
+                    SwiftUI.Section {
+                        Toggle(isOn: $dragSendPanel) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("被控时拖拽文件显示发送浮窗")
+                                Text("开启后，被控时拖动文件会在屏幕右侧出现浮窗，拖进去即可发给控制端。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        .toggleStyle(.switch)
                     }
                     SwiftUI.Section {
                         Picker("新会话的帧率", selection: $defaultFrameRate) {
@@ -177,6 +188,7 @@ struct KokoSettingsView: View {
         }
         .frame(width: 560, height: 520)
         .onChange(of: keepAwake) { _ in KeepAwake.shared.update(hosting: connection.isHosting) }
+        .onChange(of: dragSendPanel) { _ in connection.refreshSendPanel() }
         .alert("无法更改开机自启动", isPresented: Binding(get: { loginError != nil }, set: { if !$0 { loginError = nil } })) {
             Button("好") {}
         } message: {

@@ -44,6 +44,23 @@ struct RemoteControlView: View {
                 }
             }
             .overlay(alignment: .bottomTrailing) {
+              VStack(alignment: .trailing, spacing: 0) {
+                if !connection.receivedFiles.isEmpty {
+                    HStack(spacing: 8) {
+                        Label("已收到被控端发来的 \(connection.receivedFiles.count) 项", systemImage: "tray.and.arrow.down")
+                        Button("在访达中显示") {
+                            NSWorkspace.shared.activateFileViewerSelecting(connection.receivedFiles)
+                            connection.dismissReceivedFiles()
+                        }
+                        Button("关闭", action: connection.dismissReceivedFiles)
+                            .buttonStyle(.borderless)
+                    }
+                    .font(.callout)
+                    .padding(8)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal, 10)
+                    .padding(.top, 10)
+                }
                 if let notice = connection.clipboardNotice ?? connection.inputNotice {
                     HStack(spacing: 8) {
                         Label(notice.message, systemImage: connection.clipboardNotice == nil ? "cursorarrow.rays" : "doc.on.clipboard")
@@ -57,6 +74,7 @@ struct RemoteControlView: View {
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                     .padding(10)
                 }
+              }
             }
         }
         .frame(minWidth: 670, idealWidth: 1060, minHeight: 410, idealHeight: 650)

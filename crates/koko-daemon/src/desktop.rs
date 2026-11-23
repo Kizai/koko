@@ -12,8 +12,8 @@ use iroh::{
 use koko_p2p::clipboard;
 use koko_proto::{
     APPROVAL_TIMEOUT, CLIPBOARD_ERROR, CLIPBOARD_MANIFEST, ClipboardManifest, HumanResult,
-    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope, VIDEO_ERROR,
-    valid_remote_command,
+    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, OUTBOX_WAIT, PeerKind, RemoteCommand, RemoteReply, Scope,
+    VIDEO_ERROR, valid_remote_command,
 };
 use tokio::io::AsyncReadExt;
 #[cfg(unix)]
@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use crate::arbiter::Arbiter;
 use crate::audit::Audit;
+use crate::outbox::Outbox;
 use crate::session::{Sessions, report_end};
 
 pub(crate) struct DesktopRequest {
@@ -142,6 +143,7 @@ pub(crate) struct RemoteHost {
     pub(crate) app_desktop: Option<AppDesktop>,
     pub(crate) arbiter: Arc<Arbiter>,
     pub(crate) audit: Option<Audit>,
+    pub(crate) outbox: Arc<Outbox>,
     pub(crate) pointer: Mutex<()>,
     #[cfg(unix)]
     pub(crate) video: Mutex<()>,
@@ -219,6 +221,41 @@ impl RemoteHost {
                         reply = self.serve_push(transfer, manifest, body, &mut recv) => reply,
                     }
                 }
+                Ok(RemoteCommand::OutboxWait) => tokio::select! {
+                    biased;
+                    _ = revoked(&authorization, peer, scope) => {
+                        connection.close(1u32.into(), b"peer not authorized");
+                        return Ok(());
+                    }
+                    offers = self.outbox.wait(OUTBOX_WAIT) => RemoteReply::Outbox { offers },
+                },
+                Ok(command @ RemoteCommand::OutboxPull { .. })
+                    if valid_remote_command(&command) =>
+                {
+                    let RemoteCommand::OutboxPull { offer } = command else {
+                        unreachable!("matched above")
+                    };
+                    let outcome = match self.outbox.take(&offer) {
+                        Some(paths) => tokio::select! {
+                            biased;
+                            _ = revoked(&authorization, peer, scope) => {
+                                connection.close(1u32.into(), b"peer not authorized");
+                                return Ok(());
+                            }
+                            outcome = send_items(&mut send, None, paths) => outcome?,
+                        },
+                        None => {
+                            send_clipboard_error(&mut send, "outbox_gone").await?;
+                            Err("outbox_gone".to_owned())
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => println!("Outbox sent {offer}"),
+                        Err(code) => println!("Outbox failed {offer} {code}"),
+                    }
+                    let _ = send.finish();
+                    continue;
+                }
                 Ok(command @ RemoteCommand::Video { .. }) => {
                     tokio::select! {
                         biased;
@@ -240,8 +277,9 @@ impl RemoteHost {
                     });
                     if let Some(kind) = ended {
                         report_end(kind);
-                        if kind == PeerKind::Agent {
-                            self.arbiter.reset();
+                        match kind {
+                            PeerKind::Agent => self.arbiter.reset(),
+                            PeerKind::Human => self.outbox.clear(),
                         }
                     }
                     RemoteReply::Ok
@@ -467,30 +505,9 @@ impl RemoteHost {
             RemoteReply::Error { code } => return send_clipboard_error(send, &code).await,
             _ => return send_clipboard_error(send, "clipboard_failed").await,
         };
-        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-        let (entries, sources) =
-            match tokio::task::spawn_blocking(move || clipboard::collect(&paths)).await {
-                Ok(Ok(listed)) => listed,
-                Ok(Err(error)) => {
-                    return send_clipboard_error(send, clipboard::error_code(&error)).await;
-                }
-                Err(_) => return send_clipboard_error(send, "clipboard_failed").await,
-            };
-        let manifest = ClipboardManifest { text, entries };
-        if !manifest.valid() {
-            return send_clipboard_error(send, "clipboard_unsupported").await;
-        }
-        let header = serde_json::to_vec(&manifest).map_err(AcceptError::from_err)?;
-        clipboard::write_record(send, CLIPBOARD_MANIFEST, &header)
-            .await
-            .map_err(AcceptError::from_err)?;
-        if clipboard::send_files(&manifest.entries, &sources, send, |_| {})
-            .await
-            .is_err()
-        {
-            // The receiver sees the reset and discards what it received.
-            let _ = send.reset(1u32.into());
-        }
+        let paths = paths.into_iter().map(PathBuf::from).collect();
+        // The controller learns the outcome from the stream itself.
+        let _ = send_items(send, text, paths).await?;
         Ok(())
     }
 
@@ -552,6 +569,43 @@ impl RemoteHost {
         }
         reply
     }
+}
+
+/// Streams text or files to a controller: a manifest record, then every file's bytes. The inner
+/// result says whether the controller got everything, with the error code it saw otherwise.
+async fn send_items(
+    send: &mut SendStream,
+    text: Option<String>,
+    paths: Vec<PathBuf>,
+) -> Result<Result<(), String>, AcceptError> {
+    let (entries, sources) =
+        match tokio::task::spawn_blocking(move || clipboard::collect(&paths)).await {
+            Ok(Ok(listed)) => listed,
+            Ok(Err(error)) => {
+                let code = clipboard::error_code(&error);
+                send_clipboard_error(send, code).await?;
+                return Ok(Err(code.to_owned()));
+            }
+            Err(_) => {
+                send_clipboard_error(send, "clipboard_failed").await?;
+                return Ok(Err("clipboard_failed".to_owned()));
+            }
+        };
+    let manifest = ClipboardManifest { text, entries };
+    if !manifest.valid() {
+        send_clipboard_error(send, "clipboard_unsupported").await?;
+        return Ok(Err("clipboard_unsupported".to_owned()));
+    }
+    let header = serde_json::to_vec(&manifest).map_err(AcceptError::from_err)?;
+    clipboard::write_record(send, CLIPBOARD_MANIFEST, &header)
+        .await
+        .map_err(AcceptError::from_err)?;
+    if let Err(error) = clipboard::send_files(&manifest.entries, &sources, send, |_| {}).await {
+        // The receiver sees the reset and discards what it received.
+        let _ = send.reset(1u32.into());
+        return Ok(Err(clipboard::error_code(&error).to_owned()));
+    }
+    Ok(Ok(()))
 }
 
 /// Reads a request header up to its newline. Requests without a body end at the stream's end
@@ -617,6 +671,8 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         RemoteCommand::Disconnect
         | RemoteCommand::Hello
         | RemoteCommand::ReleaseControl
+        | RemoteCommand::OutboxWait
+        | RemoteCommand::OutboxPull { .. }
         | RemoteCommand::RequestHuman { .. } => {
             unreachable!("session commands are handled by the host")
         }
@@ -730,6 +786,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -789,6 +846,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -882,6 +940,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -933,7 +992,10 @@ mod tests {
         let transfer = "01234567-89ab-cdef-0123-456789abcdef";
         let received_dir = tempfile::tempdir()?;
         let started = std::time::Instant::now();
-        let received = pull(&client, transfer, received_dir.path(), |_, _| {}).await?;
+        let command = RemoteCommand::ClipboardPull {
+            transfer: transfer.into(),
+        };
+        let received = pull(&client, &command, received_dir.path(), |_, _| {}).await?;
         let pull_rate = SIZE as f64 / started.elapsed().as_secs_f64() / 1e6;
         assert_eq!(received.paths, [received_dir.path().join("Project")]);
         assert_eq!(
@@ -965,6 +1027,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_host_offers_files_to_a_waiting_controller() -> Result<(), Box<dyn Error>> {
+        use koko_p2p::clipboard::pull;
+
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let person = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions::human(person.public()));
+        let outbox = Arc::new(Outbox::default());
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(AppDesktop::channel().0),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
+                    outbox: outbox.clone(),
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let files = tempfile::tempdir()?;
+        let report = files.path().join("Report.pdf");
+        std::fs::write(&report, b"quarterly")?;
+        let client = RemoteClient::connect(person, host).await?;
+
+        let started = std::time::Instant::now();
+        let drop_files = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            outbox.add(vec![report.clone()])
+        };
+        let (offers, id) = tokio::join!(client.send(&RemoteCommand::OutboxWait), drop_files);
+        let RemoteReply::Outbox { offers } = offers? else {
+            panic!("expected offers");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait ends as soon as files arrive"
+        );
+        assert_eq!(offers[0].id, id);
+        assert_eq!(offers[0].names, ["Report.pdf"]);
+
+        let received_dir = tempfile::tempdir()?;
+        let request = RemoteCommand::OutboxPull { offer: id.clone() };
+        let received = pull(&client, &request, received_dir.path(), |_, _| {}).await?;
+        assert_eq!(std::fs::read(&received.paths[0])?, b"quarterly");
+        let again = tempfile::tempdir()?;
+        let gone = pull(&client, &request, again.path(), |_, _| {}).await;
+        assert_eq!(gone.err().as_deref(), Some("outbox_gone"));
+
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_person_preempts_an_operating_agent() -> Result<(), Box<dyn Error>> {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
         let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
@@ -984,6 +1104,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: arbiter.clone(),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -1064,6 +1185,7 @@ mod tests {
                     app_desktop: Some(AppDesktop::channel().0),
                     arbiter: arbiter.clone(),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -1114,6 +1236,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: arbiter.clone(),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -1180,6 +1303,7 @@ mod tests {
                     app_desktop: None,
                     arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),
@@ -1215,6 +1339,7 @@ mod tests {
                     app_desktop: Some(app_desktop),
                     arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
                     audit: None,
+                    outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
                     video: Mutex::new(()),

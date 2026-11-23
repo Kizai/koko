@@ -27,6 +27,7 @@ use crate::{
     arbiter::{AGENT_IDLE, Arbiter, HUMAN_GRACE},
     audit::Audit,
     desktop::{AppDesktop, AppDesktopRequests, RemoteHost},
+    outbox::Outbox,
     session::{Sessions, report_end},
     trust::{Trust, TrustRecord},
 };
@@ -159,6 +160,7 @@ impl ProtocolHandler for Pairing {
 struct HostState {
     sessions: watch::Sender<Sessions>,
     arbiter: Arc<Arbiter>,
+    outbox: Arc<Outbox>,
     trust: Trust,
     open: bool,
     pending: Option<(u64, PairRequest)>,
@@ -278,6 +280,7 @@ impl HostState {
                 let ended = self.sessions.send_replace(Sessions::default());
                 if ended.human.is_some() {
                     report_end(PeerKind::Human);
+                    self.outbox.clear();
                 }
                 if ended.agent.is_some() {
                     report_end(PeerKind::Agent);
@@ -314,6 +317,20 @@ impl HostState {
                 return;
             }
             _ => {}
+        }
+        // The person at the host dropped files to send to the controller.
+        if let Some(offer) = line.strip_prefix("outbox ") {
+            #[derive(serde::Deserialize)]
+            struct Offer {
+                paths: Vec<std::path::PathBuf>,
+            }
+            match serde_json::from_str::<Offer>(offer) {
+                Ok(offer) if !offer.paths.is_empty() && self.sessions.borrow().human.is_some() => {
+                    println!("Outbox queued {}", self.outbox.add(offer.paths));
+                }
+                _ => println!("Outbox refused"),
+            }
+            return;
         }
         if let Some(answer) = line.strip_prefix("agent-help ") {
             let (result, note) = answer.split_once(' ').unwrap_or((answer, ""));
@@ -374,6 +391,7 @@ pub(crate) async fn serve(
     let directory = app.map(|(file, _)| file.parent().unwrap_or_else(|| Path::new(".")));
     let trust = Trust::load(directory)?;
     let arbiter = Arc::new(Arbiter::new(HUMAN_GRACE, AGENT_IDLE));
+    let outbox = Arc::new(Outbox::default());
     let endpoint = bind_host(key, address).await?;
     let address = endpoint.bound_sockets()[0];
     let code = InviteCode::generate();
@@ -398,6 +416,7 @@ pub(crate) async fn serve(
                 app_desktop: app.is_some().then_some(app_desktop),
                 arbiter: arbiter.clone(),
                 audit: directory.map(Audit::new),
+                outbox: outbox.clone(),
                 pointer: tokio::sync::Mutex::new(()),
                 #[cfg(unix)]
                 video: tokio::sync::Mutex::new(()),
@@ -426,6 +445,7 @@ pub(crate) async fn serve(
     let mut state = HostState {
         sessions,
         arbiter,
+        outbox,
         trust,
         open: true,
         pending: None,
@@ -512,6 +532,7 @@ mod tests {
             state: HostState {
                 sessions,
                 arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::ZERO)),
+                outbox: Default::default(),
                 trust: Trust::load(Some(directory.path()))?,
                 open: true,
                 pending: None,

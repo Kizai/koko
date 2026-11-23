@@ -169,6 +169,11 @@ struct RemoteAction: Codable {
     }
 }
 
+struct OutboxOfferInfo: Codable {
+    let id: String
+    let names: [String]
+}
+
 struct RemoteNetworkStats {
     let rttMS: Int?
     let frameMS: Int
@@ -201,10 +206,12 @@ private struct RemoteReply: Codable {
     var text: String? = nil
     var paths: [String]? = nil
     var path: String? = nil
+    var outbox: Bool? = nil
+    var offers: [OutboxOfferInfo]? = nil
 
     enum CodingKeys: String, CodingKey {
         case status, clipboard, png, code, image, displays, direct, video, width, height, format, control
-        case app, nodes, truncated, reason, text, paths, path
+        case app, nodes, truncated, reason, text, paths, path, outbox, offers
         case clipboardStream = "clipboard_stream"
         case rttMS = "rtt_ms"
         case hostName = "host_name"
@@ -391,7 +398,9 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var isHosting = false {
         didSet { KeepAwake.shared.update(hosting: isHosting) }
     }
-    @Published private(set) var isSharingWithPeer = false
+    @Published private(set) var isSharingWithPeer = false {
+        didSet { updateSendPanel() }
+    }
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
     @Published private(set) var pendingPair: PendingPair?
@@ -474,6 +483,11 @@ final class LocalConnection: ObservableObject {
     private var clipboardCommand: LocalCommand?
     @Published private(set) var clipboardTransferID: String?
     private(set) var supportsClipboardStream = false
+    /// Files the host sent with its drop panel, saved on this Mac and shown until dismissed.
+    @Published private(set) var receivedFiles: [URL] = []
+    private var outboxTask: Task<Void, Never>?
+    private let sendPanel = SendPanel()
+    private var sendTimeout: Task<Void, Never>?
     private var displayActivity = IOPMAssertionID(0)
     private var hostCommand: LocalCommand?
     private var isCapturingScreen = false
@@ -603,6 +617,7 @@ final class LocalConnection: ObservableObject {
         agentIndicator.onResume = { [weak self] in Task { await self?.sendHost("resume-agent") } }
         agentIndicator.onAnswer = { [weak self] result in Task { await self?.answerAgentHelp(result) } }
         agentIndicator.onDecide = { [weak self] choice in Task { await self?.decideAgentApproval(choice) } }
+        sendPanel.onSend = { [weak self] urls in Task { await self?.offerFiles(urls) } }
 
         do {
             let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -639,6 +654,9 @@ final class LocalConnection: ObservableObject {
         case "Pair declined", "Pair request ended":
             pendingPair = nil
             hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
+        case "Outbox refused":
+            sendTimeout?.cancel()
+            sendPanel.status = .failed("现在没有可以接收文件的控制端。")
         case "Pair code used":
             connectionCode = ""
             directInvite = ""
@@ -676,6 +694,22 @@ final class LocalConnection: ObservableObject {
                     }
                     pendingPair = request
                 }
+            } else if line.hasPrefix("Outbox queued ") {
+                // A controller that never picks the files up is probably an older KoKo.
+                sendTimeout?.cancel()
+                sendTimeout = Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(30))
+                    guard !Task.isCancelled, let self, case .waiting = self.sendPanel.status else { return }
+                    self.sendPanel.status = .failed("控制端没有接收文件，请确认两端都已更新到最新版本。")
+                }
+            } else if line.hasPrefix("Outbox sent ") {
+                sendTimeout?.cancel()
+                sendPanel.status = .sent
+            } else if line.hasPrefix("Outbox failed ") {
+                sendTimeout?.cancel()
+                let code = line.split(separator: " ").last.map(String.init)
+                sendPanel.status = .failed(code == ClipboardError.permission.rawValue
+                    ? "KoKo 没有读取这些文件的权限。" : "发送没有完成，请再试一次。")
             } else if line.hasPrefix("Agent approval: ") {
                 struct Approval: Decodable { let reason: String }
                 if let approval = try? JSONDecoder().decode(Approval.self, from: Data(line.dropFirst("Agent approval: ".count).utf8)) {
@@ -777,7 +811,7 @@ final class LocalConnection: ObservableObject {
                 }
                 let ordered = displays.filter { $0.id == main } + displays.filter { $0.id != main }
                 return RemoteReply(status: "displays", clipboard: true, hostName: localHostName, displays: ordered, video: true,
-                                   clipboardStream: true)
+                                   clipboardStream: true, outbox: true)
             case "video":
                 guard let display = action.display, let edge = action.edge, let quality = action.quality,
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
@@ -1086,6 +1120,7 @@ final class LocalConnection: ObservableObject {
                 let name = reply.hostName ?? "远程 Mac"
                 if remoteHostName != name { remoteHostName = name }
                 supportsClipboardStream = reply.clipboardStream == true
+                if reply.outbox == true, outboxTask == nil { watchOutbox(session) }
                 supportsVideo = reply.video == true
                 let control = reply.control ?? "idle"
                 if remoteAgentControl != control { remoteAgentControl = control }
@@ -1454,6 +1489,81 @@ final class LocalConnection: ObservableObject {
         return try JSONDecoder().decode(RemoteReply.self, from: Data(result.utf8))
     }
 
+    // MARK: Files the host sends
+
+    private func updateSendPanel() {
+        let enabled = UserDefaults.standard.object(forKey: "dragSendPanel") as? Bool ?? true
+        if isSharingWithPeer && enabled { sendPanel.startWatching() } else { sendPanel.stopWatching() }
+    }
+
+    /// Re-reads the setting after it changes.
+    func refreshSendPanel() { updateSendPanel() }
+
+    private func offerFiles(_ urls: [URL]) async {
+        guard let request = try? JSONEncoder().encode(["paths": urls.map(\.path)]) else { return }
+        await sendHost("outbox " + String(decoding: request, as: UTF8.self))
+    }
+
+    /// Waits for the host to offer files, then downloads each batch like a copy from the host.
+    private func watchOutbox(_ session: PairedHost) {
+        outboxTask = Task { [weak self] in
+            var channel: RemoteChannel?
+            defer { channel?.close() }
+            while !Task.isCancelled {
+                guard let self, self.session == session else { return }
+                do {
+                    if channel == nil { channel = try RemoteChannel(keyPath: self.keyPath(for: .controller), host: session) }
+                    let reply = try await channel!.send(.init(action: "outbox_wait"))
+                    for offer in reply.offers ?? [] {
+                        await self.receiveOffer(offer, session: session)
+                    }
+                } catch {
+                    channel?.close()
+                    channel = nil
+                    try? await Task.sleep(for: .seconds(2))
+                }
+            }
+        }
+    }
+
+    private func receiveOffer(_ offer: OutboxOfferInfo, session: PairedHost) async {
+        let folder: URL
+        do { folder = try makeClipboardFolder() } catch {
+            clipboardNotice = remoteError(ClipboardError.from(error).rawValue)
+            return
+        }
+        do {
+            let command = try LocalCommand(.controller, arguments: [
+                "outbox-pull", keyPath(for: .controller), session.hostID, session.address, offer.id, folder.path,
+            ])
+            var outcome: ClipboardProgressLine?
+            _ = try await command.result(collectOutput: false) { line in
+                guard let update = try? JSONDecoder().decode(ClipboardProgressLine.self, from: Data(line.utf8)) else { return }
+                if update.status != nil {
+                    outcome = update
+                } else if let done = update.progress, let total = update.total, total > 0 {
+                    let size = { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
+                    self.clipboardNotice = ConnectionNotice(
+                        message: "正在接收被控端发来的文件 \(size(done)) / \(size(total))（\(done * 100 / total)%）…")
+                }
+            }
+            guard outcome?.status == "done", let paths = outcome?.paths else {
+                try? FileManager.default.removeItem(at: folder)
+                clipboardNotice = clipboardError(outcome?.code)
+                return
+            }
+            clipboardNotice = nil
+            receivedFiles = paths.map { URL(fileURLWithPath: $0) }
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            clipboardNotice = remoteError(error.localizedDescription)
+        }
+    }
+
+    func dismissReceivedFiles() {
+        receivedFiles = []
+    }
+
     private func remoteError(_ reason: String?) -> ConnectionNotice {
         let message: String
         switch reason {
@@ -1504,6 +1614,9 @@ final class LocalConnection: ObservableObject {
         videoSettings = nil
         videoLatency = StreamLatency()
         supportsClipboardStream = false
+        outboxTask?.cancel()
+        outboxTask = nil
+        receivedFiles = []
         cancelClipboardTransfer()
         clipboardNotice = nil
         supportsVideo = false

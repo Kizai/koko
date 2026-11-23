@@ -207,6 +207,12 @@ pub enum RemoteCommand {
         text: Option<String>,
         paths: Vec<String>,
     },
+    /// Waits up to `OUTBOX_WAIT` for files the person at the host offers to the controller.
+    OutboxWait,
+    /// Streams one offered batch like `clipboard_pull`: a manifest record, then the bytes.
+    OutboxPull {
+        offer: String,
+    },
     Disconnect,
     Hello,
     ReleaseControl,
@@ -274,6 +280,16 @@ pub struct ClipboardEntry {
 fn is_zero(size: &u64) -> bool {
     *size == 0
 }
+
+/// A batch of files the person at the host dropped to send, named by its top-level items.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OutboxOffer {
+    pub id: String,
+    pub names: Vec<String>,
+}
+
+/// How long a controller's outbox wait stays open before it is answered with no offers.
+pub const OUTBOX_WAIT: std::time::Duration = std::time::Duration::from_secs(25);
 
 pub const MAX_CLIPBOARD_TEXT: usize = 1024 * 1024;
 pub const MAX_CLIPBOARD_ENTRIES: usize = 20_000;
@@ -438,6 +454,10 @@ impl RemoteKey {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RemoteReply {
     Ok,
+    /// Files waiting at the host for this controller; empty when the wait timed out.
+    Outbox {
+        offers: Vec<OutboxOffer>,
+    },
     /// App to daemon only: what Copy put on the host's pasteboard, as absolute paths or text.
     ClipboardItems {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -516,6 +536,7 @@ impl RemoteCommand {
             | Self::ClipboardPublish { .. } => 120,
             // The host holds the request open until a person answers.
             Self::RequestHuman { timeout_s, .. } => u64::from(*timeout_s) + 5,
+            Self::OutboxWait => OUTBOX_WAIT.as_secs() + 5,
             _ => 9,
         })
     }
@@ -569,6 +590,7 @@ impl RemoteCommand {
 pub fn valid_remote_command(command: &RemoteCommand) -> bool {
     match command {
         RemoteCommand::ClipboardPull { transfer } => transfer.len() == 36,
+        RemoteCommand::OutboxPull { offer } => (1..=64).contains(&offer.len()),
         RemoteCommand::ClipboardPush { transfer, manifest } => {
             transfer.len() == 36 && manifest.valid()
         }
@@ -610,6 +632,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             !text.is_empty() && text.len() <= 2048 && !text.contains('\0')
         }
         RemoteCommand::Disconnect
+        | RemoteCommand::OutboxWait
         | RemoteCommand::Hello
         | RemoteCommand::ReleaseControl
         | RemoteCommand::Screenshot

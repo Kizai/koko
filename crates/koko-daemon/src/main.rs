@@ -1,6 +1,7 @@
 mod arbiter;
 mod audit;
 mod desktop;
+mod outbox;
 mod pairing;
 mod session;
 mod trust;
