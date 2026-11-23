@@ -8,6 +8,7 @@ use iroh::{
 use koko_proto::{MAX_REMOTE_REPLY, REMOTE_ALPN, RemoteCommand, RemoteReply};
 use tokio::time::timeout;
 
+#[derive(Clone)]
 pub struct RemoteClient {
     endpoint: Endpoint,
     connection: Connection,

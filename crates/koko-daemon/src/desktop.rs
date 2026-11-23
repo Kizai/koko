@@ -9,8 +9,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use koko_proto::{
-    MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope, VIDEO_ERROR,
-    valid_remote_command,
+    HumanResult, MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, PeerKind, RemoteCommand, RemoteReply, Scope,
+    VIDEO_ERROR, valid_remote_command,
 };
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -186,6 +186,45 @@ impl RemoteHost {
                     self.arbiter.release();
                     RemoteReply::Ok
                 }
+                Ok(command @ RemoteCommand::RequestHuman { .. })
+                    if valid_remote_command(&command) =>
+                {
+                    let RemoteCommand::RequestHuman { reason, timeout_s } = command else {
+                        unreachable!("matched above")
+                    };
+                    match self.arbiter.request_help() {
+                        Err(code) => RemoteReply::error(code),
+                        Ok(answer) => {
+                            println!(
+                                "Agent help: {}",
+                                serde_json::json!({"reason": reason.trim(), "timeout_s": timeout_s})
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = revoked(&authorization, peer, scope) => {
+                                    self.arbiter.reset();
+                                    connection.close(1u32.into(), b"peer not authorized");
+                                    return Ok(());
+                                }
+                                answer = tokio::time::timeout(
+                                    Duration::from_secs(timeout_s.into()),
+                                    answer,
+                                ) => match answer {
+                                    Ok(Ok((result, note))) => RemoteReply::Human { result, note },
+                                    // The request was withdrawn because the session ended.
+                                    Ok(Err(_)) => RemoteReply::error("desktop_unavailable"),
+                                    Err(_) => {
+                                        self.arbiter.help_timed_out();
+                                        RemoteReply::Human {
+                                            result: HumanResult::Timeout,
+                                            note: None,
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
                 Ok(RemoteCommand::Hello) => RemoteReply::Hello {
                     kind: if scope == Scope::Human {
                         PeerKind::Human
@@ -331,7 +370,10 @@ fn execute(command: RemoteCommand) -> RemoteReply {
 
     let screenshot = matches!(command, RemoteCommand::Screenshot);
     let result = match command {
-        RemoteCommand::Disconnect | RemoteCommand::Hello | RemoteCommand::ReleaseControl => {
+        RemoteCommand::Disconnect
+        | RemoteCommand::Hello
+        | RemoteCommand::ReleaseControl
+        | RemoteCommand::RequestHuman { .. } => {
             unreachable!("session commands are handled by the host")
         }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
@@ -651,6 +693,55 @@ mod tests {
         .await??;
         person_client.close().await;
         agent_client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_agent_waits_for_a_person_to_answer() -> Result<(), Box<dyn Error>> {
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let agent = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions {
+            human: None,
+            agent: Some((agent.public(), Scope::AgentSafe)),
+        });
+        let arbiter = Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60)));
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(AppDesktop::channel().0),
+                    arbiter: arbiter.clone(),
+                    audit: None,
+                    pointer: Mutex::new(()),
+                    #[cfg(unix)]
+                    video: Mutex::new(()),
+                },
+            )
+            .spawn();
+        let client = RemoteClient::connect(agent, host).await?;
+        let request = RemoteCommand::RequestHuman {
+            reason: "Please sign in to the bank website".into(),
+            timeout_s: 30,
+        };
+        let person = async {
+            while arbiter.control() != ControlState::AwaitingHuman {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            arbiter.answer(HumanResult::Resolved, Some("Done".into()));
+        };
+        let (reply, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client.send(&request), person)
+        })
+        .await?;
+        assert!(matches!(
+            reply?,
+            RemoteReply::Human { result: HumanResult::Resolved, note: Some(note) } if note == "Done"
+        ));
+        assert_eq!(arbiter.control(), ControlState::Active);
+        client.close().await;
         router.shutdown().await?;
         Ok(())
     }

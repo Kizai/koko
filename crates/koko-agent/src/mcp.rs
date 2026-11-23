@@ -10,7 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use iroh::{EndpointId, SecretKey};
 use koko_p2p::pairing::{PairingOptions, discover_hosts, request_agent_pairing, resolve_invite};
 use koko_p2p::remote::RemoteClient;
-use koko_proto::{ImageFormat, MouseButton, RemoteCommand, RemoteReply, Scope};
+use koko_proto::{
+    HELP_TIMEOUT_SECONDS, HumanResult, ImageFormat, MAX_HELP_REASON, MouseButton, RemoteCommand,
+    RemoteReply, Scope,
+};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -34,6 +37,7 @@ in KoKo on the host Mac and call koko_pair; the host owner approves the first pa
 Take a screenshot with koko_screenshot, then use koko_mouse and koko_keyboard with pixel coordinates \
 from that screenshot. The host owner sees when you are in control and can stop you at any time. \
 If a result says preempted_by_human, stop and tell the user; do not retry until they ask. \
+Call koko_request_human when a step needs a person, such as signing in or confirming a payment. \
 Call koko_release_control when you finish.";
 
 /// A tool outcome the model should act on, reported as a tool error rather than a protocol error.
@@ -66,6 +70,10 @@ impl Failure {
                 "The host Mac has not allowed KoKo to control the mouse and keyboard. Ask the user to grant Accessibility on the host.",
             ),
             "input_failed" => Self::new("input_failed", "The host could not send that input."),
+            "awaiting_human" => Self::new(
+                "awaiting_human",
+                "A request for help is still open on this host. Wait for its answer before acting.",
+            ),
             "screen_permission_required" => Self::new(
                 "screen_permission_required",
                 "The host Mac has not allowed KoKo to record the screen. Ask the user to grant Screen Recording on the host.",
@@ -240,6 +248,16 @@ pub struct KeyboardParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct HelpParams {
+    /// Device ID from koko_list_devices.
+    pub device_id: String,
+    /// What you need the person on the host Mac to do, in one or two sentences, up to 500 characters.
+    pub reason: String,
+    /// How long to wait for an answer, from 10 to 600 seconds. Defaults to 300.
+    pub timeout_s: Option<u16>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct DeviceParams {
     /// Device ID from koko_list_devices.
     pub device_id: String,
@@ -319,7 +337,7 @@ impl KokoMcp {
     ) -> Result<RemoteReply, String> {
         let mut clients = self.state.clients.lock().await;
         let client = match clients.entry(id) {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => entry.get().clone(),
             Entry::Vacant(entry) => {
                 let target = self
                     .state
@@ -332,16 +350,17 @@ impl KokoMcp {
                 let client = RemoteClient::connect(self.state.key.clone(), target)
                     .await
                     .map_err(|error| format!("{error:?}"))?;
-                entry.insert(client)
+                entry.insert(client).clone()
             }
         };
+        // Requests share the connection on separate streams; a request for help may wait minutes.
+        drop(clients);
         let result = client
             .send(command)
             .await
             .map_err(|error| format!("{error:?}"));
-        if result.is_err()
-            && let Some(client) = clients.remove(&id)
-        {
+        if result.is_err() {
+            self.state.clients.lock().await.remove(&id);
             client.close().await;
         }
         result
@@ -499,6 +518,16 @@ impl KokoMcp {
         Parameters(params): Parameters<KeyboardParams>,
     ) -> Result<CallToolResult, McpError> {
         finish(self.keyboard(params).await)
+    }
+
+    #[tool(
+        description = "Ask the person at a KoKo host Mac to do something only a person should do, such as signing in, solving a CAPTCHA, approving a payment or confirming a risky step. Blocks until they answer or the timeout passes. Results: resolved (they did it; take a new screenshot and continue), declined or taken_over (stop and tell the user), timeout (nobody answered; you hold control again)."
+    )]
+    async fn koko_request_human(
+        &self,
+        Parameters(params): Parameters<HelpParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish(self.request_help(params).await)
     }
 
     #[tool(
@@ -802,6 +831,44 @@ impl KokoMcp {
             .await
     }
 
+    async fn request_help(&self, params: HelpParams) -> Result<CallToolResult, Failure> {
+        let id = device_id(&params.device_id)?;
+        self.record(id).await?;
+        let reason = params.reason.trim().to_owned();
+        let timeout_s = params.timeout_s.unwrap_or(300);
+        if reason.is_empty()
+            || reason.chars().count() > MAX_HELP_REASON
+            || !HELP_TIMEOUT_SECONDS.contains(&timeout_s)
+        {
+            return Err(invalid(
+                "reason must be 1 to 500 characters and timeout_s 10 to 600 seconds.",
+            ));
+        }
+        let (result, note) = match self
+            .request(id, &RemoteCommand::RequestHuman { reason, timeout_s })
+            .await?
+        {
+            RemoteReply::Human { result, note } => (result, note),
+            RemoteReply::Error { code } => return Err(Failure::from_host(&code)),
+            _ => return Err(Failure::from_host("invalid_command")),
+        };
+        let message = match result {
+            HumanResult::Resolved => {
+                "The person finished. Take a new screenshot before you continue."
+            }
+            HumanResult::Declined => "The person declined. Stop this task and tell the user.",
+            HumanResult::TakenOver => {
+                "The person took over. Stop and wait until the user asks you to continue."
+            }
+            HumanResult::Timeout => {
+                "Nobody answered in time. You hold control again; decide whether to continue or stop."
+            }
+        };
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            json!({"status": result, "note": note, "message": message}).to_string(),
+        )]))
+    }
+
     async fn release(&self, device: &str) -> Result<CallToolResult, Failure> {
         let id = device_id(device)?;
         self.record(id).await?;
@@ -869,6 +936,7 @@ mod tests {
                 "koko_mouse",
                 "koko_pair",
                 "koko_release_control",
+                "koko_request_human",
                 "koko_screenshot"
             ]
         );

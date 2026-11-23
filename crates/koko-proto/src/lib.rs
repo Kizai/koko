@@ -99,7 +99,39 @@ pub enum ControlState {
     Active,
     /// A person took over or pressed stop. Only a person can let the agent continue.
     Paused,
+    /// The agent asked a person for help and waits for the answer.
+    AwaitingHuman,
 }
+
+/// How a person answered an agent's request for help.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanResult {
+    /// The person did what was needed. The agent continues.
+    Resolved,
+    /// The person said no. The agent is paused.
+    Declined,
+    /// The person took over. The agent is paused.
+    TakenOver,
+    /// Nobody answered in time. The agent continues.
+    Timeout,
+}
+
+impl std::str::FromStr for HumanResult {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "resolved" => Ok(Self::Resolved),
+            "declined" => Ok(Self::Declined),
+            "taken_over" => Ok(Self::TakenOver),
+            _ => Err("unknown result"),
+        }
+    }
+}
+
+pub const MAX_HELP_REASON: usize = 500;
+pub const HELP_TIMEOUT_SECONDS: std::ops::RangeInclusive<u16> = 10..=600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +151,10 @@ pub enum RemoteCommand {
     Disconnect,
     Hello,
     ReleaseControl,
+    RequestHuman {
+        reason: String,
+        timeout_s: u16,
+    },
     Screenshot,
     Displays,
     Capture {
@@ -297,6 +333,11 @@ pub enum RemoteReply {
         packet: ClipboardPacket,
     },
     Ok,
+    Human {
+        result: HumanResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     Hello {
         kind: PeerKind,
         scope: Scope,
@@ -339,10 +380,11 @@ impl RemoteReply {
 impl RemoteCommand {
     pub fn desktop_timeout(&self) -> std::time::Duration {
         // Clipboard file access may wait for a person to answer a macOS privacy prompt.
-        std::time::Duration::from_secs(if matches!(self, Self::Clipboard { .. }) {
-            120
-        } else {
-            9
+        std::time::Duration::from_secs(match self {
+            Self::Clipboard { .. } => 120,
+            // The host holds the request open until a person answers.
+            Self::RequestHuman { timeout_s, .. } => u64::from(*timeout_s) + 5,
+            _ => 9,
         })
     }
 
@@ -350,7 +392,9 @@ impl RemoteCommand {
         match scope {
             Scope::Human => true,
             Scope::AgentSafe => {
-                self.is_viewing() || self.is_agent_input() || matches!(self, Self::ReleaseControl)
+                self.is_viewing()
+                    || self.is_agent_input()
+                    || matches!(self, Self::ReleaseControl | Self::RequestHuman { .. })
             }
             Scope::Observer => self.is_viewing(),
         }
@@ -430,6 +474,12 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             *display != 0
                 && (1..=32).contains(&events.len())
                 && events.iter().all(PointerEvent::valid)
+        }
+        RemoteCommand::RequestHuman { reason, timeout_s } => {
+            !reason.trim().is_empty()
+                && reason.chars().count() <= MAX_HELP_REASON
+                && !reason.contains('\0')
+                && HELP_TIMEOUT_SECONDS.contains(timeout_s)
         }
         RemoteCommand::Text { text } => {
             !text.is_empty() && text.len() <= 2048 && !text.contains('\0')

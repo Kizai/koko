@@ -53,6 +53,8 @@ impl Audit {
                 entry["display"] = (*display).into();
             }
             RemoteCommand::Text { text } => entry["text_length"] = text.chars().count().into(),
+            // The agent's own explanation of why it needs a person, kept for the host owner.
+            RemoteCommand::RequestHuman { reason, .. } => entry["reason"] = reason.as_str().into(),
             _ => {}
         }
         if fs::metadata(&self.path).is_ok_and(|metadata| metadata.len() > MAX_LOG) {

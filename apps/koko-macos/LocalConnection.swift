@@ -382,10 +382,19 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var agentSession: AgentSession? {
         didSet { updateAgentIndicator() }
     }
-    /// The host arbiter's view of agent control: idle, active or paused.
+    /// The host arbiter's view of agent control: idle, active, paused or awaiting_human.
     @Published private(set) var agentControl = "idle" {
+        didSet {
+            if agentControl != "awaiting_human" { agentHelp = nil }
+            updateAgentIndicator()
+            watchLocalInput()
+        }
+    }
+    /// What the agent asked the person at this Mac to do, while it waits for an answer.
+    @Published private(set) var agentHelp: String? {
         didSet { updateAgentIndicator() }
     }
+    private var localInputWatch: Task<Void, Never>?
     /// What the remote host reports about an agent while this Mac is controlling it.
     @Published private(set) var remoteAgentControl = "idle"
     private let agentIndicator = AgentIndicator()
@@ -551,6 +560,7 @@ final class LocalConnection: ObservableObject {
         }
         agentIndicator.onStop = { [weak self] in Task { await self?.sendHost("stop-agent") } }
         agentIndicator.onResume = { [weak self] in Task { await self?.sendHost("resume-agent") } }
+        agentIndicator.onAnswer = { [weak self] result in Task { await self?.answerAgentHelp(result) } }
 
         do {
             let address = "0.0.0.0:\(listenPort.trimmingCharacters(in: .whitespacesAndNewlines))"
@@ -593,7 +603,8 @@ final class LocalConnection: ObservableObject {
         case "Agent session closed":
             agentSession = nil
             agentControl = "idle"
-        case "Agent control: idle", "Agent control: active", "Agent control: paused":
+        case "Agent control: idle", "Agent control: active", "Agent control: paused",
+             "Agent control: awaiting_human":
             agentControl = String(line.dropFirst("Agent control: ".count))
             hostNotice = ConnectionNotice(message: "Agent 会话已结束。")
         case "Pair code expired":
@@ -621,6 +632,12 @@ final class LocalConnection: ObservableObject {
                         request.scope = peer.scope
                     }
                     pendingPair = request
+                }
+            } else if line.hasPrefix("Agent help: ") {
+                struct Help: Decodable { let reason: String }
+                if let help = try? JSONDecoder().decode(Help.self, from: Data(line.dropFirst("Agent help: ".count).utf8)) {
+                    agentHelp = help.reason
+                    NSApp.requestUserAttention(.criticalRequest)
                 }
             } else if line.hasPrefix("Agent session: ") {
                 let fields = line.dropFirst("Agent session: ".count).split(separator: " ", maxSplits: 1)
@@ -771,8 +788,31 @@ final class LocalConnection: ObservableObject {
         }
     }
 
+    /// Answers the agent's request for help: resolved, taken_over or declined, with an optional note.
+    func answerAgentHelp(_ result: String, note: String = "") async {
+        let note = note.components(separatedBy: .newlines).joined(separator: " ").trimmingCharacters(in: .whitespaces)
+        await sendHost(note.isEmpty ? "agent-help \(result)" : "agent-help \(result) \(note)")
+    }
+
     private func updateAgentIndicator() {
-        agentIndicator.update(control: agentControl, agentName: agentSession?.name)
+        agentIndicator.update(control: agentControl, agentName: agentSession?.name, help: agentHelp)
+    }
+
+    /// While an agent operates, someone using this Mac's own mouse or keyboard takes control back.
+    private func watchLocalInput() {
+        localInputWatch?.cancel()
+        localInputWatch = nil
+        guard agentControl == "active" else { return }
+        localInputWatch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, self.agentControl == "active" else { return }
+                if localInputSinceInjection(within: 0.5) {
+                    await self.sendHost("local-input")
+                    return
+                }
+            }
+        }
     }
 
     func forgetTrustedDevices() async {

@@ -67,6 +67,13 @@ private struct ConnectionView: View {
     @AppStorage("permissionGuideProgress") private var permissionProgress = PermissionGuide.Progress.introduction
     @ViewState private var reviewAfterRestart = CommandLine.arguments.contains(PermissionRelaunch.argument)
     @ViewState private var permissionGuide: PermissionGuide.Context?
+    @ViewState private var helpNote = ""
+
+    private func answerHelp(_ result: String) {
+        let note = helpNote
+        helpNote = ""
+        Task { await connection.answerAgentHelp(result, note: note) }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -447,6 +454,10 @@ private struct ConnectionView: View {
                                 .font(.caption).foregroundStyle(.orange)
                         case "paused":
                             Text("已暂停，等你允许后才能继续操作。").font(.caption).foregroundStyle(.secondary)
+                        case "awaiting_human":
+                            Text("请你协助：\(connection.agentHelp ?? "")")
+                                .font(.caption).foregroundStyle(.blue)
+                                .fixedSize(horizontal: false, vertical: true)
                         default:
                             EmptyView()
                         }
@@ -458,6 +469,16 @@ private struct ConnectionView: View {
                     default: EmptyView()
                     }
                     Button("断开 Agent") { Task { await connection.endAgentSession() } }
+                }
+                if connection.agentControl == "awaiting_human" {
+                    HStack {
+                        TextField("给 Agent 的附言（可选）", text: $helpNote)
+                            .textFieldStyle(.roundedBorder)
+                        Button("已完成") { answerHelp("resolved") }
+                            .buttonStyle(.borderedProminent)
+                        Button("我来接管") { answerHelp("taken_over") }
+                        Button("拒绝") { answerHelp("declined") }
+                    }
                 }
             }
             if connection.trustedDeviceCount > 0 {

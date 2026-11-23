@@ -2,7 +2,7 @@
 
 [返回文档目录](./README.md)
 
-本文定义 KoKo 的核心能力：AI Agent 通过 MCP 识别并操作已授权的远程 Mac，被控端的人可以随时看到、停止和接管。M1 只读 MCP 和 M2 Agent 操作已实现，M3 起仍是设计稿，各里程碑的状态见[里程碑与验收](#里程碑与验收)。现有协议见[架构设计的当前实现](./architecture.md#当前实现macos-内测版)，交付顺序见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)的工作项 4 和 6。
+本文定义 KoKo 的核心能力：AI Agent 通过 MCP 识别并操作已授权的远程 Mac，被控端的人可以随时看到、停止和接管。M1 只读 MCP、M2 Agent 操作和 M3 人工协作已实现，M4 起仍是设计稿，各里程碑的状态见[里程碑与验收](#里程碑与验收)。现有协议见[架构设计的当前实现](./architecture.md#当前实现macos-内测版)，交付顺序见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)的工作项 4 和 6。
 
 ## 目标与边界
 
@@ -61,7 +61,7 @@
 | `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect` | ✓ | ✓ | ✓ |
 | `ui_tree`（Phase 3） | ✓ | ✓ | ✓ |
 | `pointer`、`click`、`key`、`text` | — | 持有控制权时 | ✓ |
-| `release_control`、`request_human`（M3） | — | ✓ | — |
+| `release_control`、`request_human` | — | ✓ | — |
 | `clipboard` | — | — | ✓ |
 
 `human` 对应当前的人类远控会话。`agent_full` 留给后续的 Shell 与文件能力，本阶段不实现。所有作用域检查都在 daemon 执行，未知类型或作用域一律拒绝。
@@ -82,17 +82,18 @@ stateDiagram-v2
     Idle --> AgentControl: Agent 的输入
     AgentControl --> Idle: release_control、断开或 60 秒无操作
     AgentControl --> Paused: 人的输入、被控端点「停止」
+    Idle --> AwaitingHuman: request_human
     AgentControl --> AwaitingHuman: request_human
-    AwaitingHuman --> AgentControl: 人点「完成」
-    AwaitingHuman --> Paused: 人选择接管或拒绝
-    AwaitingHuman --> AgentControl: 超时
+    AwaitingHuman --> AgentControl: 人点「已完成」或超时
+    AwaitingHuman --> Paused: 人选择接管、拒绝或点「停止」
+    AwaitingHuman --> Idle: Agent 交还控制权或会话结束
     Paused --> Idle: 人点「让 Agent 继续」
 ```
 
 - **Idle**：没有 Agent 持有控制权。Agent 的下一条输入自动取得控制权。最近 3 秒内有人类输入时拒绝，返回 `preempted_by_human`。
 - **AgentControl**：Agent 持有控制权。被控端只允许一个 Agent 会话，所以控制权直接绑定在这个会话上，协议里不携带 `lease_id`。被控端屏幕顶部显示指示条「Agent「名称」正在操作这台 Mac · 停止」。指示条不进入 Agent 的截图，避免遮挡和误点；人类控制端的视频照常显示它。Agent 的手势在一次 `pointer` 请求内完整发送并松开按键，所以不占用人类控制端那条连接的按键顺序锁。
 - **Paused**：控制权已收回，之后 Agent 的输入请求都返回 `preempted_by_human`。只有人能在指示条或本机共享卡片上点「让 Agent 继续」回到 Idle，Agent 不能自行恢复。Agent 会话结束时状态回到 Idle。
-- **AwaitingHuman**：`request_human` 请求挂起，直到人作出回应或超时，期间 Agent 的输入被拒绝。超时后结果为 `timeout`，控制权交还 Agent。被控端的人和人类控制端都可以回应。首个版本先在被控端 `Koko.app` 弹出求助卡片，显示 Agent 名称和原因，提供「完成」「接管」「拒绝」和附言；人类控制端的回应入口在后续版本加入。
+- **AwaitingHuman**：`request_human` 请求挂起，直到人作出回应或超时。期间 Agent 的输入返回 `awaiting_human`，同一时间只能有一个求助。人在这期间操作被控 Mac 本身就是在协助，不会触发暂停。被控端屏幕顶部的指示条变为蓝色，显示 Agent 名称和原因，并提供「已完成」「我来接管」「拒绝」；主窗口的本机共享卡片还可以填写给 Agent 的附言，程序坞图标会跳动提醒。「已完成」和超时把控制权交还 Agent，「我来接管」「拒绝」和「停止」让 Agent 暂停。已暂停的 Agent 不能发起求助。被控端的人和人类控制端都可以回应，目前只实现了被控端；人类控制端的远控窗口顶栏只显示「Agent 请求被控端协助」。
 
 ### 人工接管的触发来源
 
@@ -100,11 +101,11 @@ stateDiagram-v2
 | --- | --- | --- |
 | 人类控制端的键鼠或剪贴板请求 | 实现 | daemon 直接可知。 |
 | 被控端指示条的「停止」和全局快捷键 | 实现 | 快捷键 ⌃⌥⌘.（Control-Option-Command-句点），用 Carbon `RegisterEventHotKey` 注册，只在指示条显示期间生效，不需要额外权限。 |
-| 被控 Mac 本机的实体键鼠 | 待验证 | 方案 a：KoKo 投递事件改用私有事件源，轮询 `CGEventSourceSecondsSinceLastEventType(.hidSystemState, …)`，需实测能否排除 KoKo 自己投递的事件。方案 b：用只监听的事件 tap，按 `eventSourceUserData` 标记过滤 KoKo 的事件，可能需要「输入监控」权限。验证前不承诺这一能力。 |
+| 被控 Mac 本机的实体键鼠 | 实现，待实机验证 | Agent 操作期间，被控端应用每 250 毫秒读取一次系统的 HID 空闲时间（`CGEventSource.secondsSinceLastEventType(.hidSystemState, …)`），并与 KoKo 自己最后一次注入事件的时间比较。最近一次系统输入明显晚于 KoKo 的注入，就判定有人在使用这台 Mac，向 daemon 发送 `local-input`。无论 macOS 是否把 KoKo 注入的事件计入 HID 空闲时间，这个比较都成立，也不需要「输入监控」权限。开发环境没有发送事件的权限，只能在实机上验证检测效果；Agent 连续高频操作时，夹在两次注入之间的短暂本机输入可能漏检。 |
 
 ### 审计
 
-被控端把 Agent 的每次请求追加到 `~/.koko/audit.log`（JSON Lines），记录时间、公钥短标识、命令类型、显示器、键鼠事件数和结果码。不记录截图和文本内容，文本只记字符数。日志超过 10 MiB 时改名为 `audit.log.1` 并重新开始。
+被控端把 Agent 的每次请求追加到 `~/.koko/audit.log`（JSON Lines），记录时间、公钥短标识、命令类型、显示器、键鼠事件数和结果码。不记录截图和输入的文本，文本只记字符数。求助请求会记录 Agent 写的原因，方便事后查看它为何求助。日志超过 10 MiB 时改名为 `audit.log.1` 并重新开始。
 
 ## 识别：屏幕与界面
 
@@ -193,7 +194,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | `koko_screenshot` | `device_id`，可选 `display`、`max_edge`（默认 1280）、`format`、`cursor` | 图像，以及 `screenshot_id`、显示器、尺寸和显示器列表 | `observer` |
 | `koko_mouse` | `device_id`、`action`、`x`、`y`，可选 `to_x`、`to_y`、`dx`、`dy`、`screenshot_id`、`screenshot_after` | 状态，可附截图 | `agent_safe` 和控制权 |
 | `koko_keyboard` | `device_id`，`text` 或 `keys`，可选 `screenshot_after` | 状态，可附截图 | `agent_safe` 和控制权 |
-| `koko_request_human` | `device_id`、`reason`，可选 `timeout_s`（默认 300，最大 600） | `resolved`、`declined`、`taken_over` 或 `timeout`，以及人的附言 | `agent_safe` |
+| `koko_request_human` | `device_id`、`reason`（最多 500 字符），可选 `timeout_s`（10–600，默认 300） | `resolved`、`declined`、`taken_over` 或 `timeout`，人的附言，以及给 Agent 的下一步建议。调用会一直等到有结果；若 MCP 客户端自己的工具调用超时更短，应调小 `timeout_s` | `agent_safe` |
 | `koko_release_control` | `device_id` | 状态 | `agent_safe` |
 | `koko_get_ui_tree`（Phase 3） | `device_id`，可选 `display`、`max_nodes` | 精简界面树 | `observer` |
 
@@ -209,6 +210,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | `screen_permission_required`、`input_permission_required` | 请用户为被控端开启对应 macOS 权限 | 否 |
 | `screenshot_required`、`out_of_bounds`、`display_unavailable` | 重新截图，用新截图的坐标，必要时换显示器 | 是 |
 | `capture_busy`、`pointer_busy`、`video_busy` | 稍后重试 | 是 |
+| `awaiting_human` | 等当前求助有结果后再操作 | 是 |
 | `agent_busy` | 告诉用户被控端已有另一个 Agent 在使用 | 否 |
 | `not_paired`、`peer not authorized` | 请用户重新配对 | 否 |
 | `invalid_command` | 提示两端版本不一致 | 否 |
@@ -221,7 +223,8 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | --- | --- |
 | `hello`（无参数） | 回复 `hello` `{kind, scope, control}`，`control` 为 `idle`、`active` 或 `paused` |
 | `release_control`（无参数） | Agent 交还控制权，回复 `ok` |
-| `request_human` `{reason, timeout_s}` | 长请求，回复 `human` `{result, note}`。daemon 的桌面等待时间按 `timeout_s` 放宽，参照剪贴板请求的特例 |
+| `request_human` `{reason, timeout_s}` | 长请求，回复 `human` `{result, note}`，`result` 为 `resolved`、`declined`、`taken_over` 或 `timeout`。客户端的等待时间按 `timeout_s` 放宽。控制权状态新增 `awaiting_human` |
+| daemon 输出 `Agent help: {"reason","timeout_s"}`，接受 `agent-help <result> [附言]` 和 `local-input` | 被控端应用据此显示求助卡片、转达人的回答，以及报告本机实体输入 |
 | `ui_tree`（Phase 3） | 回复精简界面树 |
 | `capture` 的 `format`、`cursor`；`image` 回复的 `width`、`height`、`format` | 用于截图坐标映射 |
 | `displays` 回复的 `control` | 人类控制端据此显示 Agent 的状态 |
@@ -256,7 +259,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 | --- | --- | --- |
 | M1 只读 MCP（工作项 4，已实现，待实机验收） | Agent 身份、配对 v2、`observer`、设备注册表、`koko_list_devices`、`koko_pair`、`koko_screenshot` | Claude Desktop 配置后能列出设备并截取任意显示器。未授权或作用域不足的 Agent 被拒绝。Agent 首次配对需要被控端确认，信任后重连不再询问，申请更高作用域时重新确认。Agent 与人类控制端同时连接时互不影响，第二个 Agent 收到 `agent_busy`。集成测试用真实 iroh 连接覆盖作用域拒绝、信任重连和 `agent_busy`。 |
 | M2 Agent 操作（工作项 6，已实现，待实机验收） | `agent_safe`、控制权仲裁、`koko_mouse`、`koko_keyboard`、`koko_release_control`、`koko_pair` 的 `scope` 与 `device_id`、指示条与停止、⌃⌥⌘. 快捷键、「让 Agent 继续」、审计日志 | 在测试窗口中点击、拖拽、组合键和文本都正确。点「停止」后，Agent 的请求返回 `preempted_by_human`，直到人让它继续。人类控制端的输入会立即抢占。 |
-| M3 人工协作（工作项 6） | `koko_request_human`，按验证结果加入本机实体输入检测 | 被控端的求助卡片能给出完成、拒绝、接管三种结果，超时结果单独可辨。无人值守时 Agent 照常运行，指示条和审计日志生效。 |
+| M3 人工协作（工作项 6，已实现，待实机验收） | `koko_request_human`、被控端求助卡片与附言、本机实体输入检测 | 被控端的求助卡片能给出完成、拒绝、接管三种结果，超时结果单独可辨。无人值守时 Agent 照常运行，指示条和审计日志生效。 |
 | M4 界面树 | `koko_get_ui_tree`，按 `element_id` 操作 | 常见应用能按元素操作，密码框的值不会外泄。 |
 | M5 策略与审批 | 高危操作规则与单次审批 | 命中规则的请求挂起，直到被控端允许或拒绝。 |
 

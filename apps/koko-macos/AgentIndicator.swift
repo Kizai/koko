@@ -8,6 +8,8 @@ import SwiftUI
 final class AgentIndicator {
     var onStop: () -> Void = {}
     var onResume: () -> Void = {}
+    /// Answers a request for help with resolved, taken_over or declined.
+    var onAnswer: (String) -> Void = { _ in }
     private var panel: NSPanel?
     private var hotKey: EventHotKeyRef?
     private var handler: EventHandlerRef?
@@ -18,16 +20,16 @@ final class AgentIndicator {
         return CGWindowID(panel.windowNumber)
     }
 
-    func update(control: String, agentName: String?) {
-        guard let agentName, control == "active" || control == "paused" else {
+    func update(control: String, agentName: String?, help: String?) {
+        guard let agentName, ["active", "paused", "awaiting_human"].contains(control) else {
             hide()
             return
         }
         let panel = self.panel ?? makePanel()
         self.panel = panel
         let content = NSHostingView(rootView: AgentBar(
-            name: agentName, paused: control == "paused", stop: { [weak self] in self?.onStop() },
-            resume: { [weak self] in self?.onResume() }
+            name: agentName, control: control, help: help, stop: { [weak self] in self?.onStop() },
+            resume: { [weak self] in self?.onResume() }, answer: { [weak self] in self?.onAnswer($0) }
         ))
         panel.contentView = content
         panel.setContentSize(content.fittingSize)
@@ -82,27 +84,51 @@ final class AgentIndicator {
 
 private struct AgentBar: View {
     let name: String
-    let paused: Bool
+    let control: String
+    let help: String?
     let stop: () -> Void
     let resume: () -> Void
+    let answer: (String) -> Void
+
+    private var tint: Color {
+        switch control {
+        case "paused": Color.secondary.opacity(0.4)
+        case "awaiting_human": Color.blue
+        default: Color.orange
+        }
+    }
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: paused ? "pause.circle.fill" : "sparkles")
-                .foregroundStyle(paused ? Color.secondary : Color.orange)
-            Text(paused ? "Agent「\(name)」已暂停" : "Agent「\(name)」正在操作这台 Mac")
-                .font(.callout.weight(.medium))
-            if paused {
+            switch control {
+            case "paused":
+                Image(systemName: "pause.circle.fill").foregroundStyle(.secondary)
+                Text("Agent「\(name)」已暂停").font(.callout.weight(.medium))
                 Button("让 Agent 继续", action: resume)
-            } else {
+            case "awaiting_human":
+                Image(systemName: "hand.raised.fill").foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent「\(name)」请你协助").font(.callout.weight(.medium))
+                    if let help {
+                        Text(help).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(3).frame(maxWidth: 420, alignment: .leading)
+                    }
+                }
+                Button("已完成") { answer("resolved") }
+                    .help("你已处理完，Agent 继续操作")
+                Button("我来接管") { answer("taken_over") }
+                Button("拒绝", role: .destructive) { answer("declined") }
+            default:
+                Image(systemName: "sparkles").foregroundStyle(.orange)
+                Text("Agent「\(name)」正在操作这台 Mac").font(.callout.weight(.medium))
                 Button("停止", role: .destructive, action: stop)
-                    .help("也可按 ⌃⌥⌘.")
+                    .help("也可按 ⌃⌥⌘.，或直接动一下这台 Mac 的鼠标键盘")
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(paused ? Color.secondary.opacity(0.4) : Color.orange, lineWidth: 1.5))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(tint, lineWidth: 1.5))
         .padding(6)
     }
 }

@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use koko_proto::ControlState;
+use koko_proto::{ControlState, HumanResult};
+use tokio::sync::oneshot;
 
 /// An agent's input is refused this long after a person's last input.
 pub(crate) const HUMAN_GRACE: Duration = Duration::from_secs(3);
@@ -9,6 +10,10 @@ pub(crate) const HUMAN_GRACE: Duration = Duration::from_secs(3);
 pub(crate) const AGENT_IDLE: Duration = Duration::from_secs(60);
 
 pub(crate) const PREEMPTED: &str = "preempted_by_human";
+pub(crate) const AWAITING_HUMAN: &str = "awaiting_human";
+
+/// A person's answer to an agent's request for help, with an optional note for the agent.
+pub(crate) type Answer = (HumanResult, Option<String>);
 
 /// Decides whether the connected agent may send input. People always win.
 #[derive(Debug)]
@@ -23,6 +28,7 @@ struct State {
     control: ControlState,
     human_input: Option<Instant>,
     agent_input: Instant,
+    help: Option<oneshot::Sender<Answer>>,
 }
 
 impl Arbiter {
@@ -34,6 +40,7 @@ impl Arbiter {
                 control: ControlState::Idle,
                 human_input: None,
                 agent_input: Instant::now(),
+                help: None,
             }),
         }
     }
@@ -47,6 +54,7 @@ impl Arbiter {
         let mut state = self.state.lock().unwrap();
         match state.control {
             ControlState::Paused => return Err(PREEMPTED),
+            ControlState::AwaitingHuman => return Err(AWAITING_HUMAN),
             ControlState::Idle => {
                 if state
                     .human_input
@@ -63,6 +71,7 @@ impl Arbiter {
     }
 
     /// A person's input pauses an active agent until a person lets it continue.
+    /// While the agent waits for help, the person's input is the help, so it changes nothing.
     pub(crate) fn human_input(&self) {
         let mut state = self.state.lock().unwrap();
         state.human_input = Some(Instant::now());
@@ -71,9 +80,14 @@ impl Arbiter {
         }
     }
 
-    /// The host owner's stop button or shortcut. Also blocks an idle agent from starting.
+    /// The host owner's stop button or shortcut. Also blocks an idle agent from starting,
+    /// and answers a pending request for help as taken over.
     pub(crate) fn stop(&self) {
-        set(&mut self.state.lock().unwrap(), ControlState::Paused);
+        let mut state = self.state.lock().unwrap();
+        if let Some(help) = state.help.take() {
+            let _ = help.send((HumanResult::TakenOver, None));
+        }
+        set(&mut state, ControlState::Paused);
     }
 
     pub(crate) fn resume(&self) {
@@ -83,23 +97,67 @@ impl Arbiter {
         }
     }
 
-    /// The agent gave control back or its session ended.
+    /// The agent gave control back. A pending request for help is withdrawn.
     pub(crate) fn release(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.control == ControlState::Active {
+        if matches!(
+            state.control,
+            ControlState::Active | ControlState::AwaitingHuman
+        ) {
+            state.help = None;
             set(&mut state, ControlState::Idle);
         }
     }
 
-    /// Forgets a pause when the agent's session ends, so the next agent session starts idle.
+    /// Forgets a pause or request when the agent's session ends, so the next session starts idle.
     pub(crate) fn reset(&self) {
-        set(&mut self.state.lock().unwrap(), ControlState::Idle);
+        let mut state = self.state.lock().unwrap();
+        state.help = None;
+        set(&mut state, ControlState::Idle);
     }
 
     pub(crate) fn expire(&self) {
         let mut state = self.state.lock().unwrap();
         if state.control == ControlState::Active && state.agent_input.elapsed() >= self.idle {
             set(&mut state, ControlState::Idle);
+        }
+    }
+
+    /// Starts waiting for a person. Only one request may be open, and a paused agent may not ask.
+    pub(crate) fn request_help(&self) -> Result<oneshot::Receiver<Answer>, &'static str> {
+        let mut state = self.state.lock().unwrap();
+        match state.control {
+            ControlState::Paused => return Err(PREEMPTED),
+            ControlState::AwaitingHuman => return Err(AWAITING_HUMAN),
+            ControlState::Idle | ControlState::Active => {}
+        }
+        let (answer, receiver) = oneshot::channel();
+        state.help = Some(answer);
+        set(&mut state, ControlState::AwaitingHuman);
+        Ok(receiver)
+    }
+
+    /// A person answered. The agent continues after `resolved`, otherwise it is paused.
+    pub(crate) fn answer(&self, result: HumanResult, note: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        let Some(help) = state.help.take() else {
+            return;
+        };
+        let _ = help.send((result, note));
+        if result == HumanResult::Resolved {
+            state.agent_input = Instant::now();
+            set(&mut state, ControlState::Active);
+        } else {
+            set(&mut state, ControlState::Paused);
+        }
+    }
+
+    /// Nobody answered in time, so control goes back to the agent.
+    pub(crate) fn help_timed_out(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.help.take().is_some() {
+            state.agent_input = Instant::now();
+            set(&mut state, ControlState::Active);
         }
     }
 }
@@ -113,6 +171,7 @@ fn set(state: &mut State, control: ControlState) {
                 ControlState::Idle => "idle",
                 ControlState::Active => "active",
                 ControlState::Paused => "paused",
+                ControlState::AwaitingHuman => "awaiting_human",
             }
         );
     }
@@ -150,5 +209,38 @@ mod tests {
         arbiter.agent_input().unwrap();
         arbiter.release();
         assert_eq!(arbiter.control(), ControlState::Idle);
+    }
+
+    #[test]
+    fn a_request_for_help_ends_with_each_kind_of_answer() {
+        let arbiter = Arbiter::new(Duration::ZERO, Duration::from_secs(60));
+        let mut answer = arbiter.request_help().unwrap();
+        assert_eq!(arbiter.request_help().unwrap_err(), AWAITING_HUMAN);
+        assert_eq!(arbiter.agent_input(), Err(AWAITING_HUMAN));
+        // The person's input is the help itself and does not pause the agent.
+        arbiter.human_input();
+        assert_eq!(arbiter.control(), ControlState::AwaitingHuman);
+        arbiter.answer(HumanResult::Resolved, Some("Signed in".into()));
+        assert_eq!(
+            answer.try_recv().unwrap(),
+            (HumanResult::Resolved, Some("Signed in".into()))
+        );
+        assert_eq!(arbiter.control(), ControlState::Active);
+
+        let mut answer = arbiter.request_help().unwrap();
+        arbiter.answer(HumanResult::Declined, None);
+        assert_eq!(answer.try_recv().unwrap().0, HumanResult::Declined);
+        assert_eq!(arbiter.control(), ControlState::Paused);
+        assert_eq!(arbiter.request_help().unwrap_err(), PREEMPTED);
+
+        arbiter.resume();
+        let mut answer = arbiter.request_help().unwrap();
+        arbiter.stop();
+        assert_eq!(answer.try_recv().unwrap().0, HumanResult::TakenOver);
+
+        arbiter.resume();
+        let _answer = arbiter.request_help().unwrap();
+        arbiter.help_timed_out();
+        assert_eq!(arbiter.control(), ControlState::Active);
     }
 }

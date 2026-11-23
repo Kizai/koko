@@ -14,8 +14,8 @@ use koko_p2p::{
     pairing::{INVITE_LIFETIME, InviteCode, direct_invite, listening_target, publish_invite},
 };
 use koko_proto::{
-    ALPN, CONTROL_READY, CONTROL_REQUEST, MAX_PAIR_REQUEST, PAIR_ALPN, PAIR_VERSION, PairGranted,
-    PairHello, PeerKind, REMOTE_ALPN, Scope,
+    ALPN, CONTROL_READY, CONTROL_REQUEST, HumanResult, MAX_HELP_REASON, MAX_PAIR_REQUEST,
+    PAIR_ALPN, PAIR_VERSION, PairGranted, PairHello, PeerKind, REMOTE_ALPN, Scope,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -304,7 +304,26 @@ impl HostState {
                 self.arbiter.resume();
                 return;
             }
+            // The app saw someone use this Mac's own keyboard or mouse.
+            "local-input" => {
+                self.arbiter.human_input();
+                return;
+            }
             _ => {}
+        }
+        if let Some(answer) = line.strip_prefix("agent-help ") {
+            let (result, note) = answer.split_once(' ').unwrap_or((answer, ""));
+            if let Ok(result) = result.parse::<HumanResult>() {
+                let note: String = note
+                    .trim()
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(MAX_HELP_REASON)
+                    .collect();
+                self.arbiter
+                    .answer(result, (!note.is_empty()).then_some(note));
+            }
+            return;
         }
         let mut fields = line.split(' ');
         let (Some(action), Some(number)) = (fields.next(), fields.next()) else {

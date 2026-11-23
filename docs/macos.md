@@ -113,6 +113,8 @@ Agent 密钥默认保存在 `~/.koko/agent.key`，已配对的设备保存在 `~
 9. 被控端点「断开 Agent」，再让 Claude 截图。已信任的 Agent 应自动重连，被控端不再询问。
 10. 被控端「清除信任」后再截图，Claude 应收到 `not_paired` 一类的结果，重新配对需要再次确认。
 11. 用第二个 Agent 身份（`--identity` 指向另一个文件）在第一个 Agent 连接期间配对，应收到 `agent_busy`。
+12. 让 Claude 打开一个需要登录的网页，并在需要输入密码时调用 `koko_request_human`。被控端屏幕顶部出现蓝色的「请你协助」和原因，程序坞图标跳动。在主窗口填写附言后点「已完成」，Claude 收到 `resolved` 和附言后继续。再试一次，分别点「我来接管」「拒绝」和指示条上的「停止」，Claude 应停下；不回应时，到期后 Claude 收到 `timeout`。
+13. Claude 操作期间，直接动一下被控 Mac 本机的鼠标或按一个键，Agent 应在半秒内暂停，指示条显示「已暂停」。Claude 单纯截图、没有操作时，本机正常使用不受影响。
 
 M1 时以只读方式配对的 Agent，需要更多权限时会收到 `scope_denied`。让 Claude 用该设备的 `device_id` 和 `scope: agent_safe` 再次调用 `koko_pair`，被控端确认后即可操作。
 

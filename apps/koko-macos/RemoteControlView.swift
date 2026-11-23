@@ -137,6 +137,11 @@ struct RemoteControlView: View {
                     .foregroundStyle(.orange)
                     .fixedSize()
                     .help("你在画面上的键鼠操作会让 Agent 暂停")
+            case "awaiting_human":
+                Label("Agent 请求被控端协助", systemImage: "hand.raised")
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                    .fixedSize()
             case "paused":
                 Label("Agent 已暂停", systemImage: "pause.circle")
                     .font(.caption)

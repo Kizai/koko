@@ -1,6 +1,24 @@
 @preconcurrency import ApplicationServices
 import Carbon
 import Foundation
+import os
+
+/// When KoKo last posted an input event, in `DispatchTime` uptime nanoseconds.
+private let lastInjectedInput = OSAllocatedUnfairLock<UInt64>(initialState: 0)
+
+private func inject(_ event: CGEvent) {
+    lastInjectedInput.withLock { $0 = DispatchTime.now().uptimeNanoseconds }
+    event.post(tap: .cghidEventTap)
+}
+
+/// Whether this Mac's own keyboard or mouse was used within `seconds`, after KoKo's last event.
+/// Comparing the two times works whether or not macOS counts KoKo's posted events as HID activity.
+func localInputSinceInjection(within seconds: Double) -> Bool {
+    let idle = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: CGEventType(rawValue: ~0)!)
+    let injected = lastInjectedInput.withLock { $0 }
+    let sinceInjection = Double(DispatchTime.now().uptimeNanoseconds &- injected) / 1e9
+    return idle < seconds && idle + 0.15 < sinceInjection
+}
 
 enum DesktopError: String, Error {
     case inputPermissionRequired = "input_permission_required"
@@ -30,8 +48,8 @@ func click(_ x: Double, _ y: Double) throws {
     else { throw DesktopError.inputFailed }
     down.setIntegerValueField(.mouseEventClickState, value: 1)
     up.setIntegerValueField(.mouseEventClickState, value: 1)
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
+    inject(down)
+    inject(up)
 }
 
 func postRemoteKey(_ action: String) throws {
@@ -63,7 +81,7 @@ private func postKey(_ code: CGKeyCode, flags: CGEventFlags, unicode: [UInt16]) 
         if !unicode.isEmpty {
             event.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: unicode)
         }
-        event.post(tap: .cghidEventTap)
+        inject(event)
     }
 }
 
@@ -188,7 +206,7 @@ final class DesktopInput {
                       )
                 else { throw DesktopError.inputFailed }
                 scroll.location = point
-                scroll.post(tap: .cghidEventTap)
+                inject(scroll)
             case .release, .keyDown, .keyUp:
                 break
             }
@@ -215,7 +233,7 @@ final class DesktopInput {
         }
         event.flags = CGEventFlags(rawValue: UInt64(flags) << 16)
         event.setIntegerValueField(.keyboardEventAutorepeat, value: repeating ? 1 : 0)
-        event.post(tap: .cghidEventTap)
+        inject(event)
     }
 
     private func post(_ type: CGEventType, button: RemoteMouseButton, point: CGPoint, clicks: Int = 0) throws {
@@ -228,6 +246,6 @@ final class DesktopInput {
             event.setIntegerValueField(.mouseEventDeltaX, value: Int64(point.x - position.x))
             event.setIntegerValueField(.mouseEventDeltaY, value: Int64(point.y - position.y))
         }
-        event.post(tap: .cghidEventTap)
+        inject(event)
     }
 }
