@@ -5,13 +5,14 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 allow_ad_hoc=false
+require_apple=false
 release=false
 if [[ "$#" -eq 1 && "$1" == "--allow-ad-hoc" ]]; then
     allow_ad_hoc=true
 elif [[ "$#" -eq 1 && "$1" == "--release" ]]; then
     release=true
 elif [[ "$#" -eq 1 && "$1" == "--require-apple-signing" ]]; then
-    :
+    require_apple=true
 elif [[ "$#" -ne 0 ]]; then
     printf 'Usage: %s [--allow-ad-hoc | --require-apple-signing | --release]\n' "$0" >&2
     exit 2
@@ -36,7 +37,7 @@ if [[ "$release" == true ]]; then
     build_dir="$build_dir/release"
 elif [[ "$signing_identity" == "-" ]]; then
     if [[ "$allow_ad_hoc" != true ]]; then
-        printf 'Set KOKO_SIGN_IDENTITY to an Apple code-signing identity in the build Mac keychain.\nFor a local test build, explicitly pass --allow-ad-hoc.\n' >&2
+        printf 'Set KOKO_SIGN_IDENTITY to a code-signing identity in the build Mac keychain, such as the one from\nscripts/macos-installer/create-self-signed-identity.sh. For a throwaway test build, pass --allow-ad-hoc.\n' >&2
         exit 1
     fi
     ad_hoc=true
@@ -136,7 +137,7 @@ codesign "${signing_options[@]}" "$app"
 codesign --verify --deep --strict "$app"
 if [[ "$release" == true ]]; then
     codesign --verify -R "=identifier \"io.github.kizai.koko\" and anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$team_id\"" "$app"
-elif [[ "$ad_hoc" != true ]]; then
+elif [[ "$require_apple" == true ]]; then
     codesign --verify -R '=anchor apple generic' "$app"
 fi
 

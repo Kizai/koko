@@ -46,7 +46,7 @@ Koko 在本机记录最近检查的应用版本和两项桌面权限。升级后
 
 ### 为什么升级后会再次询问
 
-macOS 会核对新应用是否满足旧授权记录里的代码签名要求。临时签名通常依赖具体构建的哈希，重新编译就可能改变它。此时「应用程序」里的名称、安装路径和系统权限开关都可能和以前一样，但新进程仍无法录屏或发送键鼠事件。[Apple 代码签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
+macOS 会核对新应用是否满足旧授权记录里的代码签名要求。临时签名的要求就是具体构建的哈希，重新编译就会改变它。KoKo 0.1.20 及更早的内测版都是临时签名，所以每次升级都要重新授权。之后的内测版改用 KoKo 自签名证书，要求变为「应用标识 + 证书哈希」，升级后可以沿用授权；从临时签名版第一次升级到自签名版时，还需要最后授权一次。此时「应用程序」里的名称、安装路径和系统权限开关都可能和以前一样，但新进程仍无法录屏或发送键鼠事件。[Apple 代码签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 
 RustDesk 的 macOS 客户端通过系统接口检查或申请权限，公开发布流程为 macOS 应用签名并提交公证。正常升级时，macOS 可以复用符合签名要求的已有授权。RustDesk 的安装文档也保留了旧录屏授权失效时移除旧条目的排查步骤。[RustDesk 权限实现](https://github.com/rustdesk/rustdesk/blob/master/src/platform/macos.rs) · [RustDesk 构建流程](https://github.com/rustdesk/rustdesk/blob/master/.github/workflows/flutter-build.yml) · [RustDesk macOS 安装说明](https://rustdesk.com/docs/en/client/mac/)
 
@@ -60,7 +60,7 @@ tccutil reset Accessibility io.github.kizai.koko
 tccutil reset PostEvent io.github.kizai.koko
 ```
 
-后续版本保持应用标识 `io.github.kizai.koko`、签名团队和签名类型一致。内测可沿用钥匙串中的 Apple Development 身份，公开分发使用 Developer ID 并完成公证。发布前可把 `KOKO_PREVIOUS_APP` 指向上一版，检查新旧签名的指定要求是否相互兼容。macOS 根据签名要求识别升级后的应用，系统仍会按用户选择、设备策略和系统版本判定实际权限。第一次由临时签名换成证书签名时，为新身份授权一次。[构建与升级校验](./macos.md#公开分发与升级) · [Apple 代码签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
+后续版本保持应用标识 `io.github.kizai.koko` 和签名证书一致。内测沿用同一个 KoKo 自签名证书，[构建测试包](./macos.md#构建测试包)说明了如何创建和备份；以后公开分发改用 Developer ID 并完成公证，切换那一次需要重新授权。发布前可把 `KOKO_PREVIOUS_APP` 指向上一版，检查新旧签名的指定要求是否相互兼容。macOS 根据签名要求识别升级后的应用，系统仍会按用户选择、设备策略和系统版本判定实际权限。每次更换签名证书时，为新身份授权一次。[构建与升级校验](./macos.md#公开分发与升级) · [Apple 代码签名要求](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
 
 ## 双机验收
 

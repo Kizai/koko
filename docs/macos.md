@@ -122,22 +122,41 @@ Agent 密钥默认保存在 `~/.koko/agent.key`，已配对的设备保存在 `~
 
 ## 构建测试包
 
-在装有 Rust 和 Xcode 命令行工具的 Mac 上，用 `security find-identity -v -p codesigning` 查看钥匙串中已有证书及私钥的签名身份。私下开发测试时，各版本沿用同一个 Apple Development 身份。从仓库根目录运行：
+内测版用 KoKo 自签名证书签名，直到改用 Developer ID 公开分发。macOS 按应用的指定要求（designated requirement）记住录屏和辅助功能授权。临时签名的指定要求是本次构建的哈希，每次构建都会变；自签名证书的指定要求是「应用标识 + 证书哈希」，只要一直用同一个证书，升级后授权就能延续。
+
+### 创建自签名身份
+
+只在第一台构建机上做一次。在装有 Xcode 命令行工具的 Mac 上，从仓库根目录运行，参数是私钥备份文件的路径，放在仓库之外：
 
 ```bash
-KOKO_SIGN_IDENTITY="Apple Development: YOUR NAME (CERTIFICATE ID)" \
-./scripts/build-macos.sh
+./scripts/macos-installer/create-self-signed-identity.sh ~/Documents/KoKo-Self-Signed.p12
 ```
 
-输出为 `target/koko-macos/Koko-<version>.dmg`，包含面向 macOS 13 及以上的 Apple Silicon 和 Intel 二进制。Rust 只用于构建，测试机器打开安装好的应用即可。
+脚本在临时目录生成 10 年有效的代码签名证书和私钥，要求输入备份密码，再把身份导入登录钥匙串，并只允许 `codesign` 免提示使用这把私钥。导入时 macOS 会再请你输入一次备份密码。证书不需要在钥匙串中设为「始终信任」，所以 `security find-identity -v` 不会列出它，属正常现象。
 
-若钥匙串里还没有开发身份，可在 Xcode「Settings → Accounts」登录 Apple 账户，选择团队，在「Manage Certificates → ＋」创建 Apple Development 身份。用上面的命令核对身份，再用它构建后续本机测试版本。[Apple 的证书管理说明](https://developer.apple.com/documentation/Xcode/sharing-your-teams-signing-certificates)
+把 `.p12` 备份和密码保存在仓库之外的安全位置。丢失后只能换新证书，所有用户都要重新授权一次。换一台构建机时导入同一份备份：
+
+```bash
+security import ~/Documents/KoKo-Self-Signed.p12 -k ~/Library/Keychains/login.keychain-db -T /usr/bin/codesign
+```
+
+### 构建
+
+在装有 Rust 和 Xcode 命令行工具的 Mac 上，从仓库根目录运行：
+
+```bash
+KOKO_SIGN_IDENTITY="KoKo Self-Signed Code Signing" ./scripts/build-macos.sh
+```
+
+输出为 `target/koko-macos/Koko-<version>.dmg`，包含面向 macOS 13 及以上的 Apple Silicon 和 Intel 二进制。Rust 只用于构建，测试机器打开安装好的应用即可。从第二个自签名版本起，可设置 `KOKO_PREVIOUS_APP` 指向上一版的副本，让脚本核对新旧版本的指定要求相互满足。
+
+自签名和临时签名的应用一样，从网上下载后首次打开会被 Gatekeeper 拦截，需要在「系统设置 → 隐私与安全性」中点「仍要打开」。这一步只影响首次打开，与权限能否延续无关。
 
 内测使用 `0.1.x`。每次发一个新的迭代包时，递增根目录 `Cargo.toml` 的 `workspace.package.version` 最后一位，使用 Cargo 更新锁文件后再打包。应用内版本、CLI 的 `--version` 和 DMG 文件名都来自同一个版本。同一版本重打包使用同一个文件名。脚本校验新 DMG 后清理输出目录里的旧版 Koko DMG。
 
-脚本默认要求 Apple 证书签名，并在生成 DMG 前核验签名。测试构建的 `KOKO_SIGN_IDENTITY` 接受身份全名或 SHA-1。已有 Developer ID Installer 身份时，可通过 `KOKO_INSTALLER_SIGN_IDENTITY` 同时签署安装包。首次从临时签名切换到证书签名后，为新签名授权一次。
+`KOKO_SIGN_IDENTITY` 接受身份全名或证书的 SHA-1，可以是自签名身份、Apple Development 或 Developer ID。要求必须使用 Apple 签发的证书时，加上 `--require-apple-signing`。已有 Developer ID Installer 身份时，可通过 `KOKO_INSTALLER_SIGN_IDENTITY` 同时签署安装包。签名身份每变一次（临时签名换成自签名，或以后换成 Developer ID），用户都需要为新身份授权一次。
 
-构建机暂时没有证书时，可显式生成本地临时测试包：
+只在本机临时试验、不分发给别人时，可以不用证书，显式生成临时签名包：
 
 ```bash
 ./scripts/build-macos.sh --allow-ad-hoc
