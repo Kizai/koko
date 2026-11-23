@@ -25,6 +25,63 @@ struct KokoApp: App {
         }
         .defaultSize(width: 550, height: 430)
         .windowResizability(.contentSize)
+
+        MenuBarExtra {
+            KokoMenu(connection: delegate.connection)
+        } label: {
+            KokoMenuIcon(connection: delegate.connection, opener: delegate.opener)
+        }
+    }
+}
+
+/// Lets AppKit callbacks open SwiftUI windows. Set by a view that is always on screen.
+@MainActor
+final class WindowOpener {
+    var openMain: () -> Void = {}
+}
+
+/// The menu bar icon stays while KoKo runs in the background, so sharing does not depend on a window.
+private struct KokoMenuIcon: View {
+    @ObservedObject var connection: LocalConnection
+    let opener: WindowOpener
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Image(systemName: connection.agentControl == "active" ? "sparkles.tv"
+              : connection.isSharingWithPeer || connection.agentSession != nil ? "display.2" : "display")
+            .onAppear {
+                opener.openMain = {
+                    openWindow(id: "connection")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+            }
+    }
+}
+
+private struct KokoMenu: View {
+    @ObservedObject var connection: LocalConnection
+    @Environment(\.openWindow) private var openWindow
+
+    private var status: String {
+        if connection.agentControl == "active" { return "Agent 正在操作本机" }
+        if connection.isSharingWithPeer { return "正在共享本机" }
+        if connection.agentSession != nil { return "Agent 已连接" }
+        return connection.isHosting ? "等待连接" : "共享已关闭"
+    }
+
+    var body: some View {
+        Text(status)
+        Divider()
+        Button("打开 KoKo") {
+            openWindow(id: "connection")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        if connection.agentControl == "active" {
+            Button("停止 Agent") { Task { await connection.stopAgent() } }
+        }
+        Divider()
+        Button("退出 KoKo") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
     }
 }
 
@@ -32,6 +89,7 @@ struct KokoApp: App {
 private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
     let connection = LocalConnection()
     let updates = ReleaseUpdates()
+    let opener = WindowOpener()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String,
@@ -39,6 +97,13 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
            let icon = NSImage(contentsOf: url) {
             NSApp.applicationIconImage = icon
         }
+        Task { await connection.restoreSharing() }
+    }
+
+    /// Clicking the Dock icon brings the main window back after it was closed.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if !hasVisibleWindows { opener.openMain() }
+        return true
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -46,7 +111,8 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
         Task { await updates.check(manual: false) }
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Closing windows keeps sharing running in the background; Quit in the menu bar or ⌘Q ends KoKo.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
         connection.stopForQuit()

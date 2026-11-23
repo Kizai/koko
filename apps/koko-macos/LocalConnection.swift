@@ -562,11 +562,29 @@ final class LocalConnection: ObservableObject {
         refreshDesktopPermissions()
     }
 
+    /// Whether the person left sharing on. New installs start with it on.
+    private static let sharingKey = "allowRemoteAssistance"
+
+    /// Turns sharing back on at launch if it was on before, so updates and restarts keep it.
+    func restoreSharing() async {
+        guard UserDefaults.standard.object(forKey: Self.sharingKey) as? Bool ?? true, !isHosting else { return }
+        await prepareIdentity(for: .host)
+        refreshDesktopPermissions()
+        guard !hostID.isEmpty, screenPermission == .granted, inputPermission == .granted, !isHosting else { return }
+        await startHosting()
+    }
+
     func startHosting() async {
         isHosting = true
         stopRequested = false
+        UserDefaults.standard.set(true, forKey: Self.sharingKey)
         hostNotice = ConnectionNotice(message: "正在启动监听…")
+        // macOS slows apps that are hidden or have no open window; a host must answer at once.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical], reason: "KoKo 正在共享本机"
+        )
         defer {
+            ProcessInfo.processInfo.endActivity(activity)
             endHostDesktop()
             hostCommand = nil
             isHosting = false
@@ -937,6 +955,7 @@ final class LocalConnection: ObservableObject {
     func stopHosting() {
         endHostDesktop()
         stopRequested = true
+        UserDefaults.standard.set(false, forKey: Self.sharingKey)
         isSharingWithPeer = false
         agentSession = nil
         agentControl = "idle"
