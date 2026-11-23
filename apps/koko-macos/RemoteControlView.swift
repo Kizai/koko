@@ -146,6 +146,7 @@ struct RemoteControlView: View {
                 }
             }
             displayControls
+            audioControls
             networkControls
             Spacer(minLength: 0)
             switch connection.remoteAgentControl {
@@ -211,6 +212,65 @@ struct RemoteControlView: View {
             }
             .padding(14)
             .frame(width: 236)
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private var audioControls: some View {
+        let icon = !connection.isRemoteAudioEnabled || connection.isAudioMuted || connection.hostAudioVolume == 0
+            ? "speaker.slash"
+            : connection.hostAudioVolume < 50 ? "speaker.wave.1" : "speaker.wave.2"
+        return Button { connection.showAudioControls.toggle() } label: {
+            Image(systemName: icon)
+                .foregroundStyle(connection.isAudioMuted ? Color.orange : Color.primary)
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("声音控制")
+        .help("声音与静音")
+        .popover(isPresented: $connection.showAudioControls, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("远程声音").font(.headline)
+                    Spacer()
+                    Button {
+                        connection.isAudioMuted.toggle()
+                    } label: {
+                        Label(connection.isAudioMuted ? "取消静音" : "本机静音",
+                              systemImage: connection.isAudioMuted ? "speaker.slash.fill" : "speaker.wave.2")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("被控端音量")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("\(connection.hostAudioVolume)%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(connection.hostAudioVolume) },
+                            set: { connection.setHostAudioVolume(Int($0.rounded())) }
+                        ),
+                        in: 0...100
+                    )
+                }
+                Toggle("接收被控端声音", isOn: $connection.isRemoteAudioEnabled)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                if connection.hostAudioMuted {
+                    Text("被控端当前处于系统静音状态。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(14)
+            .frame(width: 248)
             .background(Color(nsColor: .windowBackgroundColor))
         }
     }

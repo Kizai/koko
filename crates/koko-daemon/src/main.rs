@@ -14,7 +14,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use koko_p2p::{bind_host, load_identity, load_or_create_identity};
-use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY};
+use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY, DEFAULT_PORT};
 use session::Sessions;
 
 #[derive(Debug)]
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         [command, file] if command == "serve-pair" => {
             let identity = load_or_create_identity(Path::new(file))?;
-            pairing::serve(identity, ([0, 0, 0, 0], 4444).into(), None).await?;
+            pairing::serve(identity, ([0, 0, 0, 0], DEFAULT_PORT).into(), None).await?;
         }
         _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port [--app-desktop [name]]] | screen-permission <check|request> | input-permission <check|request>".into()),
     }

@@ -172,6 +172,8 @@ struct RemoteAction: Codable {
     var edge: Int? = nil
     var quality: Int? = nil
     var fps: Int? = nil
+    var audio: Bool? = nil
+    var level: Int? = nil
     var events: [RemotePointerEvent]? = nil
     var sourceOS: String? = nil
     var videoSocket: String? = nil
@@ -183,7 +185,7 @@ struct RemoteAction: Codable {
     var approved: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, events, format, cursor
+        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, audio, level, events, format, cursor
         case actor, approved
         case maxNodes = "max_nodes"
         case sourceOS = "source_os"
@@ -211,6 +213,8 @@ private struct RemoteReply: Codable {
     var png: String? = nil
     var code: String? = nil
     var image: String? = nil
+    var level: Int? = nil
+    var muted: Bool? = nil
     var hostName: String? = nil
     var displays: [RemoteDisplay]? = nil
     var rttMS: Int? = nil
@@ -412,7 +416,7 @@ private final class RemoteChannel {
 @MainActor
 final class LocalConnection: ObservableObject {
     static let frameRates = [30, 60, 90, 120, 144, 165, 240]
-    @Published var listenPort = UserDefaults.standard.string(forKey: "listenPort") ?? "4444"
+    @Published var listenPort = UserDefaults.standard.string(forKey: "listenPort") ?? "27688"
     @Published var inviteInput = ""
     @Published var partnerDeviceID = ""
     @Published var partnerCode = ""
@@ -501,7 +505,16 @@ final class LocalConnection: ObservableObject {
     @Published var showTextControls = false
     @Published var showDisplayControls = false
     @Published var showNetworkStats = false
+    @Published var showAudioControls = false
     @Published var showControlCenter = false
+    @Published var isRemoteAudioEnabled = true
+    @Published var isAudioMuted = false {
+        didSet { videoSurface.isMuted = isAudioMuted }
+    }
+    @Published var hostAudioVolume = 50
+    @Published private(set) var hostAudioMuted = false
+    private var lastAudioPoll = Date.distantPast
+    private var volumeSendTask: Task<Void, Never>?
     @Published private(set) var screenNotice: ConnectionNotice?
     @Published private(set) var clipboardNotice: ConnectionNotice?
     @Published private(set) var inputNotice: ConnectionNotice?
@@ -727,6 +740,11 @@ final class LocalConnection: ObservableObject {
                 trustedDeviceCount = count
             } else if line.hasPrefix("Trust storage failed: ") {
                 hostNotice = ConnectionNotice(message: "无法保存设备信任。请检查 Koko 的数据目录。", isError: true)
+            } else if line.hasPrefix("Listening on "), let boundPort = line.split(separator: ":").last {
+                let actual = String(boundPort)
+                if actual != listenPort {
+                    hostNotice = ConnectionNotice(message: "默认端口 \(listenPort) 已被占用，已自动切换至 \(actual)。")
+                }
             } else if line.hasPrefix("Device ID: ") {
                 hostDeviceID = String(line.dropFirst("Device ID: ".count))
                 let mode = verificationMode
@@ -873,8 +891,11 @@ final class LocalConnection: ObservableObject {
             case "video":
                 guard let display = action.display, let edge = action.edge, let quality = action.quality,
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
-                let settings = VideoSettings(display: display, edge: edge, quality: quality, fps: fps)
+                let settings = VideoSettings(display: display, edge: edge, quality: quality, fps: fps, audio: action.audio ?? false)
                 Task { await streamDesktopVideo(settings, socket: socket) }
+            case "audio_volume":
+                let state = action.level.map { HostAudioVolume.write(level: $0) } ?? HostAudioVolume.read()
+                return RemoteReply(status: "audio_volume", level: state.level, muted: state.muted)
             case "wallpaper":
                 let shot = try await captureWallpaper()
                 screenPermission = .granted
@@ -1264,6 +1285,10 @@ final class LocalConnection: ObservableObject {
         guard let session else { return }
         while !Task.isCancelled && self.session == session {
             let changed = await refreshFrame(session)
+            if Date().timeIntervalSince(lastAudioPoll) >= 1.5 {
+                lastAudioPoll = Date()
+                await syncHostAudioVolume(session)
+            }
             try? await Task.sleep(for: supportsVideo ? .milliseconds(300) : changed ? .milliseconds(90) : .seconds(1))
         }
     }
@@ -1310,7 +1335,13 @@ final class LocalConnection: ObservableObject {
                 let constrained = adaptive && videoLatency.constrained
                 let edge = frameResolution == .automatic ? max(480, min(constrained ? 1280 : 4096, (viewportEdge / 128) * 128)) : frameResolution.rawValue
                 let quality = frameQuality == .automatic ? (constrained ? 45 : 70) : frameQuality.rawValue
-                let settings = VideoSettings(display: selectedDisplay.id, edge: edge, quality: quality, fps: targetFPS)
+                let settings = VideoSettings(
+                    display: selectedDisplay.id,
+                    edge: edge,
+                    quality: quality,
+                    fps: targetFPS,
+                    audio: isRemoteAudioEnabled
+                )
                 if videoSettings != settings || (videoTask == nil && ContinuousClock.now >= videoRetryAfter) {
                     startVideo(session, settings: settings)
                 } else if let lastVideoFrameAt, ContinuousClock.now - lastVideoFrameAt > .seconds(1),
@@ -1413,7 +1444,11 @@ final class LocalConnection: ObservableObject {
                     break records
                 case .format:
                     size = try videoSurface.setFormat(bytes)
-                case .frame:
+                case .audioFormat:
+                    videoSurface.setAudioFormat(bytes)
+                case .audioFrame:
+                    videoSurface.enqueueAudio(bytes)
+                case .frame, .syncFrame:
                     guard selectedDisplay?.id == settings.display else { continue }
                     while !videoSurface.isReadyForMoreMediaData {
                         if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
@@ -1421,7 +1456,11 @@ final class LocalConnection: ObservableObject {
                         guard videoReceiver === receiver else { return }
                     }
                     guard selectedDisplay?.id == settings.display else { continue }
-                    try videoSurface.enqueue(bytes)
+                    if kind == .syncFrame, let timed = AudioPacketCodec.decodeVideoTimedPayload(bytes) {
+                        try videoSurface.enqueue(timed.payload, ptsUs: timed.ptsUs)
+                    } else {
+                        try videoSurface.enqueue(bytes)
+                    }
                     let now = ContinuousClock.now
                     lastVideoFrameAt = now
                     if firstFrameMS == nil {
@@ -1459,6 +1498,37 @@ final class LocalConnection: ObservableObject {
         stopVideo()
         videoRetryAfter = .now.advanced(by: failure == "video_busy" ? .milliseconds(300) : .seconds(1))
         if failure == "display_unavailable" { displayRefresh = .distantPast }
+    }
+
+    private func syncHostAudioVolume(_ session: PairedHost) async {
+        do {
+            let reply = try await remote(RemoteAction(action: "audio_volume"), session: session)
+            if reply.status == "audio_volume", let level = reply.level {
+                if volumeSendTask == nil {
+                    hostAudioVolume = level
+                }
+                hostAudioMuted = reply.muted ?? false
+            }
+        } catch {
+            // Older hosts may not support audio_volume yet.
+        }
+    }
+
+    func setHostAudioVolume(_ level: Int) {
+        let clamped = max(0, min(100, level))
+        hostAudioVolume = clamped
+        guard let session else { return }
+        volumeSendTask?.cancel()
+        volumeSendTask = Task {
+            try? await Task.sleep(for: .milliseconds(60))
+            guard !Task.isCancelled else { return }
+            if let reply = try? await remote(RemoteAction(action: "audio_volume", level: clamped), session: session),
+               let updated = reply.level {
+                hostAudioVolume = updated
+                hostAudioMuted = reply.muted ?? false
+            }
+            volumeSendTask = nil
+        }
     }
 
     private func stopVideo() {

@@ -56,6 +56,41 @@ pub async fn bind_host(key: SecretKey, address: SocketAddr) -> Result<Endpoint, 
     Ok(endpoint)
 }
 
+/// Binds the requested port, or steps forward / falls back to an OS-assigned port if already in use.
+pub async fn bind_host_available(
+    key: SecretKey,
+    address: SocketAddr,
+) -> Result<Endpoint, Box<dyn Error>> {
+    let preferred = address.port();
+    if preferred != 0 {
+        for offset in 0..=16u16 {
+            if let Some(port) = preferred.checked_add(offset) {
+                let candidate = SocketAddr::new(address.ip(), port);
+                match bind_host(key.clone(), candidate).await {
+                    Ok(endpoint) => return Ok(endpoint),
+                    Err(error) if is_addr_in_use(error.as_ref()) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    bind_host(key, SocketAddr::new(address.ip(), 0)).await
+}
+
+fn is_addr_in_use(mut error: &(dyn Error + 'static)) -> bool {
+    loop {
+        if let Some(io_error) = error.downcast_ref::<io::Error>()
+            && io_error.kind() == io::ErrorKind::AddrInUse
+        {
+            return true;
+        }
+        let Some(source) = error.source() else {
+            return false;
+        };
+        error = source;
+    }
+}
+
 pub async fn check_host(
     key: SecretKey,
     host_id: iroh::EndpointId,
@@ -81,4 +116,20 @@ pub async fn check_host(
     connection.close(0u32.into(), b"check complete");
     endpoint.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_host_available_falls_back_when_port_is_occupied() -> Result<(), Box<dyn Error>> {
+        let first = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let occupied = first.bound_sockets()[0];
+        let second = bind_host_available(SecretKey::generate(), occupied).await?;
+        assert_ne!(second.bound_sockets()[0].port(), occupied.port());
+        second.close().await;
+        first.close().await;
+        Ok(())
+    }
 }

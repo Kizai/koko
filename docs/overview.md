@@ -22,7 +22,7 @@ KoKo connects two authorized Macs over a local or routed network. The host decid
 ## Connect two Macs
 
 1. Download the same DMG for both Macs from [Releases](https://github.com/Kizai/koko/releases). In v0.1.15 and newer, double-click the installer icon in the disk image, complete the installer, then open KoKo from Applications.
-2. On the host Mac, allow Screen Recording and Accessibility, then enable **Allow Remote Assistance**. The default listen address is `0.0.0.0:4444/UDP`.
+2. On the host Mac, allow Screen Recording and Accessibility, then enable **Allow Remote Assistance**. The default listen address is `0.0.0.0:27688/UDP` (with automatic fallback if occupied).
 3. On the controller, refresh LAN devices and choose the host, or enter its one-time code under **Connect to a Partner**. Use the host's direct invitation when your routed network does not forward LAN discovery.
 4. On the host, approve the first LAN request. Choose **Trust and Connect** to allow that controller to reconnect while sharing is enabled.
 

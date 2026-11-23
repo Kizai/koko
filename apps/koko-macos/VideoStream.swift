@@ -9,6 +9,7 @@ struct VideoSettings: Equatable {
     let edge: Int
     let quality: Int
     let fps: Int
+    let audio: Bool
 }
 
 // Separate entry and recovery thresholds keep a borderline link from restarting the encoder every second.
@@ -28,7 +29,7 @@ struct StreamLatency {
 
 // Each record is a big-endian length followed by a kind byte and its payload.
 enum VideoRecord: UInt8 {
-    case format = 1, frame, error, path
+    case format = 1, frame, error, path, audioFormat, audioFrame, syncFrame
 }
 
 enum VideoError: String, Error {
@@ -53,22 +54,33 @@ private struct VideoSample: @unchecked Sendable {
 }
 
 private final class ScreenVideoOutput: NSObject, SCStreamOutput, SCStreamDelegate, Sendable {
-    private let continuation: AsyncThrowingStream<VideoSample, Error>.Continuation
+    private let video: AsyncThrowingStream<VideoSample, Error>.Continuation
+    private let audio: AsyncStream<VideoSample>.Continuation?
 
-    init(_ continuation: AsyncThrowingStream<VideoSample, Error>.Continuation) {
-        self.continuation = continuation
+    init(
+        _ video: AsyncThrowingStream<VideoSample, Error>.Continuation,
+        audio: AsyncStream<VideoSample>.Continuation?
+    ) {
+        self.video = video
+        self.audio = audio
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio {
+            guard CMSampleBufferDataIsReady(sample) else { return }
+            audio?.yield(VideoSample(buffer: sample))
+            return
+        }
         guard type == .screen, let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
                     as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int,
               status == SCFrameStatus.complete.rawValue else { return }
-        continuation.yield(VideoSample(buffer: sample))
+        video.yield(VideoSample(buffer: sample))
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        continuation.finish(throwing: error)
+        video.finish(throwing: error)
+        audio?.finish()
     }
 }
 
@@ -120,12 +132,28 @@ private final class AVCEncoder {
     }
 }
 
+private actor SocketRecordWriter {
+    private let connection: NWConnection
+
+    init(_ connection: NWConnection) {
+        self.connection = connection
+    }
+
+    func send(_ kind: VideoRecord, bytes: Data) async throws {
+        try await sendVideo(kind, bytes: bytes, to: connection)
+    }
+}
+
 func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
     let connection = NWConnection(to: .unix(path: socket), using: .tcp)
     let queue = DispatchQueue(label: "KoKo.video.capture")
     let (frames, output) = AsyncThrowingStream<VideoSample, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    let (audioSamples, audioOutput) = AsyncStream<VideoSample>.makeStream(bufferingPolicy: .bufferingNewest(24))
     connection.start(queue: queue)
-    connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in output.finish() }
+    connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
+        output.finish()
+        audioOutput.finish()
+    }
     defer { connection.cancel() }
     do {
         let (filter, config) = try await screenCaptureSource(displayID: settings.display, edge: settings.edge)
@@ -134,29 +162,70 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = false
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(settings.fps))
+        config.capturesAudio = settings.audio
+        if settings.audio {
+            config.sampleRate = 48_000
+            config.channelCount = 2
+        }
 
-        let encoder = try AVCEncoder(width: config.width, height: config.height, fps: settings.fps, quality: settings.quality)
-        let delegate = ScreenVideoOutput(output)
+        let videoWidth = config.width
+        let videoHeight = config.height
+        let delegate = ScreenVideoOutput(output, audio: settings.audio ? audioOutput : nil)
         let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try stream.addStreamOutput(delegate, type: .screen, sampleHandlerQueue: queue)
+        if settings.audio {
+            try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: queue)
+        }
         try await stream.startCapture()
+        let writer = SocketRecordWriter(connection)
+        let clockBase = CMClockGetTime(CMClockGetHostTimeClock())
         do {
-            var format: CMFormatDescription?
-            for try await frame in frames {
-                guard let encoded = try await encoder.encode(frame)?.buffer,
-                      let block = encoded.dataBuffer, let nextFormat = encoded.formatDescription else { continue }
-                if format != nextFormat {
-                    try await sendVideo(.format, bytes: h264ParameterSets(nextFormat), to: connection)
-                    format = nextFormat
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    let encoder = try AVCEncoder(width: videoWidth, height: videoHeight, fps: settings.fps, quality: settings.quality)
+                    var format: CMFormatDescription?
+                    for try await frame in frames {
+                        let ptsUs = Int64(((frame.buffer.presentationTimeStamp - clockBase).seconds * 1_000_000).rounded())
+                        guard let encoded = try await encoder.encode(frame)?.buffer,
+                              let block = encoded.dataBuffer, let nextFormat = encoded.formatDescription else { continue }
+                        if format != nextFormat {
+                            try await writer.send(.format, bytes: h264ParameterSets(nextFormat))
+                            format = nextFormat
+                        }
+                        let size = CMBlockBufferGetDataLength(block)
+                        guard size > 0 else { continue }
+                        var bytes = Data(count: size)
+                        let status = bytes.withUnsafeMutableBytes {
+                            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+                        }
+                        guard status == noErr else { throw VideoError.codec }
+                        if settings.audio {
+                            try await writer.send(.syncFrame, bytes: AudioPacketCodec.encodeVideoTimedPayload(ptsUs: ptsUs, payload: bytes))
+                        } else {
+                            try await writer.send(.frame, bytes: bytes)
+                        }
+                    }
                 }
-                let size = CMBlockBufferGetDataLength(block)
-                guard size > 0 else { continue }
-                var bytes = Data(count: size)
-                let status = bytes.withUnsafeMutableBytes {
-                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+                if settings.audio {
+                    group.addTask {
+                        let aac = try AACStreamEncoder()
+                        var sentHeader = false
+                        for await sample in audioSamples {
+                            let packets = aac.encode(sample.buffer, basePTS: clockBase)
+                            if !sentHeader, let header = aac.formatHeader {
+                                try await writer.send(.audioFormat, bytes: header)
+                                sentHeader = true
+                            }
+                            for packet in packets {
+                                let payload = AudioPacketCodec.encodeTimedPayload(
+                                    ptsUs: packet.ptsUs, durationUs: packet.durationUs, payload: packet.data
+                                )
+                                try await writer.send(.audioFrame, bytes: payload)
+                            }
+                        }
+                    }
                 }
-                guard status == noErr else { throw VideoError.codec }
-                try await sendVideo(.frame, bytes: bytes, to: connection)
+                try await group.waitForAll()
             }
         } catch {
             try? await stream.stopCapture()
@@ -200,8 +269,22 @@ private func h264ParameterSets(_ format: CMFormatDescription) throws -> Data {
 @MainActor
 final class VideoSurface {
     let layer = AVSampleBufferDisplayLayer()
+    private let audioRenderer = AVSampleBufferAudioRenderer()
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
     private var format: CMVideoFormatDescription?
+    private var audioFormat: CMAudioFormatDescription?
     private var needsFlush = false
+    private var needsAudioFlush = false
+
+    var isMuted: Bool = false {
+        didSet { audioRenderer.isMuted = isMuted }
+    }
+
+    init() {
+        synchronizer.addRenderer(layer)
+        synchronizer.addRenderer(audioRenderer)
+        synchronizer.rate = 0
+    }
 
     func setFormat(_ bytes: Data) throws -> CGSize {
         guard bytes.count >= 8 else { throw VideoError.packet }
@@ -225,7 +308,13 @@ final class VideoSurface {
         return CGSize(width: Int(size.width), height: Int(size.height))
     }
 
-    func enqueue(_ bytes: Data) throws {
+    func setAudioFormat(_ bytes: Data) {
+        guard let description = AudioPacketCodec.makeFormatDescription(from: bytes) else { return }
+        audioFormat = description
+        needsAudioFlush = true
+    }
+
+    func enqueue(_ bytes: Data, ptsUs: Int64? = nil) throws {
         guard let format, !bytes.isEmpty else { throw VideoError.packet }
         var buffer: CMBlockBuffer?
         guard CMBlockBufferCreateWithMemoryBlock(
@@ -238,17 +327,30 @@ final class VideoSurface {
             CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: buffer, offsetIntoDestination: 0, dataLength: bytes.count)
         }
         var sample: CMSampleBuffer?
-        guard written == noErr,
-              CMSampleBufferCreateReady(
-                allocator: nil, dataBuffer: buffer, formatDescription: format, sampleCount: 1,
-                sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
-                sampleSizeArray: [bytes.count], sampleBufferOut: &sample
-              ) == noErr, let sample else { throw VideoError.codec }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
-            let first = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(first, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        if let ptsUs {
+            let pts = CMTime(value: ptsUs, timescale: 1_000_000)
+            var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+            guard written == noErr,
+                  CMSampleBufferCreateReady(
+                    allocator: nil, dataBuffer: buffer, formatDescription: format, sampleCount: 1,
+                    sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 1,
+                    sampleSizeArray: [bytes.count], sampleBufferOut: &sample
+                  ) == noErr else { throw VideoError.codec }
+            syncClockIfNeeded(to: pts)
+        } else {
+            guard written == noErr,
+                  CMSampleBufferCreateReady(
+                    allocator: nil, dataBuffer: buffer, formatDescription: format, sampleCount: 1,
+                    sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
+                    sampleSizeArray: [bytes.count], sampleBufferOut: &sample
+                  ) == noErr else { throw VideoError.codec }
+            if let sample, let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
+                let first = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+                CFDictionarySetValue(first, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                     Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+            }
         }
+        guard let sample else { throw VideoError.codec }
 
         if needsFlush {
             layer.flush()
@@ -257,12 +359,43 @@ final class VideoSurface {
         layer.enqueue(sample)
     }
 
+    func enqueueAudio(_ bytes: Data) {
+        guard let audioFormat,
+              let packet = AudioPacketCodec.decodeTimedPayload(bytes),
+              let sample = AudioPacketCodec.makeSampleBuffer(
+                payload: packet.payload, format: audioFormat, ptsUs: packet.ptsUs, durationUs: packet.durationUs
+              ) else { return }
+        if needsAudioFlush {
+            audioRenderer.flush()
+            needsAudioFlush = false
+        }
+        let pts = CMTime(value: packet.ptsUs, timescale: 1_000_000)
+        syncClockIfNeeded(to: pts)
+        if audioRenderer.isReadyForMoreMediaData {
+            audioRenderer.enqueue(sample)
+        }
+    }
+
+    private func syncClockIfNeeded(to pts: CMTime) {
+        if synchronizer.rate == 0 {
+            synchronizer.setRate(1.0, time: pts)
+            return
+        }
+        let drift = abs((synchronizer.currentTime() - pts).seconds)
+        if drift > 0.25 {
+            synchronizer.setRate(1.0, time: pts)
+        }
+    }
+
     var isReadyForMoreMediaData: Bool { needsFlush || layer.isReadyForMoreMediaData }
     var hasFailed: Bool { layer.status == .failed }
 
     func clear() {
+        synchronizer.rate = 0
         layer.flushAndRemoveImage()
+        audioRenderer.flush()
         format = nil
+        audioFormat = nil
     }
 }
 
@@ -275,7 +408,7 @@ final class VideoReceiver {
 
     init(keyPath: String, host: PairedHost, settings: VideoSettings) throws {
         let action = RemoteAction(action: "video", display: settings.display, edge: settings.edge,
-                                  quality: settings.quality, fps: settings.fps)
+                                  quality: settings.quality, fps: settings.fps, audio: settings.audio)
         let request = try JSONEncoder().encode(action)
         process.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/koko-agent")
         process.arguments = ["remote-video", keyPath, host.hostID, host.address, String(decoding: request, as: UTF8.self)]

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub const ALPN: &[u8] = b"koko/1";
 pub const PAIR_ALPN: &[u8] = b"koko/pair/1";
 pub const REMOTE_ALPN: &[u8] = b"koko/remote/1";
+pub const DEFAULT_PORT: u16 = 27688;
 pub const CONTROL_REQUEST: &[u8] = b"request";
 pub const MAX_PAIR_REQUEST: usize = 1024;
 pub const MAX_PAIR_REPLY: usize = 256;
@@ -249,6 +250,13 @@ pub enum RemoteCommand {
         edge: u16,
         quality: u8,
         fps: u16,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        audio: bool,
+    },
+    /// Reads (`level: None`) or sets (`level: Some(0..=100)`) the host's system output volume.
+    AudioVolume {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        level: Option<u8>,
     },
     Pointer {
         display: u32,
@@ -506,6 +514,10 @@ pub enum RemoteReply {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         format: Option<ImageFormat>,
     },
+    AudioVolume {
+        level: u8,
+        muted: bool,
+    },
     Displays {
         host_name: String,
         displays: Vec<RemoteDisplay>,
@@ -573,6 +585,7 @@ impl RemoteCommand {
                 | Self::Wallpaper
                 | Self::Capture { .. }
                 | Self::Video { .. }
+                | Self::AudioVolume { level: None }
                 | Self::Disconnect
         )
     }
@@ -621,10 +634,12 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
             edge,
             quality,
             fps,
+            ..
         } => {
             valid_capture(*display, *edge, *quality)
                 && matches!(fps, 30 | 60 | 90 | 120 | 144 | 165 | 240)
         }
+        RemoteCommand::AudioVolume { level } => level.is_none_or(|value| value <= 100),
         RemoteCommand::Pointer {
             display, events, ..
         } => {

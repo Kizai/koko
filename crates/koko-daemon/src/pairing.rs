@@ -12,7 +12,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use koko_p2p::{
-    bind_host,
+    bind_host_available,
     pairing::{VerificationCode, device_id, direct_invite, listening_target, publish_host},
 };
 use koko_proto::{
@@ -479,7 +479,7 @@ pub(crate) async fn serve(
     let trust = Trust::load(directory)?;
     let arbiter = Arc::new(Arbiter::new(HUMAN_GRACE, AGENT_IDLE));
     let outbox = Arc::new(Outbox::default());
-    let endpoint = bind_host(key, address).await?;
+    let endpoint = bind_host_available(key, address).await?;
     let address = endpoint.bound_sockets()[0];
     let target = listening_target(endpoint.id(), address)?;
     let codes = Arc::new(Mutex::new(Codes::new()));
@@ -593,7 +593,7 @@ mod tests {
 
     use iroh::EndpointAddr;
     use koko_p2p::{
-        check_host,
+        bind_host, check_host,
         pairing::{
             HumanPairing, PairingOptions, lan_request, request_agent_pairing,
             request_human_pairing, request_pairing, resolve_invite,

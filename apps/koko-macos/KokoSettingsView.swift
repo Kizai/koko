@@ -168,9 +168,12 @@ struct KokoSettingsView: View {
                     LabeledContent("共享监听地址", value: "0.0.0.0 · QUIC / UDP")
                     LabeledContent("共享端口") {
                         HStack {
-                            TextField("4444", text: $listenPort)
+                            TextField("", text: $listenPort, prompt: Text("27688"))
+                                .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
-                                .frame(width: 78)
+                                .lineLimit(1)
+                                .frame(width: 96)
                                 .disabled(connection.isHosting)
                                 .onSubmit(savePort)
                             Button("保存", action: savePort).disabled(!canSavePort)

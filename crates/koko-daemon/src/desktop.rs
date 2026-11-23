@@ -678,6 +678,7 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         }
         RemoteCommand::Screenshot => native(&["screenshot"], None),
         RemoteCommand::Wallpaper
+        | RemoteCommand::AudioVolume { .. }
         | RemoteCommand::Capture { .. }
         | RemoteCommand::UiTree { .. }
         | RemoteCommand::Displays
