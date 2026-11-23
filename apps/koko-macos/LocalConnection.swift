@@ -525,21 +525,25 @@ final class LocalConnection: ObservableObject {
     var nearbyHosts: [NearbyHost] {
         let online = discoveredHosts.filter { !hiddenDevices.contains($0.id) }
         let onlineIDs = Set(online.map(\.id))
-        let offline = rememberedDevices
+        let rest = rememberedDevices
             .filter { !onlineIDs.contains($0.id) && !hiddenDevices.contains($0.id) && $0.id != hostID }
             .map { record in
-                NearbyHost(
+                let connected = session?.hostID == record.id
+                let addresses = connected && session?.address != nil
+                    ? [session!.address] + record.addresses.filter { $0 != session!.address }
+                    : record.addresses
+                return NearbyHost(
                     id: record.id,
                     deviceID: record.deviceID,
                     label: record.name,
                     request: "",
                     os: record.os,
-                    isOnline: false,
-                    knownAddresses: record.addresses,
+                    isOnline: connected,
+                    knownAddresses: addresses,
                     lastConnectedAt: record.lastConnectedAt
                 )
             }
-        return online + offline
+        return online + rest
     }
 
     private let identityDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -1151,14 +1155,14 @@ final class LocalConnection: ObservableObject {
         )
     }
 
-    func openSavedDevice(_ host: NearbyHost, code: String? = nil, viewOnly: Bool = false) async {
+    func openSavedDevice(_ host: NearbyHost, code: String? = nil, quiet: Bool = true, viewOnly: Bool = false) async {
         let trimmedCode = code?.trimmingCharacters(in: .whitespacesAndNewlines)
         let target = !host.request.isEmpty ? host.request : (host.deviceID ?? host.id)
         let known = rememberedDevices.first { $0.id == host.id }
         await connect(
             target: target,
             verificationCode: trimmedCode?.isEmpty == false ? trimmedCode : nil,
-            quiet: true,
+            quiet: quiet,
             knownHost: known,
             viewOnly: viewOnly
         )
@@ -1322,6 +1326,11 @@ final class LocalConnection: ObservableObject {
                 }
                 let name = reply.hostName ?? "远程 Mac"
                 if remoteHostName != name { remoteHostName = name }
+                if let index = rememberedDevices.firstIndex(where: { $0.id == session.hostID }),
+                   !name.isEmpty, rememberedDevices[index].name != name {
+                    rememberedDevices[index].name = name
+                    DeviceHistoryStore.saveRecords(rememberedDevices)
+                }
                 supportsClipboardStream = reply.clipboardStream == true
                 if reply.outbox == true, outboxTask == nil { watchOutbox(session) }
                 supportsVideo = reply.video == true
@@ -1333,8 +1342,10 @@ final class LocalConnection: ObservableObject {
             let adaptive = UserDefaults.standard.object(forKey: "adaptiveStreaming") as? Bool ?? true
             if supportsVideo {
                 let constrained = adaptive && videoLatency.constrained
-                let edge = frameResolution == .automatic ? max(480, min(constrained ? 1280 : 4096, (viewportEdge / 128) * 128)) : frameResolution.rawValue
-                let quality = frameQuality == .automatic ? (constrained ? 45 : 70) : frameQuality.rawValue
+                let edge = frameResolution == .automatic
+                    ? (constrained ? 1600 : max(2560, min(4096, (viewportEdge / 128) * 128)))
+                    : frameResolution.rawValue
+                let quality = frameQuality == .automatic ? (constrained ? 55 : 82) : frameQuality.rawValue
                 let settings = VideoSettings(
                     display: selectedDisplay.id,
                     edge: edge,
@@ -1450,12 +1461,8 @@ final class LocalConnection: ObservableObject {
                     videoSurface.enqueueAudio(bytes)
                 case .frame, .syncFrame:
                     guard selectedDisplay?.id == settings.display else { continue }
-                    while !videoSurface.isReadyForMoreMediaData {
-                        if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
-                        try await Task.sleep(for: .milliseconds(2))
-                        guard videoReceiver === receiver else { return }
-                    }
-                    guard selectedDisplay?.id == settings.display else { continue }
+                    if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
+                    guard videoSurface.isReadyForMoreMediaData else { continue }
                     if kind == .syncFrame, let timed = AudioPacketCodec.decodeVideoTimedPayload(bytes) {
                         try videoSurface.enqueue(timed.payload, ptsUs: timed.ptsUs)
                     } else {

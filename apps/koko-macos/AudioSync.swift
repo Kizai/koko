@@ -106,9 +106,7 @@ final class AACStreamEncoder {
             inputFormat = sourceFormat
             converter = AVAudioConverter(from: sourceFormat, to: outputFormat)
             converter?.bitRate = 128_000
-            if let cookie = converter?.magicCookie ?? outputFormat.magicCookie {
-                formatHeader = Self.makeFormatHeader(sampleRate: 48_000, channels: 2, framesPerPacket: 1024, cookie: cookie)
-            }
+            formatHeader = nil
         }
         guard let converter else { return [] }
 
@@ -162,6 +160,9 @@ final class AACStreamEncoder {
             }
             if error != nil || outStatus == .error || compressed.packetCount == 0 {
                 break
+            }
+            if formatHeader == nil, let cookie = converter.magicCookie ?? outputFormat.magicCookie, !cookie.isEmpty {
+                formatHeader = Self.makeFormatHeader(sampleRate: 48_000, channels: 2, framesPerPacket: 1024, cookie: cookie)
             }
             if let descs = compressed.packetDescriptions {
                 let basePtr = compressed.data.assumingMemoryBound(to: UInt8.self)

@@ -139,8 +139,12 @@ private actor SocketRecordWriter {
         self.connection = connection
     }
 
-    func send(_ kind: VideoRecord, bytes: Data) async throws {
-        try await sendVideo(kind, bytes: bytes, to: connection)
+    func send(_ kind: VideoRecord, bytes: Data) {
+        var packet = Data(capacity: 5 + bytes.count)
+        packet.appendLength(bytes.count + 1)
+        packet.append(kind.rawValue)
+        packet.append(bytes)
+        connection.send(content: packet, completion: .idempotent)
     }
 }
 
@@ -189,7 +193,7 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
                         guard let encoded = try await encoder.encode(frame)?.buffer,
                               let block = encoded.dataBuffer, let nextFormat = encoded.formatDescription else { continue }
                         if format != nextFormat {
-                            try await writer.send(.format, bytes: h264ParameterSets(nextFormat))
+                            await writer.send(.format, bytes: try h264ParameterSets(nextFormat))
                             format = nextFormat
                         }
                         let size = CMBlockBufferGetDataLength(block)
@@ -200,9 +204,9 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
                         }
                         guard status == noErr else { throw VideoError.codec }
                         if settings.audio {
-                            try await writer.send(.syncFrame, bytes: AudioPacketCodec.encodeVideoTimedPayload(ptsUs: ptsUs, payload: bytes))
+                            await writer.send(.syncFrame, bytes: AudioPacketCodec.encodeVideoTimedPayload(ptsUs: ptsUs, payload: bytes))
                         } else {
-                            try await writer.send(.frame, bytes: bytes)
+                            await writer.send(.frame, bytes: bytes)
                         }
                     }
                 }
@@ -213,14 +217,14 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
                         for await sample in audioSamples {
                             let packets = aac.encode(sample.buffer, basePTS: clockBase)
                             if !sentHeader, let header = aac.formatHeader {
-                                try await writer.send(.audioFormat, bytes: header)
+                                await writer.send(.audioFormat, bytes: header)
                                 sentHeader = true
                             }
                             for packet in packets {
                                 let payload = AudioPacketCodec.encodeTimedPayload(
                                     ptsUs: packet.ptsUs, durationUs: packet.durationUs, payload: packet.data
                                 )
-                                try await writer.send(.audioFrame, bytes: payload)
+                                await writer.send(.audioFrame, bytes: payload)
                             }
                         }
                     }
@@ -371,9 +375,7 @@ final class VideoSurface {
         }
         let pts = CMTime(value: packet.ptsUs, timescale: 1_000_000)
         syncClockIfNeeded(to: pts)
-        if audioRenderer.isReadyForMoreMediaData {
-            audioRenderer.enqueue(sample)
-        }
+        audioRenderer.enqueue(sample)
     }
 
     private func syncClockIfNeeded(to pts: CMTime) {
@@ -382,7 +384,7 @@ final class VideoSurface {
             return
         }
         let drift = abs((synchronizer.currentTime() - pts).seconds)
-        if drift > 0.25 {
+        if drift > 0.6 {
             synchronizer.setRate(1.0, time: pts)
         }
     }

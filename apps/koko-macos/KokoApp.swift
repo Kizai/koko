@@ -230,6 +230,7 @@ private struct ConnectionView: View {
         .task {
             await connection.prepareIdentity(for: .host)
             await connection.prepareIdentity(for: .controller)
+            await connection.scanLAN()
         }
         .onChange(of: connection.session) { session in
             if session != nil { openWindow(id: "remote") }
@@ -591,7 +592,7 @@ private struct ConnectionView: View {
                             HStack(spacing: 8) {
                                 TextField("输入设备验证码", text: $inlineDeviceCode)
                                     .textFieldStyle(.roundedBorder)
-                                    .frame(width: 170)
+                                    .frame(width: 155)
                                     .onSubmit {
                                         Task { await connection.openSavedDevice(host, code: inlineDeviceCode, viewOnly: false) }
                                     }
@@ -600,6 +601,9 @@ private struct ConnectionView: View {
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .disabled(inlineDeviceCode.trimmingCharacters(in: .whitespaces).isEmpty)
+                                Button("请求确认") {
+                                    Task { await connection.openSavedDevice(host, quiet: false, viewOnly: false) }
+                                }
                             }
                             .padding(10)
                             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 9))
