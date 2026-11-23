@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let identity = load_or_create_identity(Path::new(file))?;
             pairing::serve(identity, ([0, 0, 0, 0], 4444).into(), None).await?;
         }
-        _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port] | screen-permission <check|request>".into()),
+        _ => return Err("usage: koko-daemon --version | identity <key-file> | serve <key-file> <bind-ip:port> <allowed-peer-id> | serve-pair <key-file> [bind-ip:port [--app-desktop [name]]] | screen-permission <check|request> | input-permission <check|request>".into()),
     }
     Ok(())
 }

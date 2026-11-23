@@ -1,4 +1,4 @@
-//! Screen capture for Koko hosts.
+//! macOS screen-recording permission checks for Koko hosts. Capture itself runs in the Swift app.
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]

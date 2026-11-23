@@ -63,11 +63,11 @@ KoKo 让你在另一台 Mac 上查看和操作已授权的桌面。被控端决�
 
 | 层次 | 实现 |
 | --- | --- |
-| 协议和传输 | Rust 的 `koko-proto` 定义消息，`koko-p2p` 使用 iroh / QUIC 完成设备发现、身份认证与传输 |
+| 协议和传输 | Rust 的 `koko-proto` 定义消息，`koko-p2p` 使用 iroh / QUIC 完成身份认证与传输，并用 mDNS 发现局域网设备 |
 | 会话和命令行 | Rust 的 `koko-daemon` 负责被控端会话与授权，`koko-agent` 提供控制端 CLI 并收发画面和输入 |
 | macOS 原生层 | Swift / SwiftUI 负责窗口和权限流程，调用 ScreenCaptureKit 采集、VideoToolbox 编码、AVFoundation 显示和 Core Graphics 投递键鼠 |
 
-低内存和低延迟是项目目标。性能评估以整条链路为单位，包括控制端辅助进程、编解码和帧缓冲。[当前实现与架构规划](./docs/architecture.md#当前实现与性能边界)
+低内存和低延迟是项目目标。性能评估以整条链路为单位，包括控制端辅助进程、编解码和帧缓冲。[当前实现与架构规划](./docs/architecture.md#性能边界)
 
 ## 命令行与 Agent
 

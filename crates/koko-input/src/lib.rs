@@ -1,1 +1,1 @@
-//! Keyboard and mouse input handling for Koko hosts.
+//! Reserved for cross-platform keyboard and mouse input. macOS input is posted by the Swift app.

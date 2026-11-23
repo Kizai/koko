@@ -1,4 +1,4 @@
-//! Shared protocol types and permission definitions for Koko.
+//! Shared protocol types, request validation and size limits for Koko.
 
 use serde::{Deserialize, Serialize};
 
