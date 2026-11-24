@@ -275,6 +275,18 @@ struct DesktopRegression {
             throw Failure("收到的图片应同时以文件和图片形式粘贴")
         }
 
+        // Copied items wait in a cache, not the download folder, and expire after a day.
+        guard !image.paths[0].hasPrefix(defaultDownloadDirectory),
+              image.paths[0].hasPrefix(clipboardCacheRoot().path) else { throw Failure("剪贴板图片不应保存到下载文件夹") }
+        let cache = folder.appendingPathComponent("cache", isDirectory: true)
+        let stale = try makeClipboardFolder(root: cache)
+        try FileManager.default.setAttributes([.creationDate: Date(timeIntervalSinceNow: -clipboardCacheLifetime - 60)],
+                                              ofItemAtPath: stale.path)
+        let recent = try makeClipboardFolder(root: cache)
+        _ = try makeClipboardFolder(root: cache)
+        guard !FileManager.default.fileExists(atPath: stale.path), FileManager.default.fileExists(atPath: recent.path)
+        else { throw Failure("剪贴板缓存应只清理超过一天的内容") }
+
         board.clearContents()
         do {
             _ = try ClipboardItems.read(from: board)

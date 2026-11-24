@@ -1945,7 +1945,7 @@ final class LocalConnection: ObservableObject {
 
     private func receiveOffer(_ offer: OutboxOfferInfo, session: PairedHost) async {
         let folder: URL
-        do { folder = try makeClipboardFolder() } catch {
+        do { folder = try makeReceiveFolder() } catch {
             clipboardNotice = remoteError(ClipboardError.from(error).rawValue)
             return
         }

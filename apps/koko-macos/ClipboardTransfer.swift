@@ -47,11 +47,7 @@ struct ClipboardItems: Codable, Equatable {
         // A screenshot taken to the clipboard or an image copied from a browser has no file, so it
         // is saved as one and sent like a copied file.
         if let png = pngData(from: board) {
-            let folder = FileManager.default.temporaryDirectory
-                .appendingPathComponent("KoKo-Clipboard", isDirectory: true)
-                .appendingPathComponent(UUID().uuidString, isDirectory: true)
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
+            let folder = try makeClipboardFolder()
             let stamp = DateFormatter()
             stamp.dateFormat = "yyyy-MM-dd HH.mm.ss"
             let file = folder.appendingPathComponent("图片 \(stamp.string(from: Date())).png")
@@ -100,8 +96,38 @@ struct ClipboardItems: Codable, Equatable {
     }
 }
 
-/// A new private folder under the chosen download location for one received transfer.
-func makeClipboardFolder() throws -> URL {
+/// Where copied and pasted items wait to be pasted. Like the system clipboard they are temporary:
+/// pasting into Finder copies them out, so they stay out of the download folder.
+func clipboardCacheRoot() -> URL {
+    let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        ?? FileManager.default.temporaryDirectory
+    return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "KoKo", isDirectory: true)
+        .appendingPathComponent("Clipboard", isDirectory: true)
+}
+
+/// How long copied items stay in the cache after they arrived.
+let clipboardCacheLifetime: TimeInterval = 24 * 60 * 60
+
+/// A new private folder in the clipboard cache for one copy or paste. Folders older than
+/// `clipboardCacheLifetime` are removed first; the newest ones are what the clipboard points to.
+func makeClipboardFolder(root: URL = clipboardCacheRoot(), now: Date = Date()) throws -> URL {
+    pruneClipboardCache(root: root, now: now)
+    let folder = root.appendingPathComponent("KoKo-" + UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    return folder
+}
+
+func pruneClipboardCache(root: URL = clipboardCacheRoot(), now: Date = Date()) {
+    let manager = FileManager.default
+    guard let folders = try? manager.contentsOfDirectory(at: root, includingPropertiesForKeys: [.creationDateKey]) else { return }
+    for folder in folders where folder.lastPathComponent.hasPrefix("KoKo-") {
+        let created = (try? folder.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+        if now.timeIntervalSince(created) > clipboardCacheLifetime { try? manager.removeItem(at: folder) }
+    }
+}
+
+/// A new private folder under the chosen download location for files the host sends on purpose.
+func makeReceiveFolder() throws -> URL {
     let root = UserDefaults.standard.string(forKey: "downloadDirectory") ?? defaultDownloadDirectory
     let folder = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("KoKo-" + UUID().uuidString, isDirectory: true)
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
