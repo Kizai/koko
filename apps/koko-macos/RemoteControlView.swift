@@ -367,6 +367,8 @@ struct RemoteControlView: View {
                                 }
                             }
                         }
+                        Divider()
+                        Button("切换输入法（⌃空格 / Caps Lock）") { connection.switchRemoteInputSource() }
                     }
                     .fixedSize()
                     .disabled(connection.isViewOnly)
@@ -475,6 +477,8 @@ private final class CanvasView: NSView {
     private var pressed = Set<RemoteMouseButton>()
     private var pressedKeys = Set<UInt16>()
     private var tracking: NSTrackingArea?
+    private var keyUpMonitor: Any?
+    private var lastCapsLock: TimeInterval = 0
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -514,8 +518,27 @@ private final class CanvasView: NSView {
         needsLayout = true
     }
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil, let keyUpMonitor {
+            NSEvent.removeMonitor(keyUpMonitor)
+            self.keyUpMonitor = nil
+        }
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if window != nil, keyUpMonitor == nil {
+            // AppKit never delivers the key-up of a Command shortcut to the view, which left the
+            // remote key held down; a local monitor still sees it.
+            keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
+                if let self, event.window === self.window, self.window?.firstResponder === self,
+                   event.modifierFlags.contains(.command) {
+                    _ = self.forwardKey(event, down: false)
+                }
+                return event
+            }
+        }
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
         if let window {
             window.acceptsMouseMovedEvents = true
@@ -543,6 +566,45 @@ private final class CanvasView: NSView {
 
     override func keyUp(with event: NSEvent) {
         if !forwardKey(event, down: false) { super.keyUp(with: event) }
+    }
+
+    /// Device-dependent bits of `NSEvent.modifierFlags`, so releasing one Shift while the other is
+    /// still held is seen as a release.
+    private static let modifierMasks: [UInt16: UInt] = [
+        56: 0x02, 60: 0x04, // left, right Shift
+        59: 0x01, 62: 0x2000, // left, right Control
+        58: 0x20, 61: 0x40, // left, right Option
+        55: 0x08, 54: 0x10, // left, right Command
+    ]
+
+    override func flagsChanged(with event: NSEvent) {
+        guard acceptsKeyboard, let displayID else { return super.flagsChanged(with: event) }
+        let code = event.keyCode
+        let flags = UInt8(truncatingIfNeeded: event.modifierFlags.rawValue >> 16) & 0xbe
+        if code == 57 {
+            // Caps Lock switches the input source on the remote Mac, as it does on a Chinese Mac by
+            // default. Some setups report a press twice, so a second report right after is ignored.
+            guard event.timestamp - lastCapsLock > 0.3 else { return }
+            lastCapsLock = event.timestamp
+            onPointer?(.init(kind: .keyDown, code: code, flags: flags, repeat: false), displayID)
+            onPointer?(.init(kind: .keyUp, code: code, flags: flags), displayID)
+            return
+        }
+        guard let mask = Self.modifierMasks[code] else { return super.flagsChanged(with: event) }
+        let down = event.modifierFlags.rawValue & mask != 0
+        if down {
+            guard pressedKeys.insert(code).inserted else { return }
+        } else {
+            guard pressedKeys.remove(code) != nil else { return }
+            if !event.modifierFlags.contains(.command) {
+                // Key-ups lost while Command was down are sent now, before Command itself is released.
+                for key in pressedKeys where Self.modifierMasks[key] == nil {
+                    pressedKeys.remove(key)
+                    onPointer?(.init(kind: .keyUp, code: key, flags: flags), displayID)
+                }
+            }
+        }
+        onPointer?(.init(kind: down ? .keyDown : .keyUp, code: code, flags: flags, repeat: down ? false : nil), displayID)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {

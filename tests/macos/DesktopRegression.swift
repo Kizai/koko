@@ -69,6 +69,12 @@ struct DesktopRegression {
         guard hosts.map(\.id) == ["a"] else { throw Failure("单次扫描漏报不应立即显示离线") }
         hosts = LocalConnection.mergeScan([], previous: hosts, lastSeen: &seen, now: start + LocalConnection.offlineAfter)
         guard hosts.isEmpty, seen.isEmpty else { throw Failure("长时间未响应的设备应显示离线") }
+        // Background scans answer in any order; the list must not reshuffle.
+        let air = NearbyHost(id: "b", label: "Air", request: "", os: "macos")
+        hosts = LocalConnection.mergeScan([mac, air], previous: [], lastSeen: &seen, now: start)
+        hosts = LocalConnection.mergeScan([air, mac], previous: hosts, lastSeen: &seen, now: start + .seconds(8))
+        guard hosts.map(\.id) == ["a", "b"] else { throw Failure("重新扫描不应打乱设备顺序") }
+        seen.removeAll()
 
         // A 60 Hz display delivers frames about 16.7 ms apart with jitter; none may be lost.
         var pacer = FramePacer(fps: 60)
@@ -201,6 +207,23 @@ struct DesktopRegression {
 
         try ClipboardItems(text: "你好 KoKo").publish(on: board)
         guard try ClipboardItems.read(from: board) == ClipboardItems(text: "你好 KoKo") else { throw Failure("文字应原样往返") }
+
+        // An image without a file (a screenshot to the clipboard) travels as a PNG file and
+        // arrives as both the file and the picture.
+        let pixel = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2, bitsPerSample: 8,
+                                     samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        board.clearContents()
+        board.setData(pixel.tiffRepresentation!, forType: .tiff)
+        let image = try ClipboardItems.read(from: board)
+        guard image.text == nil, image.paths.count == 1, image.paths[0].hasSuffix(".png") else {
+            throw Failure("剪贴板图片应保存为 PNG 文件再传输")
+        }
+        defer { try? FileManager.default.removeItem(at: URL(fileURLWithPath: image.paths[0]).deletingLastPathComponent()) }
+        try image.publish(on: board)
+        guard board.types?.contains(.fileURL) == true, board.data(forType: .png) != nil else {
+            throw Failure("收到的图片应同时以文件和图片形式粘贴")
+        }
 
         board.clearContents()
         do {

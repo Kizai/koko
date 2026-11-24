@@ -113,7 +113,9 @@ final class LowDelayAACEncoder {
         )
         if let eld = AVAudioFormat(streamDescription: &eldDesc),
            let conv = AVAudioConverter(from: pcm, to: eld) {
-            conv.bitRate = 128_000
+            // The highest rate up to 192 kbps the encoder offers; 128 kbps dulled music.
+            let rates = conv.applicableEncodeBitRates?.map(\.intValue) ?? []
+            conv.bitRate = rates.filter { $0 <= 192_000 }.max() ?? 128_000
             self.aacFormat = eld
             self.converter = conv
             self.framesPerPacket = 480

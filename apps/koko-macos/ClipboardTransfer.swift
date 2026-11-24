@@ -37,19 +37,65 @@ struct ClipboardItems: Codable, Equatable {
             guard !urls.isEmpty else { throw ClipboardError.unsupported }
             return ClipboardItems(paths: urls.map(\.path))
         }
-        if let string = board.string(forType: .string), !string.isEmpty, string.utf8.count <= maxClipboardText,
-           !string.contains("\0") {
-            return ClipboardItems(text: string)
+        let text = board.string(forType: .string).flatMap { string in
+            !string.isEmpty && string.utf8.count <= maxClipboardText && !string.contains("\0") ? string : nil
         }
+        // "Copy Image" in a browser adds the image's address as text; the picture is what was meant.
+        if let text, !(text.hasPrefix("http") && !text.contains(where: \.isWhitespace)) {
+            return ClipboardItems(text: text)
+        }
+        // A screenshot taken to the clipboard or an image copied from a browser has no file, so it
+        // is saved as one and sent like a copied file.
+        if let png = pngData(from: board) {
+            let folder = FileManager.default.temporaryDirectory
+                .appendingPathComponent("KoKo-Clipboard", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let stamp = DateFormatter()
+            stamp.dateFormat = "yyyy-MM-dd HH.mm.ss"
+            let file = folder.appendingPathComponent("图片 \(stamp.string(from: Date())).png")
+            try png.write(to: file)
+            return ClipboardItems(paths: [file.path])
+        }
+        if let text { return ClipboardItems(text: text) }
         throw ClipboardError.unsupported
+    }
+
+    @MainActor
+    private static func pngData(from board: NSPasteboard) -> Data? {
+        if let png = board.data(forType: .png) { return png }
+        guard let tiff = board.data(forType: .tiff) else { return nil }
+        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+    }
+
+    /// Image types published next to a received image file, so it pastes as a picture in editors
+    /// and chats while Finder still pastes the file.
+    private static func imageRepresentations(of path: String) -> [(NSPasteboard.PasteboardType, Data)] {
+        let url = URL(fileURLWithPath: path)
+        guard ["png", "jpg", "jpeg", "heic", "tif", "tiff", "gif", "bmp", "webp"].contains(url.pathExtension.lowercased()),
+              let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 64 * 1024 * 1024,
+              let data = try? Data(contentsOf: url), let image = NSBitmapImageRep(data: data)
+        else { return [] }
+        let png = url.pathExtension.lowercased() == "png" ? data : image.representation(using: .png, properties: [:])
+        return [png.map { (.png, $0) }, image.tiffRepresentation.map { (.tiff, $0) }].compactMap { $0 }
     }
 
     /// Replaces the pasteboard with the received text or files.
     @MainActor
     func publish(on board: NSPasteboard) throws {
         board.clearContents()
-        let published = if let text { board.setString(text, forType: .string) }
-            else { board.writeObjects(paths.map { URL(fileURLWithPath: $0) as NSURL }) }
+        let published: Bool
+        if let text {
+            published = board.setString(text, forType: .string)
+        } else if paths.count == 1, case let images = Self.imageRepresentations(of: paths[0]), !images.isEmpty {
+            let item = NSPasteboardItem()
+            item.setString(URL(fileURLWithPath: paths[0]).absoluteString, forType: .fileURL)
+            for (type, data) in images { item.setData(data, forType: type) }
+            published = board.writeObjects([item])
+        } else {
+            published = board.writeObjects(paths.map { URL(fileURLWithPath: $0) as NSURL })
+        }
         guard published else { throw ClipboardError.failed }
     }
 }

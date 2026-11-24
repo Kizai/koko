@@ -348,8 +348,14 @@ private struct ConnectionView: View {
                 Button {
                     Task { await connection.scanLAN() }
                 } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption)
+                    // The spinner takes the button's place so the list below never moves.
+                    if connection.isScanning {
+                        ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption)
+                            .frame(width: 14, height: 14)
+                    }
                 }
                 .buttonStyle(.borderless)
                 .disabled(connection.isScanning || connection.isChecking)
@@ -358,9 +364,6 @@ private struct ConnectionView: View {
             }
 
             if devicesExpanded {
-                if connection.isScanning {
-                    ProgressView("正在搜索…").controlSize(.small)
-                }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(connection.nearbyHosts) { host in
@@ -555,10 +558,14 @@ private struct ConnectionView: View {
             VStack(spacing: 0) {
                 ZStack {
                     if let cover = connection.deviceCovers[host.id] {
-                        Image(nsImage: cover)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        // The image fills a fixed-size view instead of sizing the stack itself; a
+                        // filled image is larger than the card and pushed "进入桌面" out of view.
+                        Color.clear
+                            .overlay {
+                                Image(nsImage: cover)
+                                    .resizable()
+                                    .scaledToFill()
+                            }
                             .clipped()
                             .saturation(host.isOnline ? 1 : 0.25)
                             .opacity(host.isOnline ? 1 : 0.65)

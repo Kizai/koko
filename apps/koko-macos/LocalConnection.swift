@@ -492,6 +492,7 @@ final class LocalConnection: ObservableObject {
     private let pairRequestPanel = PairRequestPanel()
     private var detectedUpgradePermissionLoss = false
     @Published private(set) var isScanning = false
+    private var scanInFlight = false
     @Published private var discoveredHosts: [NearbyHost] = []
     /// When each nearby host last answered a LAN scan. A host stays online for one missed scan,
     /// because mDNS answers are sometimes lost, and goes offline after `offlineAfter`.
@@ -1361,15 +1362,21 @@ final class LocalConnection: ObservableObject {
 
     /// `quiet` scans run in the background and never replace the notice under the connect form.
     func scanLAN(quiet: Bool = false) async {
-        guard !isScanning else { return }
-        isScanning = true
-        defer { isScanning = false }
+        guard !scanInFlight else { return }
+        scanInFlight = true
+        // Background scans stay invisible; only a scan the user asked for shows progress.
+        if !quiet { isScanning = true }
+        defer {
+            scanInFlight = false
+            isScanning = false
+        }
         do {
             let command = try LocalCommand(.controller, arguments: ["discover"])
             let result = try await command.result()
             let found = try JSONDecoder().decode([NearbyHost].self, from: Data(result.utf8))
                 .filter { $0.id != hostID }
-            discoveredHosts = Self.mergeScan(found, previous: discoveredHosts, lastSeen: &lastSeen, now: .now)
+            let merged = Self.mergeScan(found, previous: discoveredHosts, lastSeen: &lastSeen, now: .now)
+            if merged != discoveredHosts { discoveredHosts = merged }
             if !quiet {
                 controllerNotice = nearbyHosts.isEmpty
                     ? ConnectionNotice(message: "未发现可连接的 Koko 设备。") : nil
@@ -1385,13 +1392,16 @@ final class LocalConnection: ObservableObject {
         lastSeen: inout [String: ContinuousClock.Instant], now: ContinuousClock.Instant
     ) -> [NearbyHost] {
         for host in found { lastSeen[host.id] = now }
-        let foundIDs = Set(found.map(\.id))
-        let kept = previous.filter { host in
-            guard !foundIDs.contains(host.id), let seen = lastSeen[host.id] else { return false }
-            return now - seen < offlineAfter
+        let fresh = Dictionary(found.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        // Hosts keep their place in the list; one missing from this scan stays until `offlineAfter`.
+        let kept = previous.compactMap { host -> NearbyHost? in
+            if let update = fresh[host.id] { return update }
+            guard let seen = lastSeen[host.id], now - seen < offlineAfter else { return nil }
+            return host
         }
+        let keptIDs = Set(kept.map(\.id))
         lastSeen = lastSeen.filter { now - $0.value < offlineAfter }
-        return found + kept
+        return kept + found.filter { !keptIDs.contains($0.id) }
     }
 
     /// A host that could not be reached is shown offline at once instead of at the next scan.
@@ -1682,6 +1692,14 @@ final class LocalConnection: ObservableObject {
 
     func setViewportEdge(_ edge: Int) {
         viewportEdge = edge
+    }
+
+    /// Control-Space never reaches KoKo because this Mac switches its own input source, so the menu
+    /// sends Caps Lock, which the remote Mac answers with its own input-source shortcut.
+    func switchRemoteInputSource() {
+        guard let display = frameDisplayID else { return }
+        queuePointer(.init(kind: .keyDown, code: 57, flags: 0, repeat: false), display: display)
+        queuePointer(.init(kind: .keyUp, code: 57, flags: 0), display: display)
     }
 
     func queuePointer(_ event: RemotePointerEvent, display: UInt32) {

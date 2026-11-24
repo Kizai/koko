@@ -203,7 +203,11 @@ final class VideoEncoder {
         )
         guard status == noErr, let session else { return nil }
 
-        let avgBitrate = max(1_500_000, min(65_000_000, width * height * fps * quality / 900))
+        // Screen text needs far more bits than camera video: about 50 Mbps for 2560 × 1600 at
+        // 60 fps and quality 82, more for 4:4:4, which a gigabit LAN carries easily. A slow link
+        // asks for a lower quality and size, which lowers this too.
+        let chroma = pixelFormat == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ? 13 : 10
+        let avgBitrate = max(1_500_000, min(150_000_000, width * height * fps * quality / 400 * chroma / 10))
         let peakBytesPerSec = Int(Double(avgBitrate) / 8.0 * 2.5)
         let properties: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
