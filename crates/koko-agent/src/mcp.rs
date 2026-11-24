@@ -131,6 +131,13 @@ impl Failure {
                 "declined",
                 "The host owner declined the request, or did not answer in time.",
             )
+        } else if error.contains("pair_version_mismatch")
+            || error.contains("invalid pairing request")
+        {
+            Self::new(
+                "version_mismatch",
+                "The host runs a different KoKo version. Ask the user to update KoKo on both devices.",
+            )
         } else if error.contains("too_many_attempts") {
             Self::new(
                 "locked",

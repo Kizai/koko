@@ -493,6 +493,11 @@ final class LocalConnection: ObservableObject {
     private var detectedUpgradePermissionLoss = false
     @Published private(set) var isScanning = false
     @Published private var discoveredHosts: [NearbyHost] = []
+    /// When each nearby host last answered a LAN scan. A host stays online for one missed scan,
+    /// because mDNS answers are sometimes lost, and goes offline after `offlineAfter`.
+    private var lastSeen: [String: ContinuousClock.Instant] = [:]
+    nonisolated static let scanInterval: Duration = .seconds(8)
+    nonisolated static let offlineAfter: Duration = .seconds(20)
     @Published private(set) var rememberedDevices: [DeviceRecord] = DeviceHistoryStore.loadRecords()
     @Published private(set) var deviceCovers: [String: NSImage] = {
         let records = DeviceHistoryStore.loadRecords()
@@ -1286,12 +1291,15 @@ final class LocalConnection: ObservableObject {
                 controllerNotice = ConnectionNotice(message: "请输入该设备的验证码以完成连接。", isError: true)
             } else if message.contains("too_many_attempts") {
                 controllerNotice = ConnectionNotice(message: "验证码错误次数过多，对方已暂时停止校验验证码，请稍后再试或请对方确认连接。", isError: true)
+            } else if message.contains("pair_version_mismatch") || message.contains("invalid pairing request") {
+                controllerNotice = ConnectionNotice(message: "对方的 KoKo 版本与本机不一致，请把两台设备都更新到同一版本后再连接。", isError: true)
             } else if message.contains("invalid pairing code") {
                 if let id = selectedNearbyHostID {
                     codePromptHostID = id
                 }
                 controllerNotice = ConnectionNotice(message: "验证码不正确，请核对后重试。", isError: true)
             } else if message.contains("Koko device not found") || message.contains("Koko host not found") {
+                if let id = selectedNearbyHostID { markUnreachable(id) }
                 controllerNotice = ConnectionNotice(message: "未找到该设备。请确认双方在同一局域网且对方已开启远程协助，或改用直连邀请。", isError: true)
             } else if message.contains("direct invite") {
                 controllerNotice = ConnectionNotice(message: "直连邀请格式无效，请在被控端重新复制。", isError: true)
@@ -1340,20 +1348,56 @@ final class LocalConnection: ObservableObject {
         }
     }
 
-    func scanLAN() async {
+    /// Scans now, then keeps scanning while the caller's task runs, so a host that quits or
+    /// turns off sharing shows as offline within `offlineAfter`.
+    func keepScanning() async {
+        await scanLAN()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: Self.scanInterval)
+            guard !Task.isCancelled else { return }
+            await scanLAN(quiet: true)
+        }
+    }
+
+    /// `quiet` scans run in the background and never replace the notice under the connect form.
+    func scanLAN(quiet: Bool = false) async {
         guard !isScanning else { return }
         isScanning = true
         defer { isScanning = false }
         do {
             let command = try LocalCommand(.controller, arguments: ["discover"])
             let result = try await command.result()
-            discoveredHosts = try JSONDecoder().decode([NearbyHost].self, from: Data(result.utf8))
+            let found = try JSONDecoder().decode([NearbyHost].self, from: Data(result.utf8))
                 .filter { $0.id != hostID }
-            controllerNotice = nearbyHosts.isEmpty
-                ? ConnectionNotice(message: "未发现可连接的 Koko 设备。") : nil
+            discoveredHosts = Self.mergeScan(found, previous: discoveredHosts, lastSeen: &lastSeen, now: .now)
+            if !quiet {
+                controllerNotice = nearbyHosts.isEmpty
+                    ? ConnectionNotice(message: "未发现可连接的 Koko 设备。") : nil
+            }
         } catch {
-            controllerNotice = ConnectionNotice(message: error.localizedDescription, isError: true)
+            if !quiet { controllerNotice = ConnectionNotice(message: error.localizedDescription, isError: true) }
         }
+    }
+
+    /// Hosts found now, plus hosts missing from this scan that answered within `offlineAfter`.
+    nonisolated static func mergeScan(
+        _ found: [NearbyHost], previous: [NearbyHost],
+        lastSeen: inout [String: ContinuousClock.Instant], now: ContinuousClock.Instant
+    ) -> [NearbyHost] {
+        for host in found { lastSeen[host.id] = now }
+        let foundIDs = Set(found.map(\.id))
+        let kept = previous.filter { host in
+            guard !foundIDs.contains(host.id), let seen = lastSeen[host.id] else { return false }
+            return now - seen < offlineAfter
+        }
+        lastSeen = lastSeen.filter { now - $0.value < offlineAfter }
+        return found + kept
+    }
+
+    /// A host that could not be reached is shown offline at once instead of at the next scan.
+    private func markUnreachable(_ id: String) {
+        discoveredHosts.removeAll { $0.id == id }
+        lastSeen[id] = nil
     }
 
     func watchRemoteScreen() async {

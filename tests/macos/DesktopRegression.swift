@@ -60,6 +60,16 @@ struct DesktopRegression {
         latency.observe(151)
         guard latency.constrained else { throw Failure("持续高延迟时应降低自动画质") }
 
+        // A host missing from one LAN scan stays online; one silent for longer goes offline.
+        let start = ContinuousClock.now
+        var seen: [String: ContinuousClock.Instant] = [:]
+        let mac = NearbyHost(id: "a", label: "Mac", request: "", os: "macos")
+        var hosts = LocalConnection.mergeScan([mac], previous: [], lastSeen: &seen, now: start)
+        hosts = LocalConnection.mergeScan([], previous: hosts, lastSeen: &seen, now: start + .seconds(8))
+        guard hosts.map(\.id) == ["a"] else { throw Failure("单次扫描漏报不应立即显示离线") }
+        hosts = LocalConnection.mergeScan([], previous: hosts, lastSeen: &seen, now: start + LocalConnection.offlineAfter)
+        guard hosts.isEmpty, seen.isEmpty else { throw Failure("长时间未响应的设备应显示离线") }
+
         // A 60 Hz display delivers frames about 16.7 ms apart with jitter; none may be lost.
         var pacer = FramePacer(fps: 60)
         let jittered = (0..<60).map { Double($0) / 60 + ($0.isMultiple(of: 2) ? 0.0015 : -0.0015) }

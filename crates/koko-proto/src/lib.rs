@@ -80,6 +80,9 @@ pub struct PairHello {
 
 /// The close reason for a quiet pairing request that needs a verification code.
 pub const PAIR_CODE_REQUIRED: &str = "code_required";
+/// The close reason when the controller speaks another pairing version, so the app can ask
+/// for both sides to be updated instead of showing a generic error.
+pub const PAIR_VERSION_MISMATCH: &str = "pair_version_mismatch";
 /// The close reason when a host stops checking codes for a while after too many wrong ones.
 pub const PAIR_LOCKED: &str = "too_many_attempts";
 

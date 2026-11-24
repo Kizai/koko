@@ -232,7 +232,7 @@ private struct ConnectionView: View {
         .task {
             await connection.prepareIdentity(for: .host)
             await connection.prepareIdentity(for: .controller)
-            await connection.scanLAN()
+            await connection.keepScanning()
         }
         .onChange(of: connection.session) { session in
             if session != nil { openWindow(id: "remote") }

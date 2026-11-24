@@ -17,8 +17,8 @@ use koko_p2p::{
 };
 use koko_proto::{
     ALPN, CONTROL_READY, CONTROL_REQUEST, HumanResult, MAX_HELP_REASON, MAX_PAIR_REQUEST,
-    PAIR_ALPN, PAIR_CODE_REQUIRED, PAIR_LOCKED, PAIR_VERSION, PairGranted, PairHello, PeerKind,
-    REMOTE_ALPN, Scope,
+    PAIR_ALPN, PAIR_CODE_REQUIRED, PAIR_LOCKED, PAIR_VERSION, PAIR_VERSION_MISMATCH, PairGranted,
+    PairHello, PeerKind, REMOTE_ALPN, Scope,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -207,13 +207,18 @@ impl ProtocolHandler for Pairing {
             .await
             .map_err(AcceptError::from_err)?;
         let (by_code, quiet, agent, human_name, versioned) = if bytes.first() == Some(&b'{') {
-            let Some(hello) = serde_json::from_slice::<PairHello>(&bytes)
-                .ok()
-                .filter(PairHello::valid)
-            else {
+            let Some(hello) = serde_json::from_slice::<PairHello>(&bytes).ok() else {
                 connection.close(1u32.into(), b"invalid pairing request");
                 return Ok(());
             };
+            if hello.v != PAIR_VERSION {
+                connection.close(1u32.into(), PAIR_VERSION_MISMATCH.as_bytes());
+                return Ok(());
+            }
+            if !hello.valid() {
+                connection.close(1u32.into(), b"invalid pairing request");
+                return Ok(());
+            }
             let by_code = match hello.proof.as_deref() {
                 None => false,
                 Some(proof) => match self.check(proof, connection.remote_id()) {

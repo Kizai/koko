@@ -217,22 +217,67 @@ struct KokoSettingsView: View {
     }
 
     private var aboutView: some View {
-        VStack(spacing: 14) {
-            HStack(spacing: 12) {
-                if let icon = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName) {
-                    Image(nsImage: icon)
-                        .resizable()
-                        .frame(width: 44, height: 44)
-                }
-                Text("KoKo")
-                    .font(.system(size: 26, weight: .semibold))
+        VStack(spacing: 0) {
+            Spacer(minLength: 24)
+            if let icon = NSApp?.applicationIconImage ?? NSImage(named: NSImage.applicationIconName) {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 128, height: 128)
+                    .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
             }
-            Text(updates.installedVersion.map { "V\($0)" } ?? "—")
-                .font(.title3.weight(.medium))
+            Text("KoKo")
+                .font(.system(size: 40, weight: .bold, design: .rounded))
+                .padding(.top, 14)
+            Text("安全、低延迟的远程协助，也让 AI Agent 帮你操作 Mac")
+                .font(.callout)
                 .foregroundStyle(.secondary)
-            Link("https://github.com/Kizai/koko", destination: URL(string: "https://github.com/Kizai/koko")!)
-                .font(.body)
+                .multilineTextAlignment(.center)
+                .padding(.top, 4)
+
+            HStack(spacing: 10) {
+                Text(updates.installedVersion.map { "版本 \($0)" } ?? "版本 —")
+                    .font(.callout.weight(.medium).monospacedDigit())
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 5)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                Button("检查更新") { Task { await updates.check(manual: true) } }
+                    .controlSize(.regular)
+                    .disabled(updates.state == .checking)
+            }
+            .padding(.top, 20)
+
+            HStack(spacing: 12) {
+                aboutLink("GitHub", systemImage: "chevron.left.forwardslash.chevron.right",
+                          url: "https://github.com/Kizai/koko")
+                aboutLink("问题反馈", systemImage: "exclamationmark.bubble",
+                          url: "https://github.com/Kizai/koko/issues")
+                aboutLink("版本记录", systemImage: "clock.arrow.circlepath",
+                          url: "https://github.com/Kizai/koko/releases")
+            }
+            .padding(.top, 28)
+
+            Spacer(minLength: 24)
+            Text("基于 GPL-3.0 许可开源 · © 2026 Kizai")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .padding(.bottom, 18)
         }
+        .padding(.horizontal, 32)
+    }
+
+    private func aboutLink(_ title: String, systemImage: String, url: String) -> some View {
+        Link(destination: URL(string: url)!) {
+            Label(title, systemImage: systemImage)
+                .font(.callout.weight(.medium))
+                .frame(minWidth: 96)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+                .background(Color.secondary.opacity(0.10), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Color.accentColor)
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
