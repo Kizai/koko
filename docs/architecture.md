@@ -187,7 +187,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 | 层级 / 模块 | 推荐选型 | 核心理由 | 备选方案与取舍 |
 | :--- | :--- | :--- | :--- |
-| **P2P 传输与打洞 (`koko-p2p`)** | [iroh](https://github.com/n0-computer/iroh) | 纯 Rust 实现的 QUIC + NAT 穿透 + 中继回落；按公钥（`NodeId`）拨号，天然端到端加密；单条连接支持多路复用 Stream，完美同时承载视频流与 Agent RPC | WebRTC（适合浏览器直连，但信令复杂、DataChannel 承载结构化 RPC 较笨重，留待后续 Web 网关扩展） |
+| **P2P 传输与打洞 (`koko-p2p`)** | [iroh](https://github.com/n0-computer/iroh) | 纯 Rust 实现的 QUIC；按公钥（`NodeId`）拨号，天然端到端加密。KoKo 只使用其直连能力（`presets::Minimal`），不启用 NAT 穿透和中继，跨网络交给 Tailscale / ZeroTier 等组网；单条连接支持多路复用 Stream，完美同时承载视频流与 Agent RPC | WebRTC（适合浏览器直连，但信令复杂、DataChannel 承载结构化 RPC 较笨重，留待后续 Web 网关扩展） |
 | **MCP 协议层 (`koko-agent`)** | [rmcp](https://github.com/modelcontextprotocol/rust-sdk) | 官方 Rust MCP SDK，支持 `#[tool]` 宏与 stdio / HTTP 传输，直接将远端设备暴露为 Claude / OpenAI / 本地模型的标准工具节点 | 自研 JSON-RPC（维护成本高，生态兼容性差） |
 | **屏幕采集** | macOS 使用 [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) 和 [VideoToolbox](https://developer.apple.com/documentation/videotoolbox) | Koko.app 连续采集所选显示器。被控端通过当前用户私有的 Unix socket 将 H.264 送入已授权的 QUIC 视频流。控制端用 AVFoundation 显示。CLI 截图保持主屏 PNG | 其他平台可评估 [xcap](https://github.com/nashaofu/xcap)、[scap](https://github.com/CapSoftware/scap) 或原生方案 |
 | **键鼠注入** | macOS 测试包使用 [Core Graphics](https://developer.apple.com/documentation/coregraphics/cgevent) | 画面与鼠标使用独立连接，按显示器映射坐标，顺序传递按钮与拖拽事件 | 其他平台可评估 [enigo](https://github.com/enigo-rs/enigo)，Wayland 支持按实际输入后端验证 |
@@ -211,7 +211,7 @@ flowchart LR
         UI <--> P2P_L
     end
 
-    subgraph Network["P2P 加密通道 (Iroh QUIC / Relay Fallback)"]
+    subgraph Network["P2P 加密通道 (Iroh QUIC，仅直连)"]
         S1["0x01 Control & Arbiter"]
         S2["0x02 Media (Video/Audio)"]
         S3["0x03 Human/Agent Input"]
@@ -315,14 +315,14 @@ koko/
 
 ### 5.2 务实的四阶段里程碑
 
-> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占、人工求助、界面树与高危审批已实现；NAT 穿透与中继尚未实现。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
+> 实现状态：当前处于 Phase 1。人工远控已经先于 Agent 闭环落地，包括 Phase 2 中的连续视频和远程键鼠。MCP、Agent 键鼠、人工抢占、人工求助、界面树与高危审批已实现。KoKo 定位为零公网暴露的内网远控，不做 NAT 穿透和公网中继，跨网络使用 Tailscale / ZeroTier 等组网。逐项进度见 [Phase 1 实现计划](./implementation.md#实现顺序与验收)。
 
 | 阶段 | 核心目标 | 验收标准（可演示 Demo） |
 | :--- | :--- | :--- |
-| **Phase 1: Headless Agent Loop** | 跑通 `koko-proto` + `koko-p2p` + `koko-daemon` + `koko-agent` | Claude Desktop 通过本地 MCP 配置，跨越 NAT 穿透连接到家里电脑，完成截图与键鼠点击 |
+| **Phase 1: Headless Agent Loop** | 跑通 `koko-proto` + `koko-p2p` + `koko-daemon` + `koko-agent` | Claude Desktop 通过本地 MCP 配置，经局域网或 Tailscale / ZeroTier 组网连接到家里电脑，完成截图与键鼠点击 |
 | **Phase 2: Watch & Takeover** | 引入 `koko-client`（Tauri v2）与 `Media` 通道 + Arbiter 抢占 | 主人实时看到 AI 在远端电脑的操作画面，鼠标一动立即抢占接管，AI 自动暂停 |
 | **Phase 3: UI Tree & Policy** | 补齐三端 UI Accessibility Tree、高危审批卡片、硬件编解码优化 | AI 结合 UI 树与按需截图精准操控复杂应用；敏感操作触发客户端弹窗确认 |
-| **Phase 4: Mobile & Self-Host** | 移动端旁观/审批客户端（iOS/Android）与自建中继文档 | 手机随时看进度、点同意、或应急接管 |
+| **Phase 4: Mobile & Self-Host** | 移动端旁观/审批客户端（iOS/Android），以及公司内网、学校机房的批量部署与集中管理 | 手机随时看进度、点同意、或应急接管 |
 
 ## 6. 跨平台工程避坑清单
 

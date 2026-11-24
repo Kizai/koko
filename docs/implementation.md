@@ -2,7 +2,7 @@
 
 [返回文档目录](./README.md)
 
-首轮验收由两台已授权的 macOS 设备在同一局域网完成。控制端通过 macOS 测试应用发起一次截图请求并显示被控端主显示器的 PNG，CLI 以 JSON 返回相同请求的 Base64 PNG。双机截图验收通过后接入只读 MCP。跨公网直连和中继回落单独验收。
+首轮验收由两台已授权的 macOS 设备在同一局域网完成。控制端通过 macOS 测试应用发起一次截图请求并显示被控端主显示器的 PNG，CLI 以 JSON 返回相同请求的 Base64 PNG。双机截图验收通过后接入只读 MCP。跨网络场景使用 Tailscale / ZeroTier 等组网直连验收，KoKo 不做公网中继。
 
 [架构设计](./architecture.md)记录 Phase 1 的完整目标。本计划把目标拆成有独立验收结果的工作项。[开发规则](./development.md)适用于各工作项。
 
@@ -47,7 +47,7 @@ macOS 测试版通过 `koko/remote/1` 传递截图、视频、键鼠和剪贴板
 | 2. 真实截图 | 用 ScreenCaptureKit 抓主显示器，应用显示由 daemon 返回的 PNG。[macOS 权限设计](./macos-permissions.md) | 主机打开只含测试文字的窗口，控制端能看到文字和正确比例。未授权请求无法得到图像。结束会话或撤销系统录屏权限时，控制端收到可区分的错误。 | 已实现。应用内远控已改用连续 H.264 视频，`screenshot` 命令保留给 CLI。 |
 | 3. 双机局域网验收 | 在两台实际 Mac 上安装同一个 DMG，记录配对、连接和截图步骤。 | 局域网验收配置禁用中继和外部地址查询。授权成功、未授权拒绝、重启复用身份三种场景通过。记录 macOS 版本、直连状态和截图尺寸。 | 步骤见 [macOS 双机测试](./macos.md)，验收记录未纳入仓库。 |
 | 4. 只读 MCP | 双机截图验收后引入 `rmcp` stdio，先接 `koko_screenshot`，随后通过真实配对数据实现 `koko_list_devices`。 | MCP 客户端能发现并调用截图工具。工具返回图像，连接与授权仍走同一主机路径，诊断日志写到 stderr。[rmcp stdio 示例](https://github.com/modelcontextprotocol/rust-sdk/tree/main/examples/servers) | 已实现 M1：`koko-agent mcp` 提供 `koko_list_devices`、`koko_pair` 和 `koko_screenshot`，Agent 使用独立身份和 `observer` 作用域。自动化测试与本机端到端配对已通过，Claude Desktop 双机截图待实机验收。设计见 [Agent 与 MCP 设计规范](./agent.md)。 |
-| 5. 跨公网验收 | 在独立测试中启用所需的地址发现及中继，使用不同网络的授权设备。 | 验证可直连环境和需要中继的环境，记录当前连接路径。两种路径都保持同一对设备身份和截图权限。条件不足时记录哪条路径待验证。 | 未开始。组网环境可用直连邀请，前提是控制端能直接访问被控端的 UDP 端口。 |
+| 5. 组网验收 | 两台设备分处不同物理网络，通过 Tailscale 或 ZeroTier 组网后连接。KoKo 按设计不启用公网中继和外部地址发现。 | 用直连邀请或设备 ID 连接成功，记录组网类型与实测延迟、帧率。设备身份和授权与局域网一致。 | 未开始。组网环境可用直连邀请，前提是控制端能直接访问被控端的 UDP 端口。 |
 | 6. 键鼠与人工协作 | 在完成只读验收后，落实 `AgentSafe` 范围、主机侧租约与显式停止，再打开键鼠命令。定义 `koko_request_human` 的本地人工响应流程和结果语义。 | 在授权测试窗口验证输入。撤销租约后，旧租约的请求被主机拒绝。人工请求的允许、拒绝和未响应结果可区分。实时旁观与自动抢占按 Phase 2 验收。 | M2 已实现：`agent_safe` 作用域、被控端控制权仲裁与人工抢占、指示条和停止快捷键、审计日志，以及 `koko_mouse`、`koko_keyboard`、`koko_release_control`。自动化测试与本机端到端已通过，双机实机验收待完成。M3 已实现：`koko_request_human`、被控端求助卡片与附言、本机实体输入检测；检测效果需实机验证。设计见 [Agent 与 MCP 设计规范](./agent.md)。 |
 
 当前迭代优先验收人工远控。按 [macOS 双机测试](./macos.md) 检查窗口拖动、显示器唤醒、设备类型和双向剪贴板，完成后再扩展 Agent 能力。
