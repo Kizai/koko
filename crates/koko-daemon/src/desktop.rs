@@ -13,9 +13,9 @@ use koko_p2p::clipboard;
 use koko_proto::{
     APPROVAL_TIMEOUT, CLIPBOARD_ERROR, CLIPBOARD_MANIFEST, ClipboardManifest, HumanResult,
     MAX_REMOTE_REPLY, MAX_REMOTE_REQUEST, OUTBOX_WAIT, PeerKind, RemoteCommand, RemoteReply, Scope,
-    VIDEO_ERROR, valid_remote_command,
+    VIDEO_ERROR, feedback_length, valid_remote_command,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
@@ -314,6 +314,9 @@ impl RemoteHost {
                     continue;
                 }
                 Ok(command @ (RemoteCommand::Video { .. } | RemoteCommand::Audio)) => {
+                    // Frame acknowledgements arrive on the rest of the request stream.
+                    let feedback = matches!(command, RemoteCommand::Video { feedback: true, .. })
+                        .then_some((body, recv));
                     let auth = authorization.clone();
                     let conn = connection.clone();
                     let app = self.app_desktop.clone();
@@ -338,6 +341,7 @@ impl RemoteHost {
                                 #[cfg(unix)]
                                 slot,
                                 &mut send,
+                                feedback,
                             ) => {
                                 let _ = result;
                             }
@@ -518,6 +522,7 @@ impl RemoteHost {
         peer: EndpointId,
         slot: Arc<MediaSlot>,
         send: &mut SendStream,
+        feedback: Option<(Vec<u8>, RecvStream)>,
     ) -> Result<(), AcceptError> {
         if !valid_remote_command(&command) {
             return send_video_error(send, "invalid_command").await;
@@ -548,14 +553,24 @@ impl RemoteHost {
         {
             return send_video_error(send, &code).await;
         }
-        let (mut source, _) = tokio::time::timeout(Duration::from_secs(9), listener.accept())
+        let (source, _) = tokio::time::timeout(Duration::from_secs(9), listener.accept())
             .await
             .map_err(AcceptError::from_err)?
             .map_err(AcceptError::from_err)?;
+        let (mut frames, mut to_app) = source.into_split();
+        // The relay keeps the socket's write half even after the controller stops sending
+        // feedback, because closing it would tell the app to stop capturing.
+        let relay = async {
+            if let Some((body, recv)) = feedback {
+                relay_feedback(std::io::Cursor::new(body).chain(recv), &mut to_app).await;
+            }
+            std::future::pending::<()>().await
+        };
         tokio::select! {
-            copied = tokio::io::copy(&mut source, send) => {
+            copied = tokio::io::copy(&mut frames, send) => {
                 copied.map_err(AcceptError::from_err)?;
             }
+            () = relay => {}
             // Dropping the socket tells the app to stop capturing.
             () = turn.stop.notified() => {}
         }
@@ -568,6 +583,7 @@ impl RemoteHost {
         _app: Option<AppDesktop>,
         _peer: EndpointId,
         send: &mut SendStream,
+        _feedback: Option<(Vec<u8>, RecvStream)>,
     ) -> Result<(), AcceptError> {
         send_video_error(send, "desktop_unavailable").await
     }
@@ -693,6 +709,28 @@ async fn send_items(
         return Ok(Err(clipboard::error_code(&error).to_owned()));
     }
     Ok(Ok(()))
+}
+
+/// Passes a controller's frame acknowledgements and key-frame requests to the app. Only
+/// well-formed feedback records are passed on; the first malformed one ends the relay, which
+/// leaves the video itself running.
+async fn relay_feedback(mut input: impl AsyncRead + Unpin, output: &mut (impl AsyncWrite + Unpin)) {
+    let mut record = [0u8; 9];
+    loop {
+        if input.read_exact(&mut record[..5]).await.is_err() {
+            return;
+        }
+        let length = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+        if feedback_length(record[4]) != Some(length) {
+            return;
+        }
+        let end = 4 + length as usize;
+        if input.read_exact(&mut record[5..end]).await.is_err()
+            || output.write_all(&record[..end]).await.is_err()
+        {
+            return;
+        }
+    }
 }
 
 /// Reads a request header up to its newline. Requests without a body end at the stream's end
@@ -1180,6 +1218,27 @@ mod tests {
         client.close().await;
         router.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn only_well_formed_feedback_reaches_the_app() {
+        use koko_proto::{FEEDBACK_ACK, FEEDBACK_KEY_FRAME};
+        let mut input = Vec::new();
+        input.extend_from_slice(&5u32.to_be_bytes());
+        input.push(FEEDBACK_ACK);
+        input.extend_from_slice(&42u32.to_be_bytes());
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(FEEDBACK_KEY_FRAME);
+        let valid = input.len();
+        // An oversized ack ends the relay; nothing after it is passed on.
+        input.extend_from_slice(&9u32.to_be_bytes());
+        input.push(FEEDBACK_ACK);
+        input.extend_from_slice(&[0; 8]);
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(FEEDBACK_KEY_FRAME);
+        let mut output = Vec::new();
+        relay_feedback(input.as_slice(), &mut output).await;
+        assert_eq!(output, input[..valid]);
     }
 
     #[cfg(unix)]

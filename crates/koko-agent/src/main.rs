@@ -15,7 +15,9 @@ use koko_p2p::pairing::{
 };
 use koko_p2p::remote::{RemoteClient, send_command};
 use koko_p2p::{check_host, load_identity, load_or_create_identity};
-use koko_proto::{MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH};
+use koko_proto::{
+    MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH, feedback_length,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -137,14 +139,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 return Err("expected a video subscription".into());
             }
             let (closed, input_closed) = tokio::sync::oneshot::channel();
+            // The app writes feedback records to stdin and closes it to end the stream.
+            let (feedback, feedback_records) = tokio::sync::mpsc::channel(64);
             std::thread::spawn(move || {
+                read_feedback(&mut io::stdin().lock(), &feedback);
                 let _ = io::copy(&mut io::stdin(), &mut io::sink());
                 let _ = closed.send(());
             });
             let client = RemoteClient::connect(key, target).await?;
             let result = tokio::select! {
                 _ = input_closed => Ok(()),
-                result = stream_video(&client, &request) => result,
+                result = stream_video(&client, &request, feedback_records) => result,
             };
             client.close().await;
             result?;
@@ -369,12 +374,46 @@ async fn stream_commands(key: iroh::SecretKey, target: EndpointAddr) -> Result<(
     Ok(())
 }
 
+/// Passes whole feedback records from the app on, until stdin closes or holds something else.
+/// A record is dropped rather than queued when the stream is behind; the next ack replaces it.
+fn read_feedback(input: &mut impl Read, records: &tokio::sync::mpsc::Sender<Vec<u8>>) {
+    loop {
+        let mut record = vec![0u8; 5];
+        if input.read_exact(&mut record).is_err() {
+            return;
+        }
+        let length = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+        if feedback_length(record[4]) != Some(length) {
+            return;
+        }
+        record.resize(4 + length as usize, 0);
+        if input.read_exact(&mut record[5..]).is_err() {
+            return;
+        }
+        let _ = records.try_send(record);
+    }
+}
+
 async fn stream_video(
     client: &RemoteClient,
     request: &RemoteCommand,
+    mut feedback: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     let want_audio = matches!(request, RemoteCommand::Video { audio: true, .. });
-    let video_recv = client.open_command(request).await?;
+    let video_recv = if matches!(request, RemoteCommand::Video { feedback: true, .. }) {
+        // The request stream stays open so acknowledgements reach the host on it.
+        let (mut send, recv) = client.open_stream(request).await?;
+        tokio::spawn(async move {
+            while let Some(record) = feedback.recv().await {
+                if send.write_all(&record).await.is_err() {
+                    return;
+                }
+            }
+        });
+        recv
+    } else {
+        client.open_command(request).await?
+    };
     let audio_recv = if want_audio {
         client.open_command(&RemoteCommand::Audio).await.ok()
     } else {
@@ -447,4 +486,29 @@ async fn read_media_records(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use koko_proto::{FEEDBACK_ACK, FEEDBACK_KEY_FRAME};
+
+    #[test]
+    fn feedback_is_forwarded_as_whole_records_until_one_is_malformed() {
+        let mut input = Vec::new();
+        input.extend_from_slice(&5u32.to_be_bytes());
+        input.push(FEEDBACK_ACK);
+        input.extend_from_slice(&7u32.to_be_bytes());
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(FEEDBACK_KEY_FRAME);
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(0xff);
+        input.extend_from_slice(&1u32.to_be_bytes());
+        input.push(FEEDBACK_KEY_FRAME);
+        let (records, mut received) = tokio::sync::mpsc::channel(8);
+        read_feedback(&mut input.as_slice(), &records);
+        assert_eq!(received.try_recv().unwrap(), input[..9]);
+        assert_eq!(received.try_recv().unwrap(), input[9..14]);
+        assert!(received.try_recv().is_err());
+    }
 }

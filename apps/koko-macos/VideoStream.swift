@@ -2,6 +2,7 @@
 import CoreGraphics
 import Foundation
 import Network
+import os
 @preconcurrency import ScreenCaptureKit
 @preconcurrency import VideoToolbox
 
@@ -46,6 +47,8 @@ struct VideoSettings: Equatable {
     let audio: Bool
     let hevc: Bool
     let chroma444: Bool
+    /// Whether the controller acknowledges frames and asks for key frames; see `VideoFlow`.
+    var feedback = false
 }
 
 // Separate entry and recovery thresholds keep a borderline link from restarting the encoder every second.
@@ -65,7 +68,120 @@ struct StreamLatency {
 
 // Each record is a big-endian length followed by a kind byte and its payload.
 enum VideoRecord: UInt8 {
-    case format = 1, frame, error, path, audioFormat, audioFrame, syncFrame, hevcFormat
+    case format = 1, frame, error, path, audioFormat, audioFrame, syncFrame, hevcFormat, sequencedFrame
+}
+
+/// Records a controller writes back on a video stream that has feedback.
+enum VideoFeedback: UInt8 {
+    case ack = 1, keyFrame
+}
+
+/// The host's side of a video stream with feedback. The controller acknowledges every frame it
+/// receives, which tells the host how many frames are still on their way and how long a frame
+/// takes to arrive. A frame is only captured while few enough are unacknowledged to cover one
+/// round trip, so frames never pile up in the socket, QUIC or the controller and the picture
+/// stays current even when the link slows. Delay growing beyond the quietest round trip means a
+/// queue is forming, so the bitrate goes down; it climbs back while the link stays quiet.
+struct VideoFlow {
+    private let interval: Double
+    private let maxBitrate: Int
+    private(set) var bitrate: Int
+    private var unacknowledged: [(sequence: UInt32, sentAt: Double)] = []
+    private var nextSequence: UInt32 = 0
+    private var startedAt: Double?
+    private var acknowledged = false
+    private var fastest = Double.infinity
+    private var fastestAt = 0.0
+    private var queueing = 0.0
+    private var adjustedAt = 0.0
+    private var quietSince: Double?
+    private var held = false
+    private var bitrateChanged = false
+    private var keyFrameRequested = false
+    private var keyFrameAt = -Double.infinity
+
+    init(fps: Int, bitrate: Int) {
+        interval = 1 / Double(max(1, fps))
+        maxBitrate = bitrate
+        self.bitrate = bitrate
+    }
+
+    /// The lowest bitrate congestion may push the stream to.
+    var minimumBitrate: Int { max(1_000_000, maxBitrate / 5) }
+
+    /// Frames allowed on their way: one round trip plus two frame intervals, plus one frame.
+    var window: Int {
+        let roundTrip = fastest.isFinite ? fastest : 0.05
+        return max(2, Int(((roundTrip + 2 * interval) / interval).rounded(.up)) + 1)
+    }
+
+    /// Whether to capture another frame now. A controller that never acknowledges within two
+    /// seconds is treated as one without feedback and is never held back.
+    mutating func admits(now: Double) -> Bool {
+        if !acknowledged, let startedAt, now - startedAt > 2 { return true }
+        guard unacknowledged.count >= window else { return true }
+        held = true
+        return false
+    }
+
+    /// Records a frame about to be sent and returns its sequence number.
+    mutating func send(now: Double) -> UInt32 {
+        if startedAt == nil { startedAt = now }
+        let sequence = nextSequence
+        nextSequence &+= 1
+        unacknowledged.append((sequence, now))
+        return sequence
+    }
+
+    mutating func acknowledge(_ sequence: UInt32, now: Double) {
+        // Sequence numbers wrap; anything up to 2^31 behind the acknowledged one is covered.
+        guard let index = unacknowledged.lastIndex(where: { sequence &- $0.sequence < 1 << 31 }) else { return }
+        acknowledged = true
+        let delay = now - unacknowledged[index].sentAt
+        unacknowledged.removeFirst(index + 1)
+        if delay < fastest || now - fastestAt > 10 {
+            fastest = delay
+            fastestAt = now
+        }
+        queueing += (max(0, delay - fastest) - queueing) * 0.2
+        guard now - adjustedAt >= 0.25 else { return }
+        adjustedAt = now
+        let previous = bitrate
+        if held || queueing > max(0.02, 2 * interval) {
+            bitrate = max(minimumBitrate, Int(Double(bitrate) * 0.85))
+            quietSince = nil
+        } else if queueing < max(0.008, interval / 2) {
+            let since = quietSince ?? now
+            quietSince = since
+            if now - since >= 1 {
+                bitrate = min(maxBitrate, Int(Double(bitrate) * 1.1))
+                quietSince = now
+            }
+        } else {
+            quietSince = nil
+        }
+        held = false
+        if bitrate != previous { bitrateChanged = true }
+    }
+
+    /// A new bitrate for the encoder, once per change.
+    mutating func takeBitrateChange() -> Int? {
+        guard bitrateChanged else { return nil }
+        bitrateChanged = false
+        return bitrate
+    }
+
+    mutating func requestKeyFrame() { keyFrameRequested = true }
+
+    /// Whether the next frame should be a key frame. Requests within half a second of the last
+    /// forced key frame are served by that one.
+    mutating func takeKeyFrame(now: Double) -> Bool {
+        guard keyFrameRequested else { return false }
+        keyFrameRequested = false
+        guard now - keyFrameAt >= 0.5 else { return false }
+        keyFrameAt = now
+        return true
+    }
 }
 
 enum VideoError: String, Error {
@@ -141,19 +257,26 @@ final class VideoEncoder {
     private let session: VTCompressionSession
     let isHEVC: Bool
     let pixelFormat: OSType
+    /// The average bitrate the encoder was created with.
+    let bitrate: Int
 
-    init(width: Int, height: Int, fps: Int, quality: Int, preferHEVC: Bool, prefer444: Bool) throws {
+    /// `keyFrameSeconds` is the longest gap between key frames. Controllers with feedback ask for
+    /// one when they need it, so their streams can space them out and avoid regular size spikes.
+    init(width: Int, height: Int, fps: Int, quality: Int, preferHEVC: Bool, prefer444: Bool,
+         keyFrameSeconds: Double = 2) throws {
         if preferHEVC, prefer444,
            let created = Self.makeSession(
                width: width, height: height, fps: fps, quality: quality,
                codec: kCMVideoCodecType_HEVC,
                profile: "HEVC_Main444_AutoLevel" as CFString,
                pixelFormat: kCVPixelFormatType_444YpCbCr8BiPlanarFullRange,
-               requireHardware: true
+               requireHardware: true, keyFrameSeconds: keyFrameSeconds
            ) {
             self.session = created
             self.isHEVC = true
             self.pixelFormat = kCVPixelFormatType_444YpCbCr8BiPlanarFullRange
+            self.bitrate = Self.bitrate(width: width, height: height, fps: fps, quality: quality,
+                                        pixelFormat: kCVPixelFormatType_444YpCbCr8BiPlanarFullRange)
             return
         }
         if preferHEVC,
@@ -162,11 +285,13 @@ final class VideoEncoder {
                codec: kCMVideoCodecType_HEVC,
                profile: kVTProfileLevel_HEVC_Main_AutoLevel,
                pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-               requireHardware: false
+               requireHardware: false, keyFrameSeconds: keyFrameSeconds
            ) {
             self.session = created
             self.isHEVC = true
             self.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            self.bitrate = Self.bitrate(width: width, height: height, fps: fps, quality: quality,
+                                        pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
             return
         }
         guard let fallback = Self.makeSession(
@@ -174,18 +299,36 @@ final class VideoEncoder {
             codec: kCMVideoCodecType_H264,
             profile: kVTProfileLevel_H264_High_AutoLevel,
             pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            requireHardware: false
+            requireHardware: false, keyFrameSeconds: keyFrameSeconds
         ) else {
             throw VideoError.codec
         }
         self.session = fallback
         self.isHEVC = false
         self.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        self.bitrate = Self.bitrate(width: width, height: height, fps: fps, quality: quality,
+                                    pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+    }
+
+    /// Screen text needs far more bits than camera video: about 50 Mbps for 2560 × 1600 at 60 fps
+    /// and quality 82, more for 4:4:4, which a gigabit LAN carries easily. With feedback the
+    /// stream starts here and `VideoFlow` lowers it while the link cannot keep up.
+    static func bitrate(width: Int, height: Int, fps: Int, quality: Int, pixelFormat: OSType) -> Int {
+        let chroma = pixelFormat == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ? 13 : 10
+        return max(1_500_000, min(150_000_000, width * height * fps * quality / 400 * chroma / 10))
+    }
+
+    /// Changes the bitrate of the running session; the next frames follow it.
+    func setBitrate(_ bitrate: Int) {
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits,
+                             value: [Int(Double(bitrate) / 8.0 * 2.5), 1] as CFArray)
     }
 
     private static func makeSession(
         width: Int, height: Int, fps: Int, quality: Int,
-        codec: CMVideoCodecType, profile: CFString, pixelFormat: OSType, requireHardware: Bool
+        codec: CMVideoCodecType, profile: CFString, pixelFormat: OSType, requireHardware: Bool,
+        keyFrameSeconds: Double
     ) -> VTCompressionSession? {
         var session: VTCompressionSession?
         let spec: [CFString: Any] = requireHardware
@@ -203,11 +346,7 @@ final class VideoEncoder {
         )
         guard status == noErr, let session else { return nil }
 
-        // Screen text needs far more bits than camera video: about 50 Mbps for 2560 × 1600 at
-        // 60 fps and quality 82, more for 4:4:4, which a gigabit LAN carries easily. A slow link
-        // asks for a lower quality and size, which lowers this too.
-        let chroma = pixelFormat == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ? 13 : 10
-        let avgBitrate = max(1_500_000, min(150_000_000, width * height * fps * quality / 400 * chroma / 10))
+        let avgBitrate = bitrate(width: width, height: height, fps: fps, quality: quality, pixelFormat: pixelFormat)
         let peakBytesPerSec = Int(Double(avgBitrate) / 8.0 * 2.5)
         let properties: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
@@ -217,7 +356,7 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_AverageBitRate: avgBitrate,
             kVTCompressionPropertyKey_DataRateLimits: [peakBytesPerSec, 1] as CFArray,
             kVTCompressionPropertyKey_Quality: Float(max(20, min(95, quality))) / 100.0,
-            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: keyFrameSeconds,
             kVTCompressionPropertyKey_MaxFrameDelayCount: 0,
             kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
             kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_ITU_R_709_2,
@@ -233,12 +372,13 @@ final class VideoEncoder {
 
     deinit { VTCompressionSessionInvalidate(session) }
 
-    func encode(_ sample: CMSampleBuffer) async throws -> CMSampleBuffer? {
+    func encode(_ sample: CMSampleBuffer, keyFrame: Bool = false) async throws -> CMSampleBuffer? {
         guard let pixels = CMSampleBufferGetImageBuffer(sample) else { return nil }
+        let properties = keyFrame ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         return try await withCheckedThrowingContinuation { continuation in
             let status = VTCompressionSessionEncodeFrame(
                 session, imageBuffer: pixels, presentationTimeStamp: sample.presentationTimeStamp,
-                duration: sample.duration, frameProperties: nil, infoFlagsOut: nil
+                duration: sample.duration, frameProperties: properties, infoFlagsOut: nil
             ) { status, _, encoded in
                 if status == noErr {
                     continuation.resume(returning: encoded.map { VideoSample(buffer: $0) }?.buffer)
@@ -255,10 +395,15 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
     let connection = NWConnection(to: .unix(path: socket), using: .tcp)
     let queue = DispatchQueue(label: "KoKo.video.capture")
     let (frames, output) = AsyncThrowingStream<VideoSample, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
+    let flow = OSAllocatedUnfairLock<VideoFlow?>(initialState: nil)
+    // The newest frame the window held back. ScreenCaptureKit sends nothing while the screen is
+    // still, so without it the controller could keep showing an older picture.
+    let held = OSAllocatedUnfairLock<VideoSample?>(initialState: nil)
     connection.start(queue: queue)
-    connection.receive(minimumIncompleteLength: 1, maximumLength: 1) { _, _, _, _ in
-        output.finish()
-    }
+    // The daemon relays the controller's feedback on the socket and closes it when the stream ends.
+    readVideoFeedback(from: connection, into: flow, acknowledged: {
+        if let frame = held.withLock({ frame in defer { frame = nil }; return frame }) { output.yield(frame) }
+    }, ended: { output.finish() })
     defer { connection.cancel() }
     do {
         let (filter, config) = try await screenCaptureSource(displayID: settings.display, edge: settings.edge)
@@ -266,8 +411,13 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
         let videoHeight = max(2, config.height & ~1)
         let encoder = try VideoEncoder(
             width: videoWidth, height: videoHeight, fps: settings.fps, quality: settings.quality,
-            preferHEVC: settings.hevc, prefer444: settings.chroma444
+            preferHEVC: settings.hevc, prefer444: settings.chroma444,
+            keyFrameSeconds: settings.feedback ? 10 : 2
         )
+        if settings.feedback {
+            let start = VideoFlow(fps: settings.fps, bitrate: encoder.bitrate)
+            flow.withLock { $0 = start }
+        }
         config.width = videoWidth
         config.height = videoHeight
         config.pixelFormat = encoder.pixelFormat
@@ -284,8 +434,26 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
         try await stream.startCapture()
         do {
             var format: CMFormatDescription?
+            var newest = CMTime.negativeInfinity
             for try await frame in frames {
-                guard let encoded = try await encoder.encode(frame.buffer),
+                // A held frame handed back late must not replace a newer one already sent.
+                guard frame.buffer.presentationTimeStamp > newest else { continue }
+                // A frame skipped here is never encoded, so the controller's picture stays
+                // decodable and only shows fewer frames while the link catches up.
+                let (admitted, bitrate, keyFrame) = flow.withLock { state -> (Bool, Int?, Bool) in
+                    guard state != nil else { return (true, nil, false) }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    guard state!.admits(now: now) else { return (false, nil, false) }
+                    return (true, state!.takeBitrateChange(), state!.takeKeyFrame(now: now))
+                }
+                guard admitted else {
+                    held.withLock { $0 = frame }
+                    continue
+                }
+                held.withLock { $0 = nil }
+                newest = frame.buffer.presentationTimeStamp
+                if let bitrate { encoder.setBitrate(bitrate) }
+                guard let encoded = try await encoder.encode(frame.buffer, keyFrame: keyFrame),
                       let block = encoded.dataBuffer, let nextFormat = encoded.formatDescription else { continue }
                 if format != nextFormat {
                     if encoder.isHEVC {
@@ -297,12 +465,18 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
                 }
                 let size = CMBlockBufferGetDataLength(block)
                 guard size > 0 else { continue }
-                var bytes = Data(count: size)
+                let sequence = flow.withLock { $0?.send(now: ProcessInfo.processInfo.systemUptime) }
+                let header = sequence == nil ? 0 : 5
+                var bytes = Data(count: header + size)
+                if let sequence {
+                    bytes.replaceSubrange(0..<4, with: withUnsafeBytes(of: sequence.bigEndian) { Data($0) })
+                    bytes[4] = isKeyFrame(encoded) ? 1 : 0
+                }
                 let status = bytes.withUnsafeMutableBytes {
-                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress! + header)
                 }
                 guard status == noErr else { throw VideoError.codec }
-                sendVideoFast(.frame, bytes: bytes, to: connection)
+                sendVideoFast(sequence == nil ? .frame : .sequencedFrame, bytes: bytes, to: connection)
             }
         } catch {
             try? await stream.stopCapture()
@@ -313,6 +487,69 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
         let code = (error as? ScreenCaptureError)?.rawValue ?? (error as? VideoError)?.rawValue ?? "capture_failed"
         sendVideoFast(.error, bytes: Data(code.utf8), to: connection)
     }
+}
+
+private func isKeyFrame(_ sample: CMSampleBuffer) -> Bool {
+    guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false)
+            as? [[CFString: Any]], let first = attachments.first else { return true }
+    return (first[kCMSampleAttachmentKey_NotSync] as? Bool) != true
+}
+
+/// Splits complete feedback records off the front of `buffer`. Returns nil for a record that
+/// cannot be one, after which the rest of the socket is ignored.
+func takeVideoFeedback(from buffer: inout Data) -> [(VideoFeedback, UInt32)]? {
+    var records: [(VideoFeedback, UInt32)] = []
+    while buffer.count >= 5 {
+        let start = buffer.startIndex
+        let length = buffer.uint32(at: 0)
+        guard let kind = VideoFeedback(rawValue: buffer[start + 4]),
+              length == (kind == .ack ? 5 : 1) else { return nil }
+        guard buffer.count >= 4 + length else { break }
+        let value = kind == .ack ? UInt32(buffer.uint32(at: 5)) : 0
+        records.append((kind, value))
+        buffer = Data(buffer.dropFirst(4 + length))
+    }
+    return records
+}
+
+private func readVideoFeedback(
+    from connection: NWConnection, into flow: OSAllocatedUnfairLock<VideoFlow?>,
+    acknowledged: @escaping @Sendable () -> Void, ended: @escaping @Sendable () -> Void
+) {
+    final class Reader: @unchecked Sendable {
+        // Only touched from the connection's queue, which calls back serially.
+        var buffer = Data()
+        var valid = true
+    }
+    let reader = Reader()
+    func receive() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, complete, error in
+            if let data, reader.valid {
+                reader.buffer.append(data)
+                if let records = takeVideoFeedback(from: &reader.buffer) {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    flow.withLock { state in
+                        for (kind, sequence) in records {
+                            switch kind {
+                            case .ack: state?.acknowledge(sequence, now: now)
+                            case .keyFrame: state?.requestKeyFrame()
+                            }
+                        }
+                    }
+                    if records.contains(where: { $0.0 == .ack }) { acknowledged() }
+                } else {
+                    reader.valid = false
+                    reader.buffer = Data()
+                }
+            }
+            if complete || error != nil {
+                ended()
+            } else {
+                receive()
+            }
+        }
+    }
+    receive()
 }
 
 private func sendVideoFast(_ kind: VideoRecord, bytes: Data, to connection: NWConnection) {
@@ -493,12 +730,17 @@ final class VideoReceiver {
     private let input = Pipe()
     private let output = Pipe()
     private let reader = DispatchQueue(label: "KoKo.video.decode")
+    /// Feedback writes and closing stdin happen in order on this queue, off the main thread.
+    private let writer = DispatchQueue(label: "KoKo.video.feedback")
+    /// Only read and written on `writer`.
+    nonisolated(unsafe) private var inputClosed = false
 
     init(keyPath: String, host: PairedHost, settings: VideoSettings) throws {
         let action = RemoteAction(
             action: "video", display: settings.display, edge: settings.edge,
             quality: settings.quality, fps: settings.fps, audio: settings.audio,
-            hevc: settings.hevc ? true : nil, chroma444: settings.chroma444 ? true : nil
+            hevc: settings.hevc ? true : nil, chroma444: settings.chroma444 ? true : nil,
+            feedback: settings.feedback ? true : nil
         )
         let request = try JSONEncoder().encode(action)
         process.executableURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/koko-agent")
@@ -534,8 +776,32 @@ final class VideoReceiver {
     /// Closing stdin lets the helper close its QUIC connection, which tells the host at once
     /// that this stream ended. Killing it first would leave the host waiting for a timeout and
     /// refusing the next stream meanwhile, so the helper is only killed if it does not exit.
+    /// Tells the host this frame arrived; it sends new frames only while few are unacknowledged.
+    func acknowledge(_ sequence: UInt32) {
+        var record = Data([0, 0, 0, 5, VideoFeedback.ack.rawValue])
+        withUnsafeBytes(of: sequence.bigEndian) { record.append(contentsOf: $0) }
+        write(record)
+    }
+
+    /// Asks the host for a key frame after this Mac had to skip one it could not show.
+    func requestKeyFrame() {
+        write(Data([0, 0, 0, 1, VideoFeedback.keyFrame.rawValue]))
+    }
+
+    private func write(_ record: Data) {
+        let handle = input.fileHandleForWriting
+        writer.async { [weak self] in
+            guard let self, !self.inputClosed else { return }
+            try? handle.write(contentsOf: record)
+        }
+    }
+
     func close() {
-        try? input.fileHandleForWriting.close()
+        let handle = input.fileHandleForWriting
+        writer.async { [weak self] in
+            self?.inputClosed = true
+            try? handle.close()
+        }
         let process = self.process
         DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
             if process.isRunning { process.terminate() }

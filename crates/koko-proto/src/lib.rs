@@ -17,6 +17,26 @@ pub const MAX_REMOTE_REPLY: usize = 16 * 1024 * 1024;
 pub const MAX_VIDEO_PACKET: usize = 8 * 1024 * 1024;
 pub const VIDEO_ERROR: u8 = 3;
 pub const VIDEO_PATH: u8 = 4;
+/// A video frame with a big-endian u32 sequence number and a flags byte before its payload.
+/// Hosts send it only to controllers that asked for `feedback`.
+pub const VIDEO_SEQUENCED_FRAME: u8 = 9;
+pub const VIDEO_FRAME_KEY: u8 = 1;
+
+// Records a controller writes back on a video stream it opened with `feedback`. Each is a
+// big-endian u32 length, a kind byte and its payload, like the video records themselves.
+/// The newest frame the controller has received, as a big-endian u32 sequence number.
+pub const FEEDBACK_ACK: u8 = 1;
+/// The controller cannot decode until the next key frame.
+pub const FEEDBACK_KEY_FRAME: u8 = 2;
+
+/// The length field of a valid feedback record, or `None` for a kind that does not exist.
+pub fn feedback_length(kind: u8) -> Option<u32> {
+    match kind {
+        FEEDBACK_ACK => Some(5),
+        FEEDBACK_KEY_FRAME => Some(1),
+        _ => None,
+    }
+}
 
 // The first byte is the Control channel, then a big-endian u32 and its JSON payload.
 pub const CONTROL_HELLO: &[u8] = b"\x01\x00\x00\x00\x07\"hello\"";
@@ -263,6 +283,10 @@ pub enum RemoteCommand {
         hevc: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chroma444: bool,
+        /// The controller acknowledges frames and asks for key frames on the same stream, so the
+        /// host can skip frames that would only queue up and adapt its bitrate to the link.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        feedback: bool,
     },
     /// Subscribes to live desktop audio on its own QUIC stream, avoiding video head-of-line blocking.
     Audio,
@@ -713,6 +737,7 @@ mod tests {
             audio,
             hevc: false,
             chroma444: false,
+            feedback: false,
         };
         assert!(video(false).allowed_for(Scope::Observer));
         assert!(!video(true).allowed_for(Scope::AgentSafe));
@@ -777,5 +802,28 @@ mod tests {
         assert_eq!((app.as_str(), truncated), ("System Settings", false));
         assert_eq!(nodes[1].parent, Some(0));
         assert!(nodes[1].focused && !nodes[1].enabled && nodes[1].value.is_none());
+    }
+
+    #[test]
+    fn video_feedback_is_opt_in_and_records_have_fixed_sizes() {
+        let old = r#"{"action":"video","display":1,"edge":1280,"quality":70,"fps":60}"#;
+        let parsed: RemoteCommand = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            parsed,
+            RemoteCommand::Video {
+                feedback: false,
+                ..
+            }
+        ));
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("feedback"));
+        let new =
+            r#"{"action":"video","display":1,"edge":1280,"quality":70,"fps":60,"feedback":true}"#;
+        assert!(matches!(
+            serde_json::from_str(new).unwrap(),
+            RemoteCommand::Video { feedback: true, .. }
+        ));
+        assert_eq!(feedback_length(FEEDBACK_ACK), Some(5));
+        assert_eq!(feedback_length(FEEDBACK_KEY_FRAME), Some(1));
+        assert_eq!(feedback_length(0), None);
     }
 }

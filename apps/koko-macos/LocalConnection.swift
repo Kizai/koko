@@ -175,6 +175,7 @@ struct RemoteAction: Codable {
     var audio: Bool? = nil
     var hevc: Bool? = nil
     var chroma444: Bool? = nil
+    var feedback: Bool? = nil
     var level: Int? = nil
     var events: [RemotePointerEvent]? = nil
     var sourceOS: String? = nil
@@ -187,7 +188,7 @@ struct RemoteAction: Codable {
     var approved: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, audio, hevc, chroma444, level, events, format, cursor
+        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, audio, hevc, chroma444, feedback, level, events, format, cursor
         case actor, approved
         case maxNodes = "max_nodes"
         case sourceOS = "source_os"
@@ -946,7 +947,8 @@ final class LocalConnection: ObservableObject {
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
                 let settings = VideoSettings(
                     display: display, edge: edge, quality: quality, fps: fps,
-                    audio: false, hevc: action.hevc ?? false, chroma444: action.chroma444 ?? false
+                    audio: false, hevc: action.hevc ?? false, chroma444: action.chroma444 ?? false,
+                    feedback: action.feedback ?? false
                 )
                 Task { await streamDesktopVideo(settings, socket: socket) }
             case "audio":
@@ -1478,7 +1480,8 @@ final class LocalConnection: ObservableObject {
                     fps: targetFPS,
                     audio: isRemoteAudioEnabled,
                     hevc: VideoCapabilities.supportsHEVC,
-                    chroma444: VideoCapabilities.supportsHEVC444
+                    chroma444: VideoCapabilities.supportsHEVC444,
+                    feedback: true
                 )
                 if videoSettings != settings || (videoTask == nil && ContinuousClock.now >= videoRetryAfter) {
                     startVideo(session, settings: settings)
@@ -1567,6 +1570,7 @@ final class LocalConnection: ObservableObject {
         var rtt: Int?
         var direct: Bool?
         var failure = "capture_failed"
+        var awaitingKeyFrame = false
         do {
             records: while let (kind, bytes) = try await receiver.next() {
                 guard videoReceiver === receiver, !Task.isCancelled else { return }
@@ -1588,13 +1592,34 @@ final class LocalConnection: ObservableObject {
                     videoSurface.setAudioFormat(bytes)
                 case .audioFrame:
                     videoSurface.enqueueAudio(bytes)
-                case .frame, .syncFrame:
-                    guard selectedDisplay?.id == settings.display else { continue }
-                    if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
-                    guard videoSurface.isReadyForMoreMediaData else { continue }
-                    let payload = kind == .syncFrame
-                        ? (bytes.count > 8 ? bytes.subdata(in: 8..<bytes.count) : Data())
-                        : bytes
+                case .frame, .syncFrame, .sequencedFrame:
+                    var payload = bytes
+                    if kind == .sequencedFrame {
+                        guard bytes.count > 5 else { throw VideoError.packet }
+                        let sequence = bytes.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+                        let key = bytes[bytes.startIndex + 4] & 1 != 0
+                        payload = bytes.subdata(in: (bytes.startIndex + 5)..<bytes.endIndex)
+                        // Every frame is acknowledged, shown or not, so the host knows it arrived.
+                        defer { receiver.acknowledge(sequence) }
+                        if awaitingKeyFrame && !key { continue }
+                        guard selectedDisplay?.id == settings.display else { continue }
+                        if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
+                        guard videoSurface.isReadyForMoreMediaData else {
+                            // Skipping a frame breaks the chain the next ones are predicted from,
+                            // so later frames wait for the key frame asked for here.
+                            awaitingKeyFrame = true
+                            receiver.requestKeyFrame()
+                            continue
+                        }
+                        awaitingKeyFrame = false
+                    } else {
+                        guard selectedDisplay?.id == settings.display else { continue }
+                        if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
+                        guard videoSurface.isReadyForMoreMediaData else { continue }
+                        if kind == .syncFrame {
+                            payload = bytes.count > 8 ? bytes.subdata(in: 8..<bytes.count) : Data()
+                        }
+                    }
                     guard !payload.isEmpty else { continue }
                     try videoSurface.enqueue(payload)
                     let now = ContinuousClock.now

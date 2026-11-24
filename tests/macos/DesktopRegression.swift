@@ -21,7 +21,8 @@ struct DesktopRegression {
         try checkAgentPolicy()
         try checkUpdateProgress()
         try checkMediaPipeline()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度、音视频编解码回路和 Agent 高危操作规则测试")
+        try checkVideoFlow()
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度、音视频编解码回路、视频流控和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {
@@ -145,6 +146,55 @@ struct DesktopRegression {
                 throw Failure(maximize ? "双击顶栏没有最大化窗口" : "再次双击顶栏没有还原窗口")
             }
         }
+    }
+
+    private static func checkVideoFlow() throws {
+        // On a LAN the window covers a round trip plus two frames, so frames never queue up.
+        var flow = VideoFlow(fps: 60, bitrate: 50_000_000)
+        var now = 0.0
+        var sent: [UInt32] = []
+        while flow.admits(now: now) { sent.append(flow.send(now: now)) }
+        guard (2...8).contains(sent.count) else { throw Failure("未确认的帧数应受窗口限制：\(sent.count)") }
+        flow.acknowledge(sent.last!, now: now + 0.004)
+        guard flow.admits(now: now + 0.004) else { throw Failure("确认后应继续发送") }
+        guard flow.window <= 4 else { throw Failure("局域网下在途帧应只有几帧：\(flow.window)") }
+
+        // A link that keeps answering slower than its best round trip is congested.
+        for step in 1...40 {
+            now = Double(step) * 0.05
+            let frame = flow.send(now: now)
+            flow.acknowledge(frame, now: now + 0.004 + min(0.12, Double(step) * 0.01))
+        }
+        guard let lowered = flow.takeBitrateChange(), lowered < 50_000_000, lowered >= flow.minimumBitrate
+        else { throw Failure("排队延迟增长时应降低码率") }
+        // Once quiet again, the bitrate climbs back toward the start.
+        for step in 41...200 {
+            now = Double(step) * 0.05
+            let frame = flow.send(now: now)
+            flow.acknowledge(frame, now: now + 0.004)
+        }
+        guard flow.bitrate > lowered else { throw Failure("网络恢复后应逐步提高码率") }
+
+        // A controller without feedback is never held back for long.
+        var silent = VideoFlow(fps: 60, bitrate: 10_000_000)
+        for _ in 0..<10 { _ = silent.send(now: 0) }
+        guard !silent.admits(now: 1), silent.admits(now: 2.5) else { throw Failure("不回确认的控制端不应一直被限流") }
+
+        // Key frame requests close together are served by one key frame.
+        silent.requestKeyFrame()
+        guard silent.takeKeyFrame(now: 3) else { throw Failure("应响应关键帧请求") }
+        silent.requestKeyFrame()
+        guard !silent.takeKeyFrame(now: 3.2), !silent.takeKeyFrame(now: 3.8) else { throw Failure("关键帧请求应去抖") }
+
+        // Feedback records split across reads are parsed whole; garbage stops the parser.
+        var buffer = Data([0, 0, 0, 5, 1, 0, 0, 1, 2, 0, 0, 0, 1])
+        guard let first = takeVideoFeedback(from: &buffer), first.count == 1, first[0].1 == 258, buffer.count == 4
+        else { throw Failure("应解析完整的确认记录并保留不完整部分") }
+        buffer.append(2)
+        guard let second = takeVideoFeedback(from: &buffer), second.count == 1, second[0].0 == .keyFrame, buffer.isEmpty
+        else { throw Failure("应解析关键帧请求") }
+        var garbage = Data([0, 0, 0, 9, 1])
+        guard takeVideoFeedback(from: &garbage) == nil else { throw Failure("长度不符的记录应被拒绝") }
     }
 
     @MainActor private static func checkMediaPipeline() throws {

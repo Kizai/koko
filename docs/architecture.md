@@ -108,7 +108,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `request_human` | `reason`（最多 500 字符）、`timeout_s`（10–600） | `human`，含 `result`（`resolved`、`declined`、`taken_over` 或 `timeout`）和可选的 `note`；等人回答期间保持请求打开 |
 | `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard`、`clipboard_stream` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
-| `video` | `capture` 的参数、`fps`（30、60、90、120、144、165 或 240），可选 `audio`、`hevc` 和 `chroma444` | 二进制视频记录流 |
+| `video` | `capture` 的参数、`fps`（30、60、90、120、144、165 或 240），可选 `audio`、`hevc`、`chroma444` 和 `feedback` | 二进制视频记录流；`feedback` 为真时请求头以换行结束，控制端在同一条流上回写反馈记录 |
 | `audio` | `display` | 二进制音频记录流（与 `video` 共享同一条 QUIC 连接上的独立双向流，避免关键帧队头阻塞音频） |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
 | `clipboard_pull` | `transfer`（UUID） | 被控端按下 ⌘C 后，流上先发一条清单记录（文字，或文件与文件夹的相对路径和大小），再按清单顺序连续发送全部文件字节；出错时发错误记录 |
@@ -141,8 +141,28 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `audioFrame` | 6 | 一帧 `AAC-ELD`（480 采样 / 10ms）或回退 `AAC-LC` 编码数据。 |
 | `syncFrame` | 7 | 八字节大端微秒级 PTS 加四字节长度前缀 NAL 单元（兼容带时间戳视频帧）。 |
 | `hevcFormat` | 8 | HEVC 的 VPS、SPS 与 PPS，各自带四字节大端长度前缀。 |
+| `sequencedFrame` | 9 | 四字节大端帧序号、一字节标志（第 0 位为关键帧），后接与 `frame` 相同的载荷。只发给请求了 `feedback` 的控制端。 |
 
-被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端用零缓冲（`DisplayImmediately`）的 `AVSampleBufferDisplayLayer` 显示画面，并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质。
+### 视频反馈与流控
+
+请求带 `feedback` 的控制端在视频流的发送方向回写反馈记录，格式与视频记录相同（四字节大端长度含类型字节，再接类型和载荷）：
+
+| 类型 | 值 | 长度 | 载荷 |
+| --- | --- | --- | --- |
+| `ack` | 1 | 5 | 四字节大端帧序号：控制端已收到的最新一帧，不论是否显示 |
+| `keyFrame` | 2 | 1 | 无：控制端跳过了一帧，需要关键帧才能继续解码 |
+
+控制端 `koko-agent` 从标准输入读取应用写入的反馈记录，只转发完整、合法的记录，排不上队时丢弃（下一条确认会覆盖它）。被控端 daemon 再次校验后写入视频 Unix socket，遇到第一条不合法的记录即停止转发，视频本身不受影响。
+
+被控端应用按反馈做三件事，状态在 `VideoFlow` 中：
+
+1. **在途帧窗口**。只有未确认的帧少于「最快往返时间 + 两个帧间隔」对应的帧数再加一帧时，才采集并编码下一帧；局域网 60 FPS 下约 3–4 帧。跳过的帧从未编码，控制端的预测链不会断，网络变慢时只是帧率下降，画面不会因排队而越来越滞后。被拦下的最新一帧会保留，收到确认后补发，避免画面静止时控制端停在旧画面；补发的帧若比已发出的更旧则丢弃。两秒内从未收到确认的控制端视为不支持反馈，不再限流。
+2. **码率自适应**。每帧的「发送到确认」耗时减去十秒内的最快一次，平滑后即排队延迟。每 0.25 秒评估一次：排队延迟超过 20 ms（或两个帧间隔）或期间有帧被窗口拦下，码率降到 85%，最低为起始码率的 20%；排队延迟持续低于 8 ms（或半个帧间隔）满一秒，码率回升 10%，不超过起始码率。新码率在下一帧前写入 VideoToolbox 会话，不重建编码器。
+3. **关键帧**。收到 `keyFrame` 后下一帧强制编码为关键帧，半秒内的重复请求合并。有反馈时周期关键帧放宽到最长十秒一个，减少周期性的码率尖峰；无反馈的旧控制端仍为两秒。
+
+控制端收到 `sequencedFrame` 后总是回确认。显示层排不下时跳过该帧并请求关键帧，之后的非关键帧一律跳过，直到关键帧到达，避免花屏。
+
+被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧，带反馈时十秒）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端用零缓冲（`DisplayImmediately`）的 `AVSampleBufferDisplayLayer` 显示画面，并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质；码率与帧率的实时调整见[视频反馈与流控](#视频反馈与流控)。
 
 ### 应用与辅助进程的接口
 
@@ -167,7 +187,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
-控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次，`pair` 的目标和验证码通过标准输入传入（目标参数写 `-`，加 `--code-stdin`），避免出现在进程列表里；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出。应用结束订阅时先关闭它的标准输入，让它正常关闭 QUIC 连接，1.5 秒后仍未退出才强制结束；`remote` 用于单次的按键、文本和断开命令。
+控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次，`pair` 的目标和验证码通过标准输入传入（目标参数写 `-`，加 `--code-stdin`），避免出现在进程列表里；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出，并把应用写入标准输入的反馈记录转发给被控端。应用结束订阅时先关闭它的标准输入，让它正常关闭 QUIC 连接，1.5 秒后仍未退出才强制结束；`remote` 用于单次的按键、文本和断开命令。
 
 ### 性能边界
 
