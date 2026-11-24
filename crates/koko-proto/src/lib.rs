@@ -9,7 +9,7 @@ pub const DEFAULT_PORT: u16 = 27688;
 pub const CONTROL_REQUEST: &[u8] = b"request";
 pub const MAX_PAIR_REQUEST: usize = 1024;
 pub const MAX_PAIR_REPLY: usize = 256;
-pub const PAIR_VERSION: u8 = 2;
+pub const PAIR_VERSION: u8 = 3;
 pub const MAX_PEER_NAME: usize = 64;
 /// A request header; a clipboard push carries its file list here, so it allows long lists.
 pub const MAX_REMOTE_REQUEST: usize = 4 * 1024 * 1024;
@@ -68,8 +68,10 @@ pub struct PairHello {
     pub kind: PeerKind,
     pub name: String,
     pub scope: Scope,
+    /// Proves the controller knows a verification code without sending it: a keyed hash of
+    /// the host and controller keys, written as hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
+    pub proof: Option<String>,
     /// Asks the host to refuse at once with `PAIR_CODE_REQUIRED` instead of asking its owner,
     /// when neither a code nor trust lets this client in.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -78,6 +80,8 @@ pub struct PairHello {
 
 /// The close reason for a quiet pairing request that needs a verification code.
 pub const PAIR_CODE_REQUIRED: &str = "code_required";
+/// The close reason when a host stops checking codes for a while after too many wrong ones.
+pub const PAIR_LOCKED: &str = "too_many_attempts";
 
 impl PairHello {
     pub fn valid(&self) -> bool {
@@ -252,7 +256,13 @@ pub enum RemoteCommand {
         fps: u16,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         audio: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hevc: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chroma444: bool,
     },
+    /// Subscribes to live desktop audio on its own QUIC stream, avoiding video head-of-line blocking.
+    Audio,
     /// Reads (`level: None`) or sets (`level: Some(0..=100)`) the host's system output volume.
     AudioVolume {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +585,8 @@ impl RemoteCommand {
         }
     }
 
+    /// What an agent may look at. Desktop audio is left to people: an agent asked to watch the
+    /// screen should not also hear calls or media playing at the host.
     fn is_viewing(&self) -> bool {
         matches!(
             self,
@@ -584,8 +596,7 @@ impl RemoteCommand {
                 | Self::Screenshot
                 | Self::Wallpaper
                 | Self::Capture { .. }
-                | Self::Video { .. }
-                | Self::AudioVolume { level: None }
+                | Self::Video { audio: false, .. }
                 | Self::Disconnect
         )
     }
@@ -663,6 +674,7 @@ pub fn valid_remote_command(command: &RemoteCommand) -> bool {
         | RemoteCommand::ReleaseControl
         | RemoteCommand::Screenshot
         | RemoteCommand::Wallpaper
+        | RemoteCommand::Audio
         | RemoteCommand::Displays
         | RemoteCommand::Key { .. } => true,
     }
@@ -688,6 +700,20 @@ mod tests {
         assert!(RemoteCommand::Displays.allowed_for(Scope::Observer));
         assert!(RemoteCommand::Wallpaper.allowed_for(Scope::Observer));
         assert!(!RemoteCommand::ReleaseControl.allowed_for(Scope::Observer));
+        assert!(!RemoteCommand::Audio.allowed_for(Scope::AgentSafe));
+        assert!(!RemoteCommand::AudioVolume { level: None }.allowed_for(Scope::Observer));
+        let video = |audio| RemoteCommand::Video {
+            display: 1,
+            edge: 1280,
+            quality: 70,
+            fps: 30,
+            audio,
+            hevc: false,
+            chroma444: false,
+        };
+        assert!(video(false).allowed_for(Scope::Observer));
+        assert!(!video(true).allowed_for(Scope::AgentSafe));
+        assert!(video(true).allowed_for(Scope::Human));
         let clipboard = RemoteCommand::ClipboardPull {
             transfer: "x".into(),
         };

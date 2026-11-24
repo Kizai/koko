@@ -43,7 +43,7 @@ enum Origin {
     ApprovedAgent,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AppDesktop(mpsc::Sender<DesktopRequest>);
 
 #[derive(Default)]
@@ -146,7 +146,64 @@ pub(crate) struct RemoteHost {
     pub(crate) outbox: Arc<Outbox>,
     pub(crate) pointer: Mutex<()>,
     #[cfg(unix)]
-    pub(crate) video: Mutex<()>,
+    pub(crate) video: Arc<MediaSlot>,
+    #[cfg(unix)]
+    pub(crate) audio: Arc<MediaSlot>,
+}
+
+/// How long a new media request waits for the stream it replaces to wind down.
+#[cfg(unix)]
+const MEDIA_HANDOVER: Duration = Duration::from_secs(2);
+
+/// The one live stream of a media kind. A newer request from the same controller replaces the
+/// current stream at once, so switching displays never waits for the old stream to time out.
+/// Another controller's request is still refused while the stream is in use.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct MediaSlot {
+    active: Mutex<()>,
+    current: std::sync::Mutex<Option<(EndpointId, Arc<tokio::sync::Notify>)>>,
+}
+
+#[cfg(unix)]
+impl MediaSlot {
+    /// Makes `peer`'s new stream the current one, ending `peer`'s previous stream first.
+    /// Returns None while another controller's stream is live.
+    async fn claim(&self, peer: EndpointId) -> Option<(MutexGuard<'_, ()>, MediaTurn<'_>)> {
+        let previous = self.current.lock().unwrap().clone();
+        if let Some((owner, stop)) = previous {
+            if owner != peer {
+                return None;
+            }
+            stop.notify_one();
+        }
+        let active = tokio::time::timeout(MEDIA_HANDOVER, self.active.lock())
+            .await
+            .ok()?;
+        let stop = Arc::new(tokio::sync::Notify::new());
+        *self.current.lock().unwrap() = Some((peer, stop.clone()));
+        Some((active, MediaTurn { slot: self, stop }))
+    }
+}
+
+/// Forgets the current stream when it ends, unless a newer one already took its place.
+#[cfg(unix)]
+struct MediaTurn<'a> {
+    slot: &'a MediaSlot,
+    stop: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(unix)]
+impl Drop for MediaTurn<'_> {
+    fn drop(&mut self) {
+        let mut current = self.slot.current.lock().unwrap();
+        if current
+            .as_ref()
+            .is_some_and(|(_, stop)| Arc::ptr_eq(stop, &self.stop))
+        {
+            *current = None;
+        }
+    }
 }
 
 impl ProtocolHandler for RemoteHost {
@@ -256,17 +313,37 @@ impl RemoteHost {
                     let _ = send.finish();
                     continue;
                 }
-                Ok(command @ RemoteCommand::Video { .. }) => {
-                    tokio::select! {
-                        biased;
-                        _ = revoked(&authorization, peer, scope) => {
-                            connection.close(1u32.into(), b"peer not authorized");
-                            return Ok(());
+                Ok(command @ (RemoteCommand::Video { .. } | RemoteCommand::Audio)) => {
+                    let auth = authorization.clone();
+                    let conn = connection.clone();
+                    let app = self.app_desktop.clone();
+                    #[cfg(unix)]
+                    let slot = if matches!(command, RemoteCommand::Audio) {
+                        self.audio.clone()
+                    } else {
+                        self.video.clone()
+                    };
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            _ = revoked(&auth, peer, scope) => {
+                                conn.close(1u32.into(), b"peer not authorized");
+                                return;
+                            }
+                            _ = send.stopped() => return,
+                            result = RemoteHost::serve_media(
+                                command,
+                                app,
+                                peer,
+                                #[cfg(unix)]
+                                slot,
+                                &mut send,
+                            ) => {
+                                let _ = result;
+                            }
                         }
-                        _ = send.stopped() => return Ok(()),
-                        result = self.serve_video(command, &mut send) => result?,
-                    }
-                    send.finish()?;
+                        let _ = send.finish();
+                    });
                     continue;
                 }
                 Ok(RemoteCommand::Disconnect) => {
@@ -435,26 +512,31 @@ impl RemoteHost {
     }
 
     #[cfg(unix)]
-    async fn serve_video(
-        &self,
+    async fn serve_media(
         command: RemoteCommand,
+        app: Option<AppDesktop>,
+        peer: EndpointId,
+        slot: Arc<MediaSlot>,
         send: &mut SendStream,
     ) -> Result<(), AcceptError> {
         if !valid_remote_command(&command) {
             return send_video_error(send, "invalid_command").await;
         }
-        let Some(app) = &self.app_desktop else {
+        let Some(app) = app else {
             return send_video_error(send, "desktop_unavailable").await;
         };
-        let Ok(_active) = self.video.try_lock() else {
-            return send_video_error(send, "video_busy").await;
+        let is_audio = matches!(command, RemoteCommand::Audio);
+        let busy = if is_audio { "audio_busy" } else { "video_busy" };
+        // The same controller switching display or settings ends its old stream at once.
+        let Some((_active, turn)) = slot.claim(peer).await else {
+            return send_video_error(send, busy).await;
         };
         let directory = tempfile::Builder::new()
             .prefix("kv")
             .permissions(Permissions::from_mode(0o700))
             .tempdir()
             .map_err(AcceptError::from_err)?;
-        let path = directory.path().join("v");
+        let path = directory.path().join(if is_audio { "a" } else { "v" });
         let listener = UnixListener::bind(&path).map_err(AcceptError::from_err)?;
         if let RemoteReply::Error { code } = app
             .request(
@@ -470,16 +552,21 @@ impl RemoteHost {
             .await
             .map_err(AcceptError::from_err)?
             .map_err(AcceptError::from_err)?;
-        tokio::io::copy(&mut source, send)
-            .await
-            .map_err(AcceptError::from_err)?;
+        tokio::select! {
+            copied = tokio::io::copy(&mut source, send) => {
+                copied.map_err(AcceptError::from_err)?;
+            }
+            // Dropping the socket tells the app to stop capturing.
+            () = turn.stop.notified() => {}
+        }
         Ok(())
     }
 
     #[cfg(not(unix))]
-    async fn serve_video(
-        &self,
+    async fn serve_media(
         _command: RemoteCommand,
+        _app: Option<AppDesktop>,
+        _peer: EndpointId,
         send: &mut SendStream,
     ) -> Result<(), AcceptError> {
         send_video_error(send, "desktop_unavailable").await
@@ -688,6 +775,7 @@ fn execute(command: RemoteCommand) -> RemoteReply {
         | RemoteCommand::ClipboardTarget { .. }
         | RemoteCommand::ClipboardPublish { .. }
         | RemoteCommand::Pointer { .. }
+        | RemoteCommand::Audio
         | RemoteCommand::Video { .. } => {
             return RemoteReply::error("desktop_unavailable");
         }
@@ -791,7 +879,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -851,7 +941,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -945,7 +1037,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1048,7 +1142,9 @@ mod tests {
                     outbox: outbox.clone(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1086,6 +1182,39 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_stream_from_the_same_controller_replaces_the_old_one() {
+        let slot = MediaSlot::default();
+        let person = SecretKey::generate().public();
+        let agent = SecretKey::generate().public();
+
+        let (active, turn) = slot.claim(person).await.expect("an idle slot is free");
+        assert!(
+            slot.claim(agent).await.is_none(),
+            "another controller is refused"
+        );
+
+        let old_stream = async move {
+            // Stands in for the copy loop of the stream being replaced.
+            turn.stop.notified().await;
+            drop((active, turn));
+        };
+        let (claimed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(slot.claim(person), old_stream)
+        })
+        .await
+        .expect("the old stream ends at once instead of timing out");
+        let (active, turn) = claimed.expect("the newer stream takes over");
+        assert!(slot.current.lock().unwrap().is_some());
+        drop((active, turn));
+        assert!(slot.current.lock().unwrap().is_none());
+        assert!(
+            slot.claim(agent).await.is_some(),
+            "a free slot serves anyone"
+        );
+    }
+
     #[tokio::test]
     async fn a_person_preempts_an_operating_agent() -> Result<(), Box<dyn Error>> {
         let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
@@ -1109,7 +1238,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1190,7 +1321,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1241,7 +1374,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1308,7 +1443,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();
@@ -1344,7 +1481,9 @@ mod tests {
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
                     #[cfg(unix)]
-                    video: Mutex::new(()),
+                    video: Default::default(),
+                    #[cfg(unix)]
+                    audio: Default::default(),
                 },
             )
             .spawn();

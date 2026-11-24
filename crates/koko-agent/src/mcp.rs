@@ -36,8 +36,8 @@ const JPEG_QUALITY: u8 = 80;
 const MAX_SHOTS: usize = 64;
 const SETTLE: Duration = Duration::from_millis(600);
 const INSTRUCTIONS: &str = "KoKo lets you see and operate Macs whose owners paired them with you. \
-Call koko_list_devices first. If no device is paired, ask the user for the connection code shown \
-in KoKo on the host Mac and call koko_pair; the host owner approves the first pairing. \
+Call koko_list_devices first. If no device is paired, ask the user for the 9-digit device ID \
+shown in KoKo on the host Mac and call koko_pair; the host owner approves the first pairing. \
 Take a screenshot with koko_screenshot, or read the controls with koko_get_ui_tree, then use \
 koko_mouse with an element_id or with pixel coordinates from the screenshot, and koko_keyboard. The host owner sees when you are in control and can stop you at any time. \
 If a result says preempted_by_human, stop and tell the user; do not retry until they ask. \
@@ -131,20 +131,25 @@ impl Failure {
                 "declined",
                 "The host owner declined the request, or did not answer in time.",
             )
-        } else if error.contains("invalid pairing code") || error.contains("connection code") {
+        } else if error.contains("too_many_attempts") {
+            Self::new(
+                "locked",
+                "The host stopped checking codes after too many wrong ones. Wait a few minutes, or pair by device ID and let the owner approve.",
+            )
+        } else if error.contains("invalid pairing code") || error.contains("verification code") {
             Self::new(
                 "invalid_code",
-                "The connection code is not valid. Ask the user for the current code shown on the host.",
+                "The code in the invite is no longer valid. Ask the user for the device ID or a new direct invite.",
             )
-        } else if error.contains("host not found") {
+        } else if error.contains("host not found") || error.contains("device not found") {
             Self::new(
                 "host_not_found",
-                "No KoKo host with this code was found on the local network. Ask the user for the direct invite instead.",
+                "No KoKo host with this device ID was found on the local network. Ask the user for the direct invite instead.",
             )
         } else if error.contains("peer not authorized") {
             Self::new(
                 "not_paired",
-                "The host no longer accepts this agent. Ask the user for a new connection code and call koko_pair.",
+                "The host no longer accepts this agent. Ask the user for the device ID and call koko_pair again.",
             )
         } else {
             Self::new(
@@ -208,9 +213,10 @@ pub enum AgentScope {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct PairParams {
-    /// The 10-character connection code shown in KoKo on the host Mac (for example ABCDE-FGHJK),
-    /// or a direct invite that starts with koko://pair/v1/. Omit it to ask an already paired
-    /// device again by device_id, for example for more access.
+    /// The 9-digit device ID shown in KoKo on the host Mac (for example 253 153 157), or a direct
+    /// invite that starts with koko://pair/v1/. No verification code is needed: the host owner
+    /// approves an agent's first pairing. Omit it to ask an already paired device again by
+    /// device_id, for example for more access.
     pub code_or_invite: Option<String>,
     /// Device ID of an already paired host. Used when code_or_invite is omitted.
     pub device_id: Option<String>,
@@ -541,7 +547,7 @@ impl KokoMcp {
             .collect();
         let mut result = json!({"devices": devices});
         if devices.is_empty() {
-            result["message"] = "No paired devices. Ask the user for the KoKo connection code shown on the host Mac, then call koko_pair.".into();
+            result["message"] = "No paired devices. Ask the user for the 9-digit KoKo device ID shown on the host Mac, then call koko_pair.".into();
         }
         Ok(CallToolResult::success(vec![ContentBlock::text(
             result.to_string(),
@@ -549,7 +555,7 @@ impl KokoMcp {
     }
 
     #[tool(
-        description = "Pair this agent with a KoKo host Mac using the connection code or direct invite the user reads from KoKo on that Mac, or ask an already paired device again by device_id. The host owner must approve the first pairing and any request for more access; this call waits up to 90 seconds. Later connections to a trusted host need no approval."
+        description = "Pair this agent with a KoKo host Mac using the 9-digit device ID or direct invite the user reads from KoKo on that Mac, or ask an already paired device again by device_id. The host owner must approve the first pairing and any request for more access; this call waits up to 90 seconds. Later connections to a trusted host need no approval."
     )]
     async fn koko_pair(
         &self,
@@ -634,7 +640,17 @@ impl KokoMcp {
                         .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
                     (code, target, None)
                 } else if let Some(id) = parse_device_id(&input) {
-                    let discovered = find_device(&id, None)
+                    // A host paired before keeps its key, so a look-alike cannot answer for it.
+                    let known = self
+                        .state
+                        .registry
+                        .lock()
+                        .await
+                        .hosts
+                        .iter()
+                        .find(|host| koko_p2p::pairing::device_id(host.id) == id)
+                        .map(HostRecord::target);
+                    let discovered = find_device(&id, known)
                         .await
                         .map_err(|error| Failure::from_transport(&format!("{error:?}")))?;
                     (None, discovered.target, None)

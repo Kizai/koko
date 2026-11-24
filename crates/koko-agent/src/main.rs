@@ -69,6 +69,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         [command, file, target, flags @ ..] if command == "pair" => {
             let mut args = PairArgs::default();
+            // Secrets come on stdin, one per line, so other processes cannot read them from
+            // the command line: first the target when it is `-`, then the code for `--code-stdin`.
+            let mut secrets = std::io::stdin().lines();
+            let mut secret = |what: &str| -> Result<String, Box<dyn Error>> {
+                let line = secrets
+                    .next()
+                    .ok_or(format!("stdin ended before the {what}"))??;
+                Ok(line.trim().to_owned())
+            };
+            let target = if target == "-" {
+                secret("pairing target")?
+            } else {
+                target.clone()
+            };
             let mut flags = flags.iter();
             while let Some(flag) = flags.next() {
                 match flag.as_str() {
@@ -79,6 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         let value = flags.next().ok_or("--code needs a value")?;
                         args.code = Some(value.parse()?);
                     }
+                    "--code-stdin" => args.code = Some(secret("verification code")?.parse()?),
                     "--name" => {
                         let value = flags.next().ok_or("--name needs a value")?;
                         args.name = value.trim().to_owned();
@@ -90,7 +105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     _ => return Err(format!("unknown pairing option: {flag}").into()),
                 }
             }
-            pair(Path::new(file), target, args).await?;
+            pair(Path::new(file), &target, args).await?;
         }
         [command] if command == "discover" => {
             let devices: Vec<_> = discover_hosts()
@@ -358,19 +373,29 @@ async fn stream_video(
     client: &RemoteClient,
     request: &RemoteCommand,
 ) -> Result<(), Box<dyn Error>> {
-    let mut recv = client.open_command(request).await?;
+    let want_audio = matches!(request, RemoteCommand::Video { audio: true, .. });
+    let video_recv = client.open_command(request).await?;
+    let audio_recv = if want_audio {
+        client.open_command(&RemoteCommand::Audio).await.ok()
+    } else {
+        None
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let video_tx = tx.clone();
+    let video_task =
+        tokio::spawn(async move { read_media_records(video_recv, video_tx, false).await });
+    let audio_task = audio_recv.map(|recv| {
+        let audio_tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = read_media_records(recv, audio_tx, true).await;
+        })
+    });
+    drop(tx);
+
     let mut output = io::BufWriter::new(io::stdout().lock());
-    let mut packet = Vec::new();
     let mut last_stats = None::<Instant>;
-    let mut length = [0; 4];
-    while recv.read(&mut length[..1]).await?.is_some() {
-        recv.read_exact(&mut length[1..]).await?;
-        let size = u32::from_be_bytes(length) as usize;
-        if !(1..=MAX_VIDEO_PACKET).contains(&size) {
-            return Err("invalid video packet size".into());
-        }
-        packet.resize(size, 0);
-        recv.read_exact(&mut packet).await?;
+    while let Some(frame) = rx.recv().await {
         if last_stats.is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
             && let Some((rtt, direct)) = client.selected_path()
         {
@@ -380,9 +405,46 @@ async fn stream_video(
             output.write_all(&[u8::from(direct)])?;
             last_stats = Some(Instant::now());
         }
-        output.write_all(&length)?;
-        output.write_all(&packet)?;
+        output.write_all(&frame)?;
         output.flush()?;
+    }
+    if let Some(task) = audio_task {
+        task.abort();
+    }
+    video_task.await??;
+    Ok(())
+}
+
+async fn read_media_records(
+    mut recv: iroh::endpoint::RecvStream,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ignore_error_record: bool,
+) -> Result<(), String> {
+    let mut length = [0u8; 4];
+    while recv
+        .read(&mut length[..1])
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
+        recv.read_exact(&mut length[1..])
+            .await
+            .map_err(|e| e.to_string())?;
+        let size = u32::from_be_bytes(length) as usize;
+        if !(1..=MAX_VIDEO_PACKET).contains(&size) {
+            return Err("invalid media packet size".into());
+        }
+        let mut frame = vec![0u8; 4 + size];
+        frame[..4].copy_from_slice(&length);
+        recv.read_exact(&mut frame[4..])
+            .await
+            .map_err(|e| e.to_string())?;
+        if ignore_error_record && frame[4] == koko_proto::VIDEO_ERROR {
+            return Ok(());
+        }
+        if tx.send(frame).await.is_err() {
+            break;
+        }
     }
     Ok(())
 }

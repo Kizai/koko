@@ -33,11 +33,11 @@ flowchart LR
 | 组件 | 位置 | 职责 |
 | --- | --- | --- |
 | `Koko.app` | `apps/koko-macos/` | SwiftUI 主窗口、远控窗口和设置。被控端执行 daemon 转发的桌面请求，包括显示器列表、截帧、视频推流、键鼠和剪贴板。控制端管理各个 `koko-agent` 子进程，解码显示视频，合并并发送键鼠事件。 |
-| `koko-daemon` | `crates/koko-daemon` | 被控端监听进程。管理连接码、局域网请求、信任列表和当前会话授权，把已授权的远控命令转给 `Koko.app` 或 `koko-desktop`。 |
+| `koko-daemon` | `crates/koko-daemon` | 被控端监听进程。管理设备 ID、验证码、局域网请求、信任列表和当前会话授权，把已授权的远控命令转给 `Koko.app` 或 `koko-desktop`。 |
 | `koko-agent` | `crates/koko-agent` | 控制端 CLI。负责发现、配对、单次命令、持续命令通道和视频订阅，应用和脚本使用同一个程序。`mcp` 子命令以 stdio 提供 MCP Server，见 [Agent 与 MCP 设计规范](./agent.md)。 |
 | `koko-desktop` | `apps/koko-macos/desktop/` | 不经图形版、单独运行 daemon 时使用的 Swift 辅助程序，只处理主屏 PNG、比例坐标点击、常用按键和文本。 |
 | `koko-proto` | `crates/koko-proto` | ALPN 常量、远控命令与回复类型、请求校验和大小上限。 |
-| `koko-p2p` | `crates/koko-p2p` | 设备密钥持久化、iroh 端点、连接码、直连邀请、mDNS 发现和远控客户端。 |
+| `koko-p2p` | `crates/koko-p2p` | 设备密钥持久化、iroh 端点、设备 ID、验证码证明、直连邀请、mDNS 发现和远控客户端。 |
 | `koko-capture` | `crates/koko-capture` | macOS 录屏权限探测，供 `koko-daemon screen-permission` 在找不到 `koko-desktop` 时使用。 |
 | `koko-input` | `crates/koko-input` | 空 crate，预留给后续跨平台键鼠实现。macOS 键鼠由 Swift 投递。 |
 
@@ -50,16 +50,22 @@ flowchart LR
 | ALPN | 用途 |
 | --- | --- |
 | `koko/1` | 授权自检。控制端发送 `0x01`、四字节大端长度和 JSON 字符串 `"hello"`。已授权时主机以同样格式回复 `"ready"`。`koko-agent check` 使用这条路径。 |
-| `koko/pair/1` | 配对。人类控制端在一条双向流上发送 10 字节连接码，或发送 `request` 申请局域网确认，批准后主机回复 `koko/1` 的 `ready` 帧。Agent 发送不超过 1 KiB 的 JSON（版本 2），声明类型、名称、申请的作用域和可选的连接码，批准后主机回复 `{"v":2,"scope":...}`。 |
+| `koko/pair/1` | 配对。控制端发送不超过 1 KiB 的 JSON（版本 3），声明类型、名称、申请的作用域、可选的验证码证明 `proof` 和 `quiet`，批准后主机回复 `{"v":3,"scope":...}`。旧客户端只发 `request` 时仍可申请被控端确认；明文验证码一律拒绝。 |
 | `koko/remote/1` | 远控。每条双向流承载一条 JSON 命令和一条 JSON 回复；视频订阅的流保持打开，持续传送二进制记录。 |
 
 配对入口有三种格式：
 
-- **连接码**：10 个字符，取自去掉易混字符的 32 字符表（约 50 位熵），显示为 `ABCDE-FGHJK`。控制端通过 mDNS 查找对应主机，再在加密连接内提交连接码。
-- **直连邀请**：`koko://pair/v1/<连接码>/<主机公钥>/<IPv4:端口,...>`，用于组网环境中 mDNS 无法到达的情况。
+- **设备 ID + 验证码**：设备 ID 是 9 位数字，由 `blake3("koko/device-id/1" ‖ 主机公钥)` 得出，永不变化。控制端通过 mDNS 找到设备 ID 对应的主机。验证码是 6–16 位 ASCII 字母或数字，不区分大小写；临时验证码为 8 位，取自去掉易混字符的 32 字符表。
+- **直连邀请**：`koko://pair/v1/<验证码>/<主机公钥>/<IPv4:端口,...>`，用于组网环境中 mDNS 无法到达的情况。
 - **局域网申请**：`koko://request/v1/<主机公钥>/<IPv4:端口,...>`，由 `koko-agent discover` 的 `request` 字段给出，需要被控端确认。
 
-mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id`、系统类型 `os`、可选的设备名 `name`（最长 54 个字符），以及 `proof`。`proof` 是 `blake3("koko/lan-pair/1" ‖ 主机公钥 ‖ 连接码)` 的十六进制值，控制端据此找到连接码对应的主机，连接码本身不在网络上广播。
+mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id`、系统类型 `os` 和可选的设备名 `name`（最长 54 个字符）。
+
+验证码从不在网络上传输。控制端发送 `proof = blake3_keyed(derive_key("koko/pair-proof/1", 验证码), 主机公钥 ‖ 控制端公钥)` 的十六进制值，主机用自己的公钥和 QUIC 握手确认的控制端公钥重新计算并比对。冒充主机的设备只能拿到绑定它自己公钥的证明，无法拿去连接真正的主机。
+
+设备 ID 只有约 30 位，有人可以刻意生成设备 ID 相同的密钥。因此控制端连接过某台主机后，会记住它的公钥（应用传 `--known`，MCP 读取已配对设备列表），之后按设备 ID 查找时只接受公钥一致的主机。首次连接仍依赖局域网可信，需要更高保证时改用直连邀请。
+
+主机统计所有控制端输错验证码的次数：连续 5 次后暂停校验验证码 30 秒，之后每错一次时长翻倍，最长 10 分钟，期间回复 `too_many_attempts`。验证成功后清零。已信任的控制端不需要验证码，不受影响。
 
 ### 会话授权
 
@@ -67,9 +73,9 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 
 | 事件 | 结果 |
 | --- | --- |
-| 人类控制端提供有效连接码 | 直接授权。连接码有效期 5 分钟，任何一次批准后即失效。 |
+| 人类控制端提供有效验证码证明 | 直接授权。临时验证码在人类会话结束时刷新；会话进行中其他人类控制端会被拒绝，因此每次会话只能用一次。自定义验证码不过期，至少 8 位且须同时包含字母和数字。 |
 | 已信任的人类控制端发来局域网申请 | 直接授权。 |
-| Agent 首次配对 | 即使提供了有效连接码，也输出 `Pair request` 等待被控端确认。 |
+| Agent 首次配对 | 即使提供了有效验证码，也输出 `Pair request` 等待被控端确认。 |
 | 已信任的 Agent 申请不高于已授予的作用域 | 直接授权，不再询问。 |
 | 其他局域网申请，或 Agent 申请更高的作用域 | 输出 `Pair request` 等待确认。同时只保留一个待确认请求。 |
 | 已有人类会话时，又有人类控制端申请 | 拒绝，控制端看到 `pairing declined or expired`。 |
@@ -81,7 +87,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | 作用域 | 授予对象 | 允许的命令 |
 | --- | --- | --- |
 | `human` | 人类控制端 | 全部命令 |
-| `observer` | Agent | `hello`、`displays`、`ui_tree`、`screenshot`、`capture`、`video`、`disconnect`。其他命令返回 `scope_denied`。 |
+| `observer` | Agent | `hello`、`displays`、`ui_tree`、`screenshot`、`capture`、`video`、`audio`、`disconnect`。其他命令返回 `scope_denied`。 |
 | `agent_safe` | Agent | `observer` 的命令，加上 `pointer`、`click`、`key`、`text` 和 `release_control`。输入还要经过控制权仲裁。剪贴板仍只对人类开放。 |
 
 Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）判定。控制权有五种状态：`idle` 时 Agent 的下一条输入取得控制权，3 秒内有过人类输入则拒绝；`active` 时 Agent 可以操作，人类控制端的键鼠或剪贴板请求、被控端的「停止」或 ⌃⌥⌘. 都会转为 `paused`；`paused` 时 Agent 的输入返回 `preempted_by_human`，直到被控端的人点「让 Agent 继续」；`awaiting_human` 时 Agent 发出的 `request_human` 正在等人回答，Agent 的输入返回 `awaiting_human`，人回答「已完成」或超时后回到 `active`，回答「我来接管」「拒绝」或点「停止」后转为 `paused`；`awaiting_approval` 时一条 Agent 输入命中了被控端应用的高危操作规则，正等人「允许一次」「本次会话都允许」或「拒绝」，决定后回到 `active`，2 分钟无人回应按拒绝处理。规则见 [Agent 与 MCP 设计规范](./agent.md#高危操作审批)。被控 Mac 本机的实体键鼠由应用检测后以 `local-input` 告知 daemon，效果等同人类控制端的输入。Agent 60 秒没有输入、发送 `release_control` 或会话结束时，控制权回到 `idle`。Agent 发出的每条请求会写入 `~/.koko/audit.log`，不含截图和输入的文本。
@@ -100,7 +106,8 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `request_human` | `reason`（最多 500 字符）、`timeout_s`（10–600） | `human`，含 `result`（`resolved`、`declined`、`taken_over` 或 `timeout`）和可选的 `note`；等人回答期间保持请求打开 |
 | `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard`、`clipboard_stream` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
-| `video` | `capture` 的参数和 `fps`（30、60、90、120、144、165 或 240） | 二进制视频记录流 |
+| `video` | `capture` 的参数、`fps`（30、60、90、120、144、165 或 240），可选 `audio`、`hevc` 和 `chroma444` | 二进制视频记录流 |
+| `audio` | `display` | 二进制音频记录流（与 `video` 共享同一条 QUIC 连接上的独立双向流，避免关键帧队头阻塞音频） |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
 | `clipboard_pull` | `transfer`（UUID） | 被控端按下 ⌘C 后，流上先发一条清单记录（文字，或文件与文件夹的相对路径和大小），再按清单顺序连续发送全部文件字节；出错时发错误记录 |
 | `outbox_wait` | 无 | 最多等待 25 秒，返回被控端待发送的文件批次 `outbox`（`offers` 含批次 ID 和顶层名称）；有新批次时立即返回，超时返回空列表 |
@@ -110,7 +117,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `click`、`key`、`text` | 主屏比例坐标、常用按键名或最长 2048 字节的文本 | `ok` |
 | `disconnect` | 无 | `ok`，同时撤销本会话授权 |
 
-`pointer` 事件包括 `move`、`down`、`up`、`scroll`、`key_down`、`key_up` 和 `release`。按键使用 Mac 虚拟键码与 Core Graphics 修饰位右移 16 位。daemon 同一时间只允许一条连接发送 `pointer`，另一条连接会收到 `pointer_busy`，以保证按下、拖动和抬起的顺序。视频订阅同样只允许一个，新的订阅在旧订阅结束前收到 `video_busy`。
+`pointer` 事件包括 `move`、`down`、`up`、`scroll`、`key_down`、`key_up` 和 `release`。按键使用 Mac 虚拟键码与 Core Graphics 修饰位右移 16 位。daemon 同一时间只允许一条连接发送 `pointer`，另一条连接会收到 `pointer_busy`，以保证按下、拖动和抬起的顺序。视频和声音订阅各只允许一个。同一控制端发来新的订阅（例如切换显示器或调整画质）时，daemon 立即结束它的旧订阅并移交，最多等待 2 秒；其他控制端的订阅在旧订阅结束前收到 `video_busy` 或 `audio_busy`。
 
 失败时回复 `{"status":"error","code":...}`。稳定的错误码包括 `invalid_command`、`scope_denied`、`preempted_by_human`、`awaiting_human`、`awaiting_approval`、`approval_declined`、`approval_timeout`、`desktop_unavailable`、`screen_permission_required`、`input_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed`、`input_failed`、`pointer_busy`、`video_busy` 和 `clipboard_*` 系列。桌面请求默认等待 9 秒，剪贴板相关的桌面请求因可能等待 macOS 文件访问确认而等待 120 秒。
 
@@ -118,18 +125,22 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 以图形版模式运行时，所有命令都交给 `Koko.app`。单独运行 `koko-daemon serve-pair` 时，`screenshot`、`click`、`key` 和 `text` 由同目录的 `koko-desktop` 执行，其余命令返回 `desktop_unavailable`。
 
-### 视频记录
+### 音视频记录
 
-视频流中的每条记录是四字节大端长度，后接一字节类型和载荷，长度包含类型字节，单条不超过 8 MiB。
+视频流与音频流中的每条记录是四字节大端长度，后接一字节类型和载荷，长度包含类型字节，单条不超过 8 MiB。
 
 | 类型 | 值 | 载荷 |
 | --- | --- | --- |
-| `format` | 1 | SPS 与 PPS，各自带四字节大端长度前缀。格式变化时重发。 |
-| `frame` | 2 | 一帧 H.264，NAL 单元使用四字节长度前缀（AVCC）。 |
-| `error` | 3 | UTF-8 错误码，随后视频流结束。 |
+| `format` | 1 | H.264 的 SPS 与 PPS，各自带四字节大端长度前缀。格式变化时重发。 |
+| `frame` | 2 | 一帧 H.264 或 HEVC，NAL 单元使用四字节长度前缀（AVCC / HVCC）。 |
+| `error` | 3 | UTF-8 错误码，随后流结束。 |
 | `path` | 4 | 由控制端 `koko-agent` 每秒插入：八字节大端 RTT 毫秒数，加一字节是否为 IP 直连。 |
+| `audioFormat` | 5 | 40 字节大端 `AudioStreamBasicDescription` 字段加解码器 Magic Cookie。 |
+| `audioFrame` | 6 | 一帧 `AAC-ELD`（480 采样 / 10ms）或回退 `AAC-LC` 编码数据。 |
+| `syncFrame` | 7 | 八字节大端微秒级 PTS 加四字节长度前缀 NAL 单元（兼容带时间戳视频帧）。 |
+| `hevcFormat` | 8 | HEVC 的 VPS、SPS 与 PPS，各自带四字节大端长度前缀。 |
 
-被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit，用 VideoToolbox 实时编码（关闭帧重排，最长两秒一个关键帧），把记录写入 daemon 创建的 Unix socket。socket 位于仅当前用户可访问（0700）的临时目录。daemon 将其原样复制到 QUIC 流。控制端用 `AVSampleBufferDisplayLayer` 显示，并按 `path` 记录中的 RTT 自动降低分辨率和画质。
+被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端用零缓冲（`DisplayImmediately`）的 `AVSampleBufferDisplayLayer` 显示画面，并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质。
 
 ### 应用与辅助进程的接口
 
@@ -138,7 +149,9 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | daemon 输出 | 含义 |
 | --- | --- |
 | `Listening on <地址>`、`Trusted devices: <数量>` | 启动信息与信任设备数 |
-| `Pair code: <码>`、`Pair invite: <邀请>`、`Pair code expired` | 连接码与直连邀请 |
+| `Device ID: <设备 ID>`、`Pair code: <码>`、`Pair invite: <邀请>` | 设备 ID、临时验证码与直连邀请 |
+| `Pair code locked` | 输错验证码次数过多，暂停校验 |
+| `Custom code rejected` | 自定义验证码不符合要求（少于 8 位或未同时包含字母和数字），已停用 |
 | `Pair request: <编号> <公钥短标识> <JSON>` | 等待确认的申请，JSON 含 `kind`、`name` 和 `scope` |
 | `Pair approved`、`Session closed` | 人类会话开始与结束 |
 | `Agent session: <公钥短标识> <JSON>`、`Agent session closed` | Agent 会话开始与结束，JSON 含 `name` 和 `scope` |
@@ -146,13 +159,13 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `Agent help: <JSON>` | Agent 请人协助，JSON 含 `reason` 和 `timeout_s` |
 | `Agent approval: <JSON>` | 一条 Agent 输入等待批准，JSON 含 `reason` |
 | `Outbox queued <批次>`、`Outbox sent <批次>`、`Outbox failed <批次> <错误码>`、`Outbox refused` | 被控端发送文件的进展；没有人类控制端在线时拒绝入队 |
-| `Pair declined`、`Pair request ended`、`Pair code used` | 申请被拒绝、申请方已离开、连接码因批准而失效 |
+| `Pair declined`、`Pair request ended` | 申请被拒绝、申请方已离开 |
 | `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
-应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
-控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出；`remote` 用于单次的按键、文本和断开命令。
+控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次，`pair` 的目标和验证码通过标准输入传入（目标参数写 `-`，加 `--code-stdin`），避免出现在进程列表里；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出。应用结束订阅时先关闭它的标准输入，让它正常关闭 QUIC 连接，1.5 秒后仍未退出才强制结束；`remote` 用于单次的按键、文本和断开命令。
 
 ### 性能边界
 

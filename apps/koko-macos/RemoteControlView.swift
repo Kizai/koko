@@ -275,10 +275,15 @@ struct RemoteControlView: View {
         }
     }
 
+    /// Round trips are reported in whole milliseconds, so a local link reads 0.
+    private static func latencyText(_ milliseconds: Int) -> String {
+        milliseconds < 1 ? "<1 ms" : "\(milliseconds) ms"
+    }
+
     private var networkControls: some View {
         let rtt = connection.networkStats?.rttMS
         return Button { connection.showNetworkStats.toggle() } label: {
-            Label(rtt.map { "\($0) ms" } ?? "网络", systemImage: "waveform.path")
+            Label(rtt.map(Self.latencyText) ?? "网络", systemImage: "waveform.path")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(rtt.map { $0 < 100 ? Color.green : Color.orange } ?? .secondary)
                 .fixedSize()
@@ -289,7 +294,7 @@ struct RemoteControlView: View {
         .popover(isPresented: $connection.showNetworkStats, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("会话网络").font(.headline)
-                networkRow("网络延迟", rtt.map { "\($0) ms" } ?? "—")
+                networkRow("网络延迟", rtt.map(Self.latencyText) ?? "—")
                 networkRow(connection.networkStats?.isVideo == true ? "首帧耗时" : "帧请求耗时",
                            connection.networkStats.map { "\($0.frameMS) ms" } ?? "—")
                 networkRow("接收帧率", connection.networkStats?.framesPerSecond.map { String(format: "%.1f fps", $0) } ?? "—")

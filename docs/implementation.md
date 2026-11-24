@@ -30,7 +30,7 @@
 | --- | --- |
 | `koko-proto` | 声明 `koko/1` 自检帧，以及 `koko/remote/1` 的命令、回复、请求校验和大小上限。截图请求返回主显示器 PNG，不单独携带宽高，由调用方解码图像得到。 |
 | `koko-p2p` | 管理本地持久化设备身份，通过 iroh 建立带公钥身份的 QUIC 连接。所有端点使用 `presets::Minimal`，不启用中继和外部地址查询，只按明确的设备标识与 IP 地址直连。 |
-| `koko-daemon` | 在已登录的 macOS 图形会话中以前台模式运行。`serve` 只为一个指定控制端提供 `koko/1` 自检。`serve-pair` 通过连接码、局域网确认或信任列表授权一个控制端，尚无 `Observer` 等分级作用域。根据连接认证的公钥授权后，把命令交给 `Koko.app` 或 `koko-desktop`。 |
+| `koko-daemon` | 在已登录的 macOS 图形会话中以前台模式运行。`serve` 只为一个指定控制端提供 `koko/1` 自检。`serve-pair` 通过验证码证明、局域网确认或信任列表授权控制端，并按作用域限制 Agent。根据连接认证的公钥授权后，把命令交给 `Koko.app` 或 `koko-desktop`。 |
 | macOS 采集 | 图形版在 `Koko.app` 进程内检查录屏权限，通过 ScreenCaptureKit 采集所选显示器，截图编码为 PNG，远控画面编码为 H.264。CLI 独立运行时使用 `koko-desktop` 中的同一截图实现。 |
 | `koko-agent` | 提供本机设备标识、授权自检、发现、配对，以及从标准输入读取 JSON 命令的单次远控命令。结果以 JSON 写到标准输出，不接受本地输出路径。后续 MCP 复用同一调用路径。 |
 | `koko-input` | 仍为空。macOS 键鼠由 `Koko.app` 和 `koko-desktop` 通过 Core Graphics 投递。 |
@@ -98,7 +98,7 @@ cargo run --locked -p koko-agent -- check ~/.koko/controller.key "$HOST_ID" 192.
 /Applications/Koko.app/Contents/Helpers/koko-daemon serve-pair ~/.koko/host.key 0.0.0.0:4445
 ```
 
-daemon 输出 `Pair code` 和 `Pair invite`。把 `PAIR_INVITE` 设为输出的直连邀请，同一局域网也可以直接使用连接码。控制端配对成功后输出包含 `host_id` 和 `address` 的 JSON。局域网申请需要在 daemon 所在终端输入 `approve <编号>`。
+daemon 输出 `Device ID`、`Pair code` 和 `Pair invite`。把 `PAIR_INVITE` 设为输出的直连邀请，同一局域网也可以直接使用设备 ID。控制端配对成功后输出包含 `host_id` 和 `address` 的 JSON。局域网申请需要在 daemon 所在终端输入 `approve <编号>`。
 
 ```bash
 cargo run --locked -p koko-agent -- pair ~/.koko/controller.key "$PAIR_INVITE"

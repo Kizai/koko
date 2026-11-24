@@ -1,4 +1,7 @@
 import AppKit
+import AudioToolbox
+import CoreMedia
+import CoreVideo
 import SwiftUI
 
 @main
@@ -17,7 +20,8 @@ struct DesktopRegression {
         try checkClipboardItems()
         try checkAgentPolicy()
         try checkUpdateProgress()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度和 Agent 高危操作规则测试")
+        try checkMediaPipeline()
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度、音视频编解码回路和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {
@@ -55,6 +59,17 @@ struct DesktopRegression {
         guard !latency.constrained else { throw Failure("单次延迟波动不应切换画质") }
         latency.observe(151)
         guard latency.constrained else { throw Failure("持续高延迟时应降低自动画质") }
+
+        // A 60 Hz display delivers frames about 16.7 ms apart with jitter; none may be lost.
+        var pacer = FramePacer(fps: 60)
+        let jittered = (0..<60).map { Double($0) / 60 + ($0.isMultiple(of: 2) ? 0.0015 : -0.0015) }
+        guard jittered.filter({ pacer.accepts($0) }).count == 60 else { throw Failure("60 Hz 抖动下不应丢帧") }
+        // A 120 Hz display must still be paced down to the target rate.
+        var fast = FramePacer(fps: 60)
+        guard (0..<120).map({ Double($0) / 120 }).filter({ fast.accepts($0) }).count == 60
+        else { throw Failure("120 Hz 屏幕应按目标帧率降到 60 fps") }
+        guard FramePacer.captureInterval(fps: 60) < CMTime(value: 1, timescale: 60)
+        else { throw Failure("采集间隔应短于目标帧间隔，避免系统丢帧") }
         for sample in [70, 95, 72, 72, 72, 72] { latency.observe(sample) }
         guard latency.constrained else { throw Failure("网络恢复前应维持低带宽档位") }
         latency.observe(72)
@@ -114,6 +129,52 @@ struct DesktopRegression {
                 throw Failure(maximize ? "双击顶栏没有最大化窗口" : "再次双击顶栏没有还原窗口")
             }
         }
+    }
+
+    @MainActor private static func checkMediaPipeline() throws {
+        let encoder = try LowDelayAACEncoder()
+        guard let decoder = LowDelayAACDecoder() else { throw Failure("无法初始化音频解码器") }
+        var packets: [Data] = []
+        var phase = 0.0
+        let step = 2.0 * Double.pi * 440.0 / 48_000.0
+        for _ in 0..<500 {
+            var left = [Float](repeating: 0, count: 960)
+            var right = [Float](repeating: 0, count: 960)
+            for i in 0..<960 {
+                let s = Float(sin(phase) * 0.4)
+                left[i] = s
+                right[i] = s
+                phase += step
+            }
+            packets.append(contentsOf: encoder.encodePlanar(left: left, right: right))
+        }
+        guard let header = encoder.formatHeader, decoder.configure(header: header) else {
+            throw Failure("AAC 编码器未生成有效的格式头")
+        }
+        let expectedPackets = (500 * 960) / encoder.framesPerPacket
+        guard packets.count == expectedPackets else {
+            throw Failure("音频包数量不连续：期望 \(expectedPackets)，实际 \(packets.count)")
+        }
+        var decodedSamples = 0
+        for packet in packets {
+            guard let pcm = decoder.decode(frame: packet) else {
+                throw Failure("AAC 音频包解码失败")
+            }
+            decodedSamples += Int(pcm.frameLength)
+        }
+        guard decodedSamples == packets.count * encoder.framesPerPacket else {
+            throw Failure("解码采样数与编码采样数不一致：\(decodedSamples)")
+        }
+
+        let video = try VideoEncoder(
+            width: 1280, height: 720, fps: 60, quality: 82,
+            preferHEVC: VideoCapabilities.supportsHEVC,
+            prefer444: VideoCapabilities.supportsHEVC444
+        )
+        if VideoCapabilities.supportsHEVC {
+            guard video.isHEVC else { throw Failure("支持硬件 HEVC 的机器未启用 HEVC 编码") }
+        }
+        print("媒体管线验证通过：音频格式=\(encoder.formatID == kAudioFormatMPEG4AAC_ELD ? "AAC-ELD(10ms)" : "AAC-LC") 包数=\(packets.count)，视频编码=\(video.isHEVC ? (video.pixelFormat == kCVPixelFormatType_444YpCbCr8BiPlanarFullRange ? "HEVC 4:4:4 FullRange" : "HEVC 4:2:0 FullRange") : "H.264")")
     }
 
     /// The pasteboard is read as paths or text and filled back from received items; the bytes are streamed in Rust.

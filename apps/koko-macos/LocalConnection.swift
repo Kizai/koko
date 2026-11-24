@@ -173,6 +173,8 @@ struct RemoteAction: Codable {
     var quality: Int? = nil
     var fps: Int? = nil
     var audio: Bool? = nil
+    var hevc: Bool? = nil
+    var chroma444: Bool? = nil
     var level: Int? = nil
     var events: [RemotePointerEvent]? = nil
     var sourceOS: String? = nil
@@ -185,7 +187,7 @@ struct RemoteAction: Codable {
     var approved: Bool? = nil
 
     enum CodingKeys: String, CodingKey {
-        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, audio, level, events, format, cursor
+        case action, transfer, paths, x, y, key, text, display, edge, quality, fps, audio, hevc, chroma444, level, events, format, cursor
         case actor, approved
         case maxNodes = "max_nodes"
         case sourceOS = "source_os"
@@ -755,10 +757,16 @@ final class LocalConnection: ObservableObject {
             hostNotice = ConnectionNotice(message: "远程会话已结束。")
         case "Pair declined", "Pair request ended":
             pendingPair = nil
-            hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前连接码。")
+            hostNotice = ConnectionNotice(message: "配对未完成，仍可使用当前验证码。")
         case "Outbox refused":
             sendTimeout?.cancel()
             sendPanel.status = .failed("现在没有可以接收文件的控制端。")
+        case "Custom code rejected":
+            customVerificationCode = ""
+            KeychainCode.save("")
+            hostNotice = ConnectionNotice(message: "自定义验证码过于简单，已停用。请设置 8–16 位、同时包含字母和数字的新验证码。", isError: true)
+        case "Pair code locked":
+            hostNotice = ConnectionNotice(message: "有人多次输入错误验证码，已暂时停止校验验证码。", isError: true)
         case "Pair code used":
             connectionCode = ""
             directInvite = ""
@@ -930,8 +938,14 @@ final class LocalConnection: ObservableObject {
             case "video":
                 guard let display = action.display, let edge = action.edge, let quality = action.quality,
                       let fps = action.fps, let socket = action.videoSocket else { throw DesktopError.invalidCommand }
-                let settings = VideoSettings(display: display, edge: edge, quality: quality, fps: fps, audio: action.audio ?? false)
+                let settings = VideoSettings(
+                    display: display, edge: edge, quality: quality, fps: fps,
+                    audio: false, hevc: action.hevc ?? false, chroma444: action.chroma444 ?? false
+                )
                 Task { await streamDesktopVideo(settings, socket: socket) }
+            case "audio":
+                guard let socket = action.videoSocket else { throw DesktopError.invalidCommand }
+                Task { await streamDesktopAudio(socket: socket) }
             case "audio_volume":
                 let state = action.level.map { HostAudioVolume.write(level: $0) } ?? HostAudioVolume.read()
                 return RemoteReply(status: "audio_volume", level: state.level, muted: state.muted)
@@ -1114,8 +1128,23 @@ final class LocalConnection: ObservableObject {
         await sendHost("code-mode \(mode.rawValue)")
     }
 
+    /// The host only accepts ASCII letters and digits, compared without case.
+    nonisolated static func cleanedCode(_ code: String) -> String {
+        String(String.UnicodeScalarView(code.unicodeScalars.filter {
+            $0.isASCII && CharacterSet.alphanumerics.contains($0)
+        })).uppercased()
+    }
+
+    /// Mirrors the host's rule for a code that never expires.
+    nonisolated static func isStrongCustomCode(_ code: String) -> Bool {
+        (8...16).contains(code.count)
+            && code.contains(where: \.isLetter)
+            && code.contains(where: \.isNumber)
+    }
+
     func saveCustomVerificationCode(_ code: String) async {
-        let cleaned = code.filter { $0.isLetter || $0.isNumber }.uppercased()
+        let cleaned = Self.cleanedCode(code)
+        guard cleaned.isEmpty || Self.isStrongCustomCode(cleaned) else { return }
         customVerificationCode = cleaned
         KeychainCode.save(cleaned)
         await sendHost("custom-code \(cleaned)")
@@ -1222,16 +1251,21 @@ final class LocalConnection: ObservableObject {
 
         do {
             let defaults = UserDefaults.standard
-            var arguments = ["pair", keyPath(for: .controller), target, "--name", localHostName]
-            if let verificationCode { arguments.append(contentsOf: ["--code", verificationCode]) }
+            // The target and code go over stdin: a direct invite carries the code, and command
+            // lines are visible to every process on this Mac.
+            var arguments = ["pair", keyPath(for: .controller), "-", "--name", localHostName]
+            if verificationCode != nil { arguments.append("--code-stdin") }
             if quiet { arguments.append("--quiet") }
             if let knownHost, !knownHost.addresses.isEmpty {
                 arguments.append(contentsOf: ["--known", "\(knownHost.id)/\(knownHost.addresses.joined(separator: ","))"])
             }
             if defaults.object(forKey: "preferLAN") as? Bool ?? true { arguments.append("--prefer-lan") }
             if defaults.object(forKey: "enhancedConnections") as? Bool ?? true { arguments.append("--enhanced") }
-            let command = try LocalCommand(.controller, arguments: arguments)
+            let command = try LocalCommand(.controller, arguments: arguments, interactive: true)
             checkProcess = command.process
+            try await command.send(target)
+            if let verificationCode { try await command.send(verificationCode) }
+            command.finishInput()
             let reply = try await command.result()
             let host = try JSONDecoder().decode(PairedHost.self, from: Data(reply.utf8))
             let defaultFPS = UserDefaults.standard.integer(forKey: "defaultFrameRate")
@@ -1250,6 +1284,8 @@ final class LocalConnection: ObservableObject {
                     codePromptHostID = id
                 }
                 controllerNotice = ConnectionNotice(message: "请输入该设备的验证码以完成连接。", isError: true)
+            } else if message.contains("too_many_attempts") {
+                controllerNotice = ConnectionNotice(message: "验证码错误次数过多，对方已暂时停止校验验证码，请稍后再试或请对方确认连接。", isError: true)
             } else if message.contains("invalid pairing code") {
                 if let id = selectedNearbyHostID {
                     codePromptHostID = id
@@ -1386,7 +1422,9 @@ final class LocalConnection: ObservableObject {
                     edge: edge,
                     quality: quality,
                     fps: targetFPS,
-                    audio: isRemoteAudioEnabled
+                    audio: isRemoteAudioEnabled,
+                    hevc: VideoCapabilities.supportsHEVC,
+                    chroma444: VideoCapabilities.supportsHEVC444
                 )
                 if videoSettings != settings || (videoTask == nil && ContinuousClock.now >= videoRetryAfter) {
                     startVideo(session, settings: settings)
@@ -1490,6 +1528,8 @@ final class LocalConnection: ObservableObject {
                     break records
                 case .format:
                     size = try videoSurface.setFormat(bytes)
+                case .hevcFormat:
+                    size = try videoSurface.setHEVCFormat(bytes)
                 case .audioFormat:
                     videoSurface.setAudioFormat(bytes)
                 case .audioFrame:
@@ -1498,11 +1538,11 @@ final class LocalConnection: ObservableObject {
                     guard selectedDisplay?.id == settings.display else { continue }
                     if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }
                     guard videoSurface.isReadyForMoreMediaData else { continue }
-                    if kind == .syncFrame, let timed = AudioPacketCodec.decodeVideoTimedPayload(bytes) {
-                        try videoSurface.enqueue(timed.payload, ptsUs: timed.ptsUs)
-                    } else {
-                        try videoSurface.enqueue(bytes)
-                    }
+                    let payload = kind == .syncFrame
+                        ? (bytes.count > 8 ? bytes.subdata(in: 8..<bytes.count) : Data())
+                        : bytes
+                    guard !payload.isEmpty else { continue }
+                    try videoSurface.enqueue(payload)
                     let now = ContinuousClock.now
                     lastVideoFrameAt = now
                     if firstFrameMS == nil {

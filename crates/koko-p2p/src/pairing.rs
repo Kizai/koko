@@ -22,6 +22,8 @@ const ALPHABET: &[u8; 32] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 pub const TEMPORARY_CODE_LENGTH: usize = 8;
 /// Lengths accepted for any code, including one the host owner chose.
 pub const CODE_LENGTHS: RangeInclusive<usize> = 6..=16;
+/// The shortest code a host owner may choose. It never expires, so it is longer than the least.
+pub const CUSTOM_CODE_MIN: usize = 8;
 /// How long a lookup by device ID listens for the host on the local network.
 const FIND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,6 +49,33 @@ impl VerificationCode {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether a host owner may keep this as a code that never expires: at least
+    /// `CUSTOM_CODE_MIN` characters, mixing letters and digits.
+    pub fn strong_enough_to_keep(&self) -> bool {
+        self.0.len() >= CUSTOM_CODE_MIN
+            && self.0.bytes().any(|byte| byte.is_ascii_alphabetic())
+            && self.0.bytes().any(|byte| byte.is_ascii_digit())
+    }
+
+    /// Proves knowledge of this code to one host, for one controller, without sending the code.
+    /// A device that only pretends to be the host learns nothing it can replay at the real one.
+    pub fn proof(&self, host: EndpointId, controller: EndpointId) -> String {
+        self.proof_hash(host, controller).to_hex().to_string()
+    }
+
+    /// Checks a proof from `controller`. Hash equality is constant time.
+    pub fn verifies(&self, proof: &str, host: EndpointId, controller: EndpointId) -> bool {
+        blake3::Hash::from_hex(proof).is_ok_and(|proof| proof == self.proof_hash(host, controller))
+    }
+
+    fn proof_hash(&self, host: EndpointId, controller: EndpointId) -> blake3::Hash {
+        let key = blake3::derive_key("koko/pair-proof/1", self.0.as_bytes());
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(host.as_bytes());
+        hasher.update(controller.as_bytes());
+        hasher.finalize()
     }
 }
 
@@ -245,11 +274,15 @@ pub async fn discover_hosts() -> Result<Vec<DiscoveredHost>, Box<dyn Error>> {
 
 /// Finds the host with this device ID on the local network. When it does not answer there,
 /// falls back to `known`, the addresses a controller remembers from an earlier connection.
+///
+/// A device ID is short enough that someone could make a key with the same one, so once a
+/// controller knows the host's key it only accepts a host that has that key.
 pub async fn find_device(
     device: &str,
     known: Option<EndpointAddr>,
 ) -> Result<DiscoveredHost, Box<dyn Error>> {
     let known = known.filter(|target| device_id(target.id) == device);
+    let pinned = known.as_ref().map(|target| target.id);
     let daemon = ServiceDaemon::new()?;
     let events = daemon.browse(SERVICE)?;
     let found = timeout(FIND_TIMEOUT, async {
@@ -257,6 +290,7 @@ pub async fn find_device(
             if let ServiceEvent::ServiceResolved(service) = event
                 && let Some(target) = discovered_target(&service)
                 && device_id(target.id) == device
+                && pinned.is_none_or(|key| key == target.id)
             {
                 let mut host = DiscoveredHost {
                     target: EndpointAddr::new(target.id),
@@ -398,7 +432,7 @@ pub async fn request_human_pairing(
         kind: PeerKind::Human,
         name: pairing.name.to_owned(),
         scope: Scope::Human,
-        code: pairing.code.map(ToString::to_string),
+        proof: pairing.code.map(|code| code.proof(target.id, key.public())),
         quiet: pairing.quiet,
     };
     if !hello.valid() {
@@ -429,7 +463,7 @@ pub async fn request_agent_pairing(
         kind: PeerKind::Agent,
         name: name.to_owned(),
         scope,
-        code: code.map(ToString::to_string),
+        proof: code.map(|code| code.proof(target.id, key.public())),
         quiet: false,
     };
     if !hello.valid() {
@@ -502,6 +536,42 @@ mod tests {
         assert!(typed.matches(&"AB12CD34".parse().unwrap()));
         assert!("abc12".parse::<VerificationCode>().is_err(), "too short");
         assert!("abc12!".parse::<VerificationCode>().is_err(), "punctuation");
+        let host = SecretKey::generate().public();
+        let controller = SecretKey::generate().public();
+        let proof = generated.proof(host, controller);
+        assert!(!proof.contains(generated.as_str()));
+        assert!(generated.verifies(&proof, host, controller));
+        let elsewhere = SecretKey::generate().public();
+        assert!(
+            !generated.verifies(&proof, elsewhere, controller),
+            "a proof made for a look-alike host is useless at the real one"
+        );
+        assert!(!generated.verifies(&proof, host, elsewhere));
+        assert!(!generated.verifies("not hex", host, controller));
+        assert!(
+            "KOKO2026"
+                .parse::<VerificationCode>()
+                .unwrap()
+                .strong_enough_to_keep()
+        );
+        assert!(
+            !"KOKO26"
+                .parse::<VerificationCode>()
+                .unwrap()
+                .strong_enough_to_keep()
+        );
+        assert!(
+            !"12345678"
+                .parse::<VerificationCode>()
+                .unwrap()
+                .strong_enough_to_keep()
+        );
+        assert!(
+            !"ABCDEFGH"
+                .parse::<VerificationCode>()
+                .unwrap()
+                .strong_enough_to_keep()
+        );
     }
 
     #[test]

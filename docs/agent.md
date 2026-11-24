@@ -43,14 +43,14 @@
 
 - **独立密钥**。Agent 默认使用 `~/.koko/agent.key`。`koko-agent mcp --identity <文件> --name <名称>` 可为不同 MCP 客户端指定不同身份。
 - **识别依据**。被控端只依据 QUIC 握手确认的公钥识别 Agent。Agent 自报的名称和类型只用于显示。
-- **配对声明**。`koko/pair/1` 流中，旧客户端仍发送 10 字节连接码或 `request`。新客户端发送不超过 1 KiB 的 JSON，首字节为 `{`，与旧格式不冲突。旧格式一律按人类控制端处理。
+- **配对声明**。`koko/pair/1` 流中发送不超过 1 KiB 的 JSON（版本 3）。旧客户端发送的 `request` 仍按人类控制端的局域网申请处理。
 
   ```json
-  {"v": 2, "kind": "agent", "name": "Claude Desktop", "scope": "agent_safe", "code": "ABCDEFGHJK"}
+  {"v": 3, "kind": "agent", "name": "Claude Desktop", "scope": "agent_safe"}
   ```
 
-  `code` 可省略，省略时按局域网申请处理。daemon 读取配对请求的上限为 1 KiB。
-- **首次确认，之后信任重连**。Agent 第一次配对时，即使提供了有效连接码，也必须由被控端确认。连接码只用来找到并绑定主机，不能跳过确认。确认框显示类型（人 / Agent）、名称、公钥指纹和申请的作用域，被控端可以降低作用域，例如只授予 `observer`。对 Agent 的确认默认勾选「信任」。信任后，同一 Agent 公钥在本机共享开启时直接重连，沿用已授予的作用域，不再询问。只有以下情况需要再次确认：申请比已授予更高的作用域，被控端清除了信任，或 Agent 换了密钥。
+  直连邀请带有验证码时，客户端附上 `proof`：用验证码派生的密钥对主机公钥和自己的公钥做 blake3 keyed hash，验证码本身不发送。省略 `proof` 时按局域网申请处理。
+- **首次确认，之后信任重连**。Agent 第一次配对时，即使提供了有效验证码，也必须由被控端确认，因此 Agent 只需要被控端的 9 位设备 ID。验证码不能跳过确认。确认框显示类型（人 / Agent）、名称、公钥指纹和申请的作用域，被控端可以降低作用域，例如只授予 `observer`。对 Agent 的确认默认勾选「信任」。信任后，同一 Agent 公钥在本机共享开启时直接重连，沿用已授予的作用域，不再询问。只有以下情况需要再次确认：申请比已授予更高的作用域，被控端清除了信任，或 Agent 换了密钥。
 - **信任记录**。升级为 `~/.koko/trusted-controllers.json`，每条记录包含公钥、类型、作用域、名称和批准时间。读取到旧的每行一个公钥的文件时，按人类控制端、完整权限迁移。
 - **被控端输出**。待确认的申请输出为 `Pair request: <编号> <公钥短标识> {"kind","name","scope"}`，Agent 会话开始和结束分别输出 `Agent session: <公钥短标识> {"name","scope"}` 与 `Agent session closed`。应用用 `approve <编号> observer` 这类命令缩小作用域，用 `end-agent` 断开 Agent。
 
@@ -58,13 +58,14 @@
 
 | 命令 | `observer` | `agent_safe` | `human` |
 | --- | --- | --- | --- |
-| `hello`、`displays`、`screenshot`、`capture`、`video`、`disconnect` | ✓ | ✓ | ✓ |
+| `hello`、`displays`、`screenshot`、`wallpaper`、`capture`、不带声音的 `video`、`disconnect` | ✓ | ✓ | ✓ |
 | `ui_tree` | ✓ | ✓ | ✓ |
+| `audio`、`audio_volume`、带声音的 `video` | — | — | ✓ |
 | `pointer`、`click`、`key`、`text` | — | 持有控制权时 | ✓ |
 | `release_control`、`request_human` | — | ✓ | — |
 | `clipboard` | — | — | ✓ |
 
-`human` 对应当前的人类远控会话。`agent_full` 留给后续的 Shell 与文件能力，本阶段不实现。所有作用域检查都在 daemon 执行，未知类型或作用域一律拒绝。
+`human` 对应当前的人类远控会话。被控端的声音可能包含通话或个人媒体，Agent 看屏幕不需要听声音，因此只开放给人类会话。`agent_full` 留给后续的 Shell 与文件能力，本阶段不实现。所有作用域检查都在 daemon 执行，未知类型或作用域一律拒绝。
 
 ## 会话与控制权
 
@@ -291,7 +292,7 @@ MCP Server 为每台设备保持一条长连接，断开后按设备注册表的
 
 | 问题 | 决定 |
 | --- | --- |
-| Agent 用连接码配对时是否需要被控端确认 | 只在首次配对时确认，默认信任该 Agent 公钥，之后重连不再询问。连接码不能跳过首次确认。申请更高作用域、清除信任或更换密钥时重新确认。 |
+| Agent 用设备 ID 或直连邀请配对时是否需要被控端确认 | 只在首次配对时确认，默认信任该 Agent 公钥，之后重连不再询问。验证码不能跳过首次确认。申请更高作用域、清除信任或更换密钥时重新确认。 |
 | `koko_request_human` 由谁响应 | 被控端的人和人类控制端都可以。首个版本先实现被控端。 |
 | 无人值守时是否允许 Agent 操作 | 允许。指示条、全局快捷键和审计日志照常生效。 |
 | 是否允许多个 Agent 同时连接同一台被控端 | 先只允许一个，其他 Agent 收到 `agent_busy`。单 Agent 流程稳定后再评估。 |

@@ -4,7 +4,7 @@ use std::io::{self, BufRead};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::{
     EndpointAddr, EndpointId, SecretKey,
@@ -17,8 +17,8 @@ use koko_p2p::{
 };
 use koko_proto::{
     ALPN, CONTROL_READY, CONTROL_REQUEST, HumanResult, MAX_HELP_REASON, MAX_PAIR_REQUEST,
-    PAIR_ALPN, PAIR_CODE_REQUIRED, PAIR_VERSION, PairGranted, PairHello, PeerKind, REMOTE_ALPN,
-    Scope,
+    PAIR_ALPN, PAIR_CODE_REQUIRED, PAIR_LOCKED, PAIR_VERSION, PairGranted, PairHello, PeerKind,
+    REMOTE_ALPN, Scope,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const DECLINED: &str = "pairing declined or expired";
+const INVALID_CODE: &str = "invalid pairing code";
 const AGENT_BUSY: &str = "agent_busy";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,18 +77,56 @@ impl Codes {
         }
     }
 
-    fn matches(&self, supplied: &VerificationCode) -> bool {
-        (self.mode.allows_temporary() && self.temporary.matches(supplied))
-            || (self.mode.allows_custom()
-                && self
-                    .custom
-                    .as_ref()
-                    .is_some_and(|code| code.matches(supplied)))
+    /// Whether `proof` shows that `controller` knows a code this host accepts right now.
+    fn verifies(&self, proof: &str, host: EndpointId, controller: EndpointId) -> bool {
+        let temporary =
+            self.mode.allows_temporary() && self.temporary.verifies(proof, host, controller);
+        let custom = self.mode.allows_custom()
+            && self
+                .custom
+                .as_ref()
+                .is_some_and(|code| code.verifies(proof, host, controller));
+        temporary || custom
     }
 
     fn refresh_temporary(&mut self) -> VerificationCode {
         self.temporary = VerificationCode::generate();
         self.temporary.clone()
+    }
+}
+
+/// Wrong codes allowed before the host stops checking codes for a while.
+const FREE_ATTEMPTS: u32 = 5;
+const FIRST_LOCK: Duration = Duration::from_secs(30);
+const LONGEST_LOCK: Duration = Duration::from_secs(10 * 60);
+
+/// Slows down guessing. It counts wrong codes from every controller together, because a
+/// guesser can make a new key for each try. Trusted controllers need no code, so a lock never
+/// keeps them out.
+#[derive(Debug, Default)]
+struct Attempts {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl Attempts {
+    fn locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| now < until)
+    }
+
+    /// Each wrong code past the free ones doubles the lock, up to `LONGEST_LOCK`.
+    fn failed(&mut self, now: Instant) {
+        self.failures += 1;
+        if let Some(extra) = self.failures.checked_sub(FREE_ATTEMPTS) {
+            let lock = FIRST_LOCK
+                .saturating_mul(1 << extra.min(16))
+                .min(LONGEST_LOCK);
+            self.locked_until = Some(now + lock);
+        }
+    }
+
+    fn succeeded(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -123,13 +162,40 @@ impl PairRequest {
 }
 
 struct Pairing {
+    host: EndpointId,
     codes: Arc<Mutex<Codes>>,
+    attempts: Mutex<Attempts>,
     requests: mpsc::Sender<PairRequest>,
 }
 
 impl fmt::Debug for Pairing {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("Pairing").finish_non_exhaustive()
+    }
+}
+
+impl Pairing {
+    fn check(&self, proof: &str, controller: EndpointId) -> Result<(), &'static str> {
+        let now = Instant::now();
+        let mut attempts = self.attempts.lock().unwrap();
+        if attempts.locked(now) {
+            return Err(PAIR_LOCKED);
+        }
+        if self
+            .codes
+            .lock()
+            .unwrap()
+            .verifies(proof, self.host, controller)
+        {
+            attempts.succeeded();
+            Ok(())
+        } else {
+            attempts.failed(now);
+            if attempts.locked(now) {
+                println!("Pair code locked");
+            }
+            Err(INVALID_CODE)
+        }
     }
 }
 
@@ -148,13 +214,15 @@ impl ProtocolHandler for Pairing {
                 connection.close(1u32.into(), b"invalid pairing request");
                 return Ok(());
             };
-            let by_code = match hello.code.as_deref().map(str::parse::<VerificationCode>) {
+            let by_code = match hello.proof.as_deref() {
                 None => false,
-                Some(Ok(code)) if self.codes.lock().unwrap().matches(&code) => true,
-                Some(_) => {
-                    connection.close(1u32.into(), b"invalid pairing code");
-                    return Ok(());
-                }
+                Some(proof) => match self.check(proof, connection.remote_id()) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        connection.close(1u32.into(), reason.as_bytes());
+                        return Ok(());
+                    }
+                },
             };
             let name = hello.name.trim().to_owned();
             let agent = (hello.kind == PeerKind::Agent).then(|| AgentRequest {
@@ -162,19 +230,13 @@ impl ProtocolHandler for Pairing {
                 scope: hello.scope,
             });
             (by_code, hello.quiet, agent, name, true)
+        } else if bytes == CONTROL_REQUEST {
+            // Clients from before pairing version 2 can still ask the host owner. They sent
+            // codes in the clear, so a code from one is no longer accepted.
+            (false, false, None, String::new(), false)
         } else {
-            let by_code = if bytes == CONTROL_REQUEST {
-                false
-            } else if let Ok(text) = std::str::from_utf8(&bytes)
-                && let Ok(code) = text.parse::<VerificationCode>()
-                && self.codes.lock().unwrap().matches(&code)
-            {
-                true
-            } else {
-                connection.close(1u32.into(), b"invalid pairing code");
-                return Ok(());
-            };
-            (by_code, false, None, String::new(), false)
+            connection.close(1u32.into(), INVALID_CODE.as_bytes());
+            return Ok(());
         };
 
         let (decision, response) = oneshot::channel();
@@ -400,8 +462,15 @@ impl HostState {
             let mut codes = self.codes.lock().unwrap();
             if trimmed.is_empty() {
                 codes.custom = None;
-            } else if let Ok(code) = trimmed.parse::<VerificationCode>() {
-                codes.custom = Some(code);
+            } else {
+                match trimmed.parse::<VerificationCode>() {
+                    Ok(code) if code.strong_enough_to_keep() => codes.custom = Some(code),
+                    // An older app may have saved a weaker code. It stays off until replaced.
+                    _ => {
+                        codes.custom = None;
+                        println!("Custom code rejected");
+                    }
+                }
             }
             return;
         }
@@ -496,7 +565,8 @@ pub(crate) async fn serve(
     let mut session_changes = sessions.subscribe();
     let (requests, mut incoming) = mpsc::channel(1);
     let (app_desktop, mut desktop_requests) = AppDesktop::channel();
-    let host_device_id = device_id(endpoint.id());
+    let host_key = endpoint.id();
+    let host_device_id = device_id(host_key);
     let router = Router::builder(endpoint)
         .accept(
             REMOTE_ALPN,
@@ -508,14 +578,18 @@ pub(crate) async fn serve(
                 outbox: outbox.clone(),
                 pointer: tokio::sync::Mutex::new(()),
                 #[cfg(unix)]
-                video: tokio::sync::Mutex::new(()),
+                video: Default::default(),
+                #[cfg(unix)]
+                audio: Default::default(),
             },
         )
         .accept(ALPN, Host { authorized })
         .accept(
             PAIR_ALPN,
             Pairing {
+                host: host_key,
                 codes: codes.clone(),
+                attempts: Mutex::default(),
                 requests,
             },
         )
@@ -627,7 +701,9 @@ mod tests {
             .accept(
                 PAIR_ALPN,
                 Pairing {
+                    host: id,
                     codes: codes.clone(),
+                    attempts: Mutex::default(),
                     requests,
                 },
             )
@@ -696,7 +772,15 @@ mod tests {
         assert!(try_code.is_none());
         let router = Router::builder(endpoint)
             .accept(ALPN, Host { authorized })
-            .accept(PAIR_ALPN, Pairing { codes, requests })
+            .accept(
+                PAIR_ALPN,
+                Pairing {
+                    host: host_id,
+                    codes,
+                    attempts: Mutex::default(),
+                    requests,
+                },
+            )
             .spawn();
 
         timeout(Duration::from_secs(10), async {
@@ -769,6 +853,45 @@ mod tests {
         .await??;
         host.router.shutdown().await?;
         Ok(())
+    }
+
+    #[test]
+    fn wrong_codes_lock_code_checks_for_longer_each_time() {
+        let start = Instant::now();
+        let mut attempts = Attempts::default();
+        for _ in 0..FREE_ATTEMPTS - 1 {
+            attempts.failed(start);
+            assert!(!attempts.locked(start));
+        }
+        attempts.failed(start);
+        assert!(attempts.locked(start + FIRST_LOCK - Duration::from_secs(1)));
+        assert!(!attempts.locked(start + FIRST_LOCK));
+        attempts.failed(start);
+        assert!(attempts.locked(start + FIRST_LOCK * 2 - Duration::from_secs(1)));
+        for _ in 0..20 {
+            attempts.failed(start);
+        }
+        assert!(!attempts.locked(start + LONGEST_LOCK));
+        attempts.succeeded();
+        assert!(!attempts.locked(start));
+    }
+
+    #[test]
+    fn weak_custom_codes_are_turned_off() {
+        let mut state = HostState {
+            sessions: watch::channel(Sessions::default()).0,
+            arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::ZERO)),
+            outbox: Default::default(),
+            trust: Trust::load(None).unwrap(),
+            codes: Arc::new(Mutex::new(Codes::new())),
+            target: None,
+            pending: None,
+            request_number: 0,
+        };
+        state.command("custom-code KOKO2026");
+        assert!(state.codes.lock().unwrap().custom.is_some());
+        state.command("custom-code 123456");
+        assert!(state.codes.lock().unwrap().custom.is_none());
     }
 
     #[tokio::test]

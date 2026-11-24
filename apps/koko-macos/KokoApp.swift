@@ -1041,15 +1041,15 @@ private struct ConnectionView: View {
     private var customCodeSheet: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("自定义验证码").font(.headline)
-            Text("设置 6–16 位字母或数字验证码。留空保存则清除自定义验证码。")
+            Text("设置 8–16 位验证码，须同时包含字母和数字。留空保存则清除自定义验证码。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextField("例如 KOKO2026", text: $customCodeDraft)
                 .textFieldStyle(.roundedBorder)
-            let cleaned = customCodeDraft.filter { $0.isLetter || $0.isNumber }
-            let valid = cleaned.isEmpty || (6...16).contains(cleaned.count)
+            let cleaned = LocalConnection.cleanedCode(customCodeDraft)
+            let valid = cleaned.isEmpty || LocalConnection.isStrongCustomCode(cleaned)
             if !valid {
-                Text("请输入 6–16 位字母或数字。").font(.caption).foregroundStyle(.red)
+                Text("请输入 8–16 位，且同时包含字母和数字。").font(.caption).foregroundStyle(.red)
             }
             HStack {
                 Spacer()
