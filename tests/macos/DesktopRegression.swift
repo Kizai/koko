@@ -2,6 +2,7 @@ import AppKit
 import AudioToolbox
 import CoreMedia
 import CoreVideo
+import Metal
 import SwiftUI
 
 @main
@@ -22,7 +23,8 @@ struct DesktopRegression {
         try checkUpdateProgress()
         try checkMediaPipeline()
         try checkVideoFlow()
-        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度、音视频编解码回路、视频流控和 Agent 高危操作规则测试")
+        for chroma444 in [true, false] { try await checkVideoRendering(chroma444: chroma444) }
+        print("通过发布更新检查、升级权限检测、高级设置、顶栏拖动、双击最大化与还原、管道背压、辅助进程退出、剪贴板读写、更新进度、音视频编解码回路、视频流控、Metal 解码直出和 Agent 高危操作规则测试")
     }
 
     struct Failure: LocalizedError {
@@ -145,6 +147,72 @@ struct DesktopRegression {
             guard window.frame == expected else {
                 throw Failure(maximize ? "双击顶栏没有最大化窗口" : "再次双击顶栏没有还原窗口")
             }
+        }
+    }
+
+    /// Encodes a red frame, decodes it with VideoToolbox and draws it with the Metal shader, then
+    /// reads the middle pixel back: catches wrong planes, range or color matrix in the renderer.
+    private static func checkVideoRendering(chroma444: Bool) async throws {
+        let encoder = try VideoEncoder(width: 320, height: 180, fps: 60, quality: 90,
+                                       preferHEVC: VideoCapabilities.supportsHEVC,
+                                       prefer444: chroma444 && VideoCapabilities.supportsHEVC444)
+        var created: CVPixelBuffer?
+        let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary
+        guard CVPixelBufferCreate(nil, 320, 180, encoder.pixelFormat, attributes, &created) == kCVReturnSuccess,
+              let pixels = created else { throw Failure("无法创建测试画面") }
+        // Rec. 709 full range red: Y 54, Cb 99, Cr 255.
+        CVPixelBufferLockBaseAddress(pixels, [])
+        for plane in 0..<2 {
+            let base = CVPixelBufferGetBaseAddressOfPlane(pixels, plane)!.assumingMemoryBound(to: UInt8.self)
+            let rows = CVPixelBufferGetHeightOfPlane(pixels, plane), stride = CVPixelBufferGetBytesPerRowOfPlane(pixels, plane)
+            let width = CVPixelBufferGetWidthOfPlane(pixels, plane)
+            for row in 0..<rows {
+                for column in 0..<width {
+                    if plane == 0 {
+                        base[row * stride + column] = 54
+                    } else {
+                        base[row * stride + column * 2] = 99
+                        base[row * stride + column * 2 + 1] = 255
+                    }
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixels, [])
+        CVBufferSetAttachment(pixels, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
+        var description: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixels, formatDescriptionOut: &description)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 60), presentationTimeStamp: .zero,
+                                        decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        guard let description, CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: nil, imageBuffer: pixels, formatDescription: description, sampleTiming: &timing, sampleBufferOut: &sample
+        ) == noErr, let sample else { throw Failure("无法创建测试帧") }
+        guard let encoded = try await encoder.encode(sample, keyFrame: true), let format = encoded.formatDescription
+        else { throw Failure("测试帧编码失败") }
+
+        let decoder = try VideoDecoder(format: format)
+        let (status, decoded) = decoder.decode(encoded)
+        guard status == noErr, let decoded else { throw Failure("VideoToolbox 解码失败：\(status)") }
+        guard decoder.isHardware || !VideoCapabilities.supportsHEVC else { throw Failure("支持硬件解码的机器应使用硬解") }
+
+        let drawing = try VideoDrawing()
+        let target = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 160, height: 90, mipmapped: false)
+        target.usage = [.renderTarget]
+        target.storageMode = .managed
+        guard let texture = drawing.device.makeTexture(descriptor: target),
+              let queue = drawing.device.makeCommandQueue(), let commands = queue.makeCommandBuffer()
+        else { throw Failure("无法创建 Metal 目标") }
+        let textures = drawing.encode(decoded, into: texture, commands: commands)
+        guard !textures.isEmpty else { throw Failure("Metal 无法读取解码后的画面") }
+        let blit = commands.makeBlitCommandEncoder()!
+        blit.synchronize(resource: texture)
+        blit.endEncoding()
+        commands.commit()
+        await commands.completed()
+        var bgra = [UInt8](repeating: 0, count: 4)
+        texture.getBytes(&bgra, bytesPerRow: 160 * 4, from: MTLRegionMake2D(80, 45, 1, 1), mipmapLevel: 0)
+        guard bgra[2] > 225, bgra[1] < 30, bgra[0] < 30 else {
+            throw Failure("Metal 颜色转换不正确（\(chroma444 ? "4:4:4" : "4:2:0")）：BGRA \(bgra)")
         }
     }
 

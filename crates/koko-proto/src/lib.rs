@@ -21,6 +21,9 @@ pub const VIDEO_PATH: u8 = 4;
 /// Hosts send it only to controllers that asked for `feedback`.
 pub const VIDEO_SEQUENCED_FRAME: u8 = 9;
 pub const VIDEO_FRAME_KEY: u8 = 1;
+/// JSON naming the host's encoder (`hardware` or `software`) and capture method. Sent first, and
+/// only to controllers that asked for `feedback`.
+pub const VIDEO_STREAM_INFO: u8 = 10;
 
 // Records a controller writes back on a video stream it opened with `feedback`. Each is a
 // big-endian u32 length, a kind byte and its payload, like the video records themselves.

@@ -127,7 +127,7 @@ cargo test --workspace --locked
 
 KoKo will not add public relays or cloud signaling; reaching other networks is left to overlay networks you control, such as Tailscale and ZeroTier. Next:
 
-- **Intranet image quality and latency**: per-frame acknowledgements now keep only a few frames in flight and adapt the bitrate in real time. Next: present decoded frames directly with Metal, support 120/165 Hz displays, and push toward high frame rates at 1440p.
+- **Intranet image quality and latency**: per-frame acknowledgements now keep only a few frames in flight and adapt the bitrate in real time. Frames are decoded in hardware and drawn directly with Metal, ready for 120/165 Hz displays. Next: push toward high frame rates at 1440p and fold the network layer into the app to cut hand-offs between processes.
 - **Agent capabilities**: MCP already covers screenshots, UI reading, mouse and keyboard, and asking for help, with host approval for risky actions. Next come two-Mac acceptance tests and resource measurements.
 - **More platforms and intranet management**: after the macOS experience is polished, Windows / Linux hosts, plus batch deployment, central management, and auditing for company networks and school labs.
 

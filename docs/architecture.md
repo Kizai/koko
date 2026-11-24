@@ -141,6 +141,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `audioFrame` | 6 | 一帧 `AAC-ELD`（480 采样 / 10ms）或回退 `AAC-LC` 编码数据。 |
 | `syncFrame` | 7 | 八字节大端微秒级 PTS 加四字节长度前缀 NAL 单元（兼容带时间戳视频帧）。 |
 | `hevcFormat` | 8 | HEVC 的 VPS、SPS 与 PPS，各自带四字节大端长度前缀。 |
+| `streamInfo` | 10 | JSON：被控端编码器（`hardware` / `software`）与采集方式（`ScreenCaptureKit`）。只发给请求了 `feedback` 的控制端，在第一帧之前。 |
 | `sequencedFrame` | 9 | 四字节大端帧序号、一字节标志（第 0 位为关键帧），后接与 `frame` 相同的载荷。只发给请求了 `feedback` 的控制端。 |
 
 ### 视频反馈与流控
@@ -162,7 +163,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 控制端收到 `sequencedFrame` 后总是回确认。显示层排不下时跳过该帧并请求关键帧，之后的非关键帧一律跳过，直到关键帧到达，避免花屏。
 
-被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧，带反馈时十秒）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端用零缓冲（`DisplayImmediately`）的 `AVSampleBufferDisplayLayer` 显示画面，并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质；码率与帧率的实时调整见[视频反馈与流控](#视频反馈与流控)。
+被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧，带反馈时十秒）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端在专用队列上用 VideoToolbox（`VTDecompressionSession`，优先硬件解码）逐帧解码出 IOSurface 像素缓冲，经 `CVMetalTextureCache` 零拷贝映射为 Metal 纹理，由着色器按 Rec.709（或 601）与全范围（或视频范围）转换为 sRGB，等比绘制到 `CAMetalLayer` 并立即呈现，不经过显示层自己的时钟和队列。每一帧都解码以保持预测链；显示器还在处理上一次绘制时，新帧只替换待画内容，最多两次绘制在途，因此在 60、120 或 165 Hz 屏幕上都跟随最新一帧。解码失败（缺少参考帧、睡眠后会话失效）时请求关键帧，而不是重启视频流。并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质；码率与帧率的实时调整见[视频反馈与流控](#视频反馈与流控)。
 
 ### 应用与辅助进程的接口
 

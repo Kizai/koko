@@ -69,6 +69,8 @@ struct StreamLatency {
 // Each record is a big-endian length followed by a kind byte and its payload.
 enum VideoRecord: UInt8 {
     case format = 1, frame, error, path, audioFormat, audioFrame, syncFrame, hevcFormat, sequencedFrame
+    /// JSON describing the host's encoder and capture, sent to controllers with feedback.
+    case streamInfo
 }
 
 /// Records a controller writes back on a video stream that has feedback.
@@ -318,6 +320,14 @@ final class VideoEncoder {
         return max(1_500_000, min(150_000_000, width * height * fps * quality / 400 * chroma / 10))
     }
 
+    /// Whether VideoToolbox runs this session on the media engine.
+    var isHardware: Bool {
+        var value: CFTypeRef?
+        VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                              allocator: nil, valueOut: &value)
+        return (value as? Bool) ?? false
+    }
+
     /// Changes the bitrate of the running session; the next frames follow it.
     func setBitrate(_ bitrate: Int) {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
@@ -417,6 +427,9 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
         if settings.feedback {
             let start = VideoFlow(fps: settings.fps, bitrate: encoder.bitrate)
             flow.withLock { $0 = start }
+            // Older controllers would reject a record kind they do not know.
+            let info = ["encoder": encoder.isHardware ? "hardware" : "software", "capture": "ScreenCaptureKit"]
+            sendVideoFast(.streamInfo, bytes: try JSONEncoder().encode(info), to: connection)
         }
         config.width = videoWidth
         config.height = videoHeight
@@ -601,10 +614,12 @@ func hevcParameterSets(_ format: CMFormatDescription) throws -> Data {
 
 @MainActor
 final class VideoSurface {
-    let layer = AVSampleBufferDisplayLayer()
+    private let renderer = MetalVideoRenderer()
     private let audioPlayer = LiveAudioPlayer()
     private var format: CMVideoFormatDescription?
-    private var needsFlush = false
+
+    var layer: CAMetalLayer { renderer.layer }
+    var info: VideoPipelineInfo { renderer.info }
 
     var isMuted: Bool = false {
         didSet { audioPlayer.isMuted = isMuted }
@@ -627,7 +642,7 @@ final class VideoSurface {
         }
         guard status == noErr, let description else { throw VideoError.codec }
         format = description
-        needsFlush = true
+        renderer.setFormat(description)
         let size = CMVideoFormatDescriptionGetDimensions(description)
         return CGSize(width: Int(size.width), height: Int(size.height))
     }
@@ -669,7 +684,7 @@ final class VideoSurface {
         }
         guard status == noErr, let description else { throw VideoError.codec }
         format = description
-        needsFlush = true
+        renderer.setFormat(description)
         let size = CMVideoFormatDescriptionGetDimensions(description)
         return CGSize(width: Int(size.width), height: Int(size.height))
     }
@@ -697,28 +712,33 @@ final class VideoSurface {
                 sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1,
                 sampleSizeArray: [bytes.count], sampleBufferOut: &sample
               ) == noErr, let sample else { throw VideoError.codec }
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
-            let first = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(first, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
-
-        if needsFlush {
-            layer.flush()
-            needsFlush = false
-        }
-        layer.enqueue(sample)
+        renderer.decode(sample)
     }
+
+    /// The host's encoder and capture, from its `streamInfo` record.
+    func setStreamInfo(_ bytes: Data) {
+        struct Info: Decodable { var encoder: String?; var capture: String? }
+        guard let info = try? JSONDecoder().decode(Info.self, from: bytes) else { return }
+        renderer.setStreamInfo(hardwareEncode: info.encoder.map { $0 == "hardware" }, capture: info.capture)
+    }
+
+    /// Called by the view when its size or backing scale changes.
+    func resize(to size: CGSize, scale: CGFloat) {
+        renderer.resize(to: size, scale: scale)
+    }
+
+    /// Whether a frame failed to decode since the last call, so a key frame is needed.
+    func takeKeyFrameNeed() -> Bool { renderer.takeKeyFrameNeed() }
 
     func enqueueAudio(_ bytes: Data) {
         audioPlayer.enqueue(bytes)
     }
 
-    var isReadyForMoreMediaData: Bool { needsFlush || layer.isReadyForMoreMediaData }
-    var hasFailed: Bool { layer.status == .failed }
+    var isReadyForMoreMediaData: Bool { renderer.canAccept }
+    var hasFailed: Bool { renderer.hasFailed }
 
     func clear() {
-        layer.flushAndRemoveImage()
+        renderer.clear()
         audioPlayer.stop()
         format = nil
     }

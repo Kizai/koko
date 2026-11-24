@@ -126,22 +126,27 @@ struct RemoteDisplay: Codable, Equatable, Identifiable {
     }
 }
 
+/// Stream sizes by their long edge, named like video formats; a 16:10 Mac screen at 1080P
+/// streams 1920 × 1200. A display smaller than the preset streams at its own size.
 enum FrameResolution: Int, CaseIterable, Identifiable {
-    case automatic = 0, compact = 1280, standard = 1920, large = 2560, original = 4096
+    case automatic = 0, hd = 1280, fullHD = 1920, qhd = 2560, uhd = 3840
 
     var id: Self { self }
 
-    func title(for display: RemoteDisplay?) -> String {
+    var name: String {
         switch self {
         case .automatic: "自适应"
-        case .original: "原始尺寸（最大 4096 px）"
-        default:
-            if let display, rawValue <= max(display.width, display.height) {
-                display.dimensions(edge: rawValue)
-            } else {
-                "\(rawValue) px（长边上限）"
-            }
+        case .hd: "720P"
+        case .fullHD: "1080P"
+        case .qhd: "2K"
+        case .uhd: "4K"
         }
+    }
+
+    func title(for display: RemoteDisplay?) -> String {
+        guard self != .automatic, let display else { return name }
+        let native = rawValue >= max(display.width, display.height) ? "（原始尺寸）" : ""
+        return "\(name) · \(display.dimensions(edge: rawValue))\(native)"
     }
 }
 
@@ -528,6 +533,8 @@ final class LocalConnection: ObservableObject {
     @Published var showTextControls = false
     @Published var showDisplayControls = false
     @Published var showNetworkStats = false
+    /// Codec, chroma and how the current stream is captured, encoded, decoded and drawn.
+    @Published private(set) var videoInfo: VideoPipelineInfo?
     @Published var showAudioControls = false
     @Published var showControlCenter = false
     @Published var isRemoteAudioEnabled = true
@@ -1588,6 +1595,8 @@ final class LocalConnection: ObservableObject {
                     size = try videoSurface.setFormat(bytes)
                 case .hevcFormat:
                     size = try videoSurface.setHEVCFormat(bytes)
+                case .streamInfo:
+                    videoSurface.setStreamInfo(bytes)
                 case .audioFormat:
                     videoSurface.setAudioFormat(bytes)
                 case .audioFrame:
@@ -1622,6 +1631,11 @@ final class LocalConnection: ObservableObject {
                     }
                     guard !payload.isEmpty else { continue }
                     try videoSurface.enqueue(payload)
+                    // A frame the decoder could not use breaks the chain until the next key frame.
+                    if kind == .sequencedFrame, videoSurface.takeKeyFrameNeed() {
+                        awaitingKeyFrame = true
+                        receiver.requestKeyFrame()
+                    }
                     let now = ContinuousClock.now
                     lastVideoFrameAt = now
                     if firstFrameMS == nil {
@@ -1643,6 +1657,8 @@ final class LocalConnection: ObservableObject {
                             rttMS: rtt, frameMS: firstFrameMS, framesPerSecond: Double(frameCount) / seconds,
                             kilobitsPerSecond: Double(byteCount) * 8 / seconds / 1000, direct: direct, isVideo: true
                         )
+                        let info = videoSurface.info
+                        if videoInfo != info { videoInfo = info }
                         measurementStarted = now
                         frameCount = 0
                         byteCount = 0
@@ -1698,6 +1714,7 @@ final class LocalConnection: ObservableObject {
         videoReceiver?.close()
         videoReceiver = nil
         lastVideoFrameAt = nil
+        videoInfo = nil
     }
 
     func selectDisplay(_ display: RemoteDisplay) {

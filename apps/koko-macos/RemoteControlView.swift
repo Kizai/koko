@@ -275,6 +275,10 @@ struct RemoteControlView: View {
         }
     }
 
+    private static func bitrateText(_ kilobits: Double) -> String {
+        kilobits >= 1000 ? String(format: "%.1f Mbps", kilobits / 1000) : String(format: "%.0f Kbps", kilobits)
+    }
+
     /// Round trips are reported in whole milliseconds, so a local link reads 0.
     private static func latencyText(_ milliseconds: Int) -> String {
         milliseconds < 1 ? "<1 ms" : "\(milliseconds) ms"
@@ -293,15 +297,28 @@ struct RemoteControlView: View {
         .help("查看延迟与画面传输")
         .popover(isPresented: $connection.showNetworkStats, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 10) {
+                let stats = connection.networkStats
+                let info = connection.videoInfo
                 Text("会话网络").font(.headline)
                 networkRow("网络延迟", rtt.map(Self.latencyText) ?? "—")
-                networkRow(connection.networkStats?.isVideo == true ? "首帧耗时" : "帧请求耗时",
-                           connection.networkStats.map { "\($0.frameMS) ms" } ?? "—")
-                networkRow("接收帧率", connection.networkStats?.framesPerSecond.map { String(format: "%.1f fps", $0) } ?? "—")
-                networkRow("画面数据速率", connection.networkStats?.kilobitsPerSecond.map { String(format: "%.0f Kbps", $0) } ?? "—")
+                networkRow(stats?.isVideo == true ? "首帧耗时" : "帧请求耗时", stats.map { "\($0.frameMS) ms" } ?? "—")
+                networkRow("接收帧率", stats?.framesPerSecond.map { String(format: "%.1f fps", $0) } ?? "—")
+                networkRow("码率", stats?.kilobitsPerSecond.map(Self.bitrateText) ?? "—")
+                networkRow("分辨率", connection.remoteVideoSize.map { "\(Int($0.width)) × \(Int($0.height))" } ?? "—")
                 Divider()
-                networkRow("连接路径", connection.networkStats?.direct.map { $0 ? "QUIC 直连" : "QUIC 中继" } ?? "—")
+                networkRow("加密通道", stats?.direct.map { $0 ? "UDP 直连 · QUIC" : "QUIC 中继" } ?? "—")
                 networkRow("被控端地址", connection.session?.address ?? "—")
+                Divider()
+                networkRow("编码格式", info.map { [$0.codec, $0.chroma].compactMap { $0 }.joined(separator: " · ") }
+                    .flatMap { $0.isEmpty ? nil : $0 } ?? "—")
+                networkRow("编解码器", info.map { info in
+                    let encode = info.hardwareEncode.map { $0 ? "硬编" : "软编" } ?? "—"
+                    let decode = info.hardwareDecode.map { $0 ? "硬解" : "软解" } ?? "—"
+                    return "\(encode) / \(decode)"
+                } ?? "—")
+                networkRow("采集方式", info?.capture.map { $0 == "ScreenCaptureKit" ? "SCK" : $0 } ?? "—")
+                networkRow("渲染", stats?.isVideo == true ? "Metal 直出" : "—")
+                networkRow("本机刷新率", (NSApp.keyWindow?.screen ?? NSScreen.main).map { "\($0.maximumFramesPerSecond) Hz" } ?? "—")
             }
             .padding(16)
             .frame(width: 274)
@@ -435,9 +452,8 @@ private struct RemoteCanvas: NSViewRepresentable {
         canvas.onPointer = pointer
         canvas.onResize = resize
         canvas.wantsLayer = true
-        videoSurface.layer.videoGravity = .resizeAspect
         canvas.layer?.addSublayer(videoSurface.layer)
-        canvas.videoLayer = videoSurface.layer
+        canvas.videoSurface = videoSurface
         return canvas
     }
 
@@ -453,12 +469,12 @@ private struct RemoteCanvas: NSViewRepresentable {
 @MainActor
 private final class CanvasView: NSView {
     var image: NSImage?
-    var videoLayer: AVSampleBufferDisplayLayer?
+    var videoSurface: VideoSurface?
     var acceptsKeyboard = true
     var videoSize: CGSize? {
         didSet {
             if videoSize != oldValue {
-                videoLayer?.isHidden = videoSize == nil
+                videoSurface?.layer.isHidden = videoSize == nil
                 needsLayout = true
             }
         }
@@ -501,8 +517,9 @@ private final class CanvasView: NSView {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoLayer?.frame = bounds
+        videoSurface?.layer.frame = bounds
         CATransaction.commit()
+        videoSurface?.resize(to: bounds.size, scale: window?.backingScaleFactor ?? 2)
         let pixels = convertToBacking(bounds).size
         let fitted = imageRect
         guard fitted.width > 0 && fitted.height > 0 else {
