@@ -148,6 +148,7 @@ struct KokoSettingsView: View {
                     Button("权限设置…") { showPermissions = true }
                     LabeledContent("录屏", value: connection.screenPermission.title)
                     LabeledContent("辅助功能", value: connection.inputPermission.title)
+                    LabeledContent("消息通知", value: connection.notificationPermission.title)
                     LabeledContent("信任的控制端") {
                         HStack {
                             Text("\(connection.trustedDeviceCount) 台")

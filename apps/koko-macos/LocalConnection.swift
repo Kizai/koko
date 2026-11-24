@@ -436,7 +436,17 @@ final class LocalConnection: ObservableObject {
     }
     @Published private(set) var connectionCode = ""
     @Published private(set) var directInvite = ""
-    @Published private(set) var pendingPair: PendingPair?
+    @Published private(set) var pendingPair: PendingPair? {
+        didSet {
+            pairRequestPanel.update(pendingPair)
+            if let oldValue, oldValue.number != pendingPair?.number {
+                pairNotifications.clear(number: oldValue.number)
+            }
+            if let pendingPair {
+                pairNotifications.post(request: pendingPair)
+            }
+        }
+    }
     @Published private(set) var codePromptHostID: String?
     @Published private(set) var agentSession: AgentSession? {
         didSet { updateAgentIndicator() }
@@ -474,6 +484,10 @@ final class LocalConnection: ObservableObject {
     @Published private(set) var isCheckingScreenPermission = false
     @Published private(set) var inputPermission = ScreenPermission.unknown
     @Published private(set) var isCheckingInputPermission = false
+    @Published private(set) var notificationPermission = ScreenPermission.unknown
+    @Published private(set) var isCheckingNotificationPermission = false
+    let pairNotifications = PairNotifications()
+    private let pairRequestPanel = PairRequestPanel()
     private var detectedUpgradePermissionLoss = false
     @Published private(set) var isScanning = false
     @Published private var discoveredHosts: [NearbyHost] = []
@@ -584,6 +598,16 @@ final class LocalConnection: ObservableObject {
     private var stopRequested = false
     private var cancelRequested = false
 
+    init() {
+        pairRequestPanel.onDecision = { [weak self] request, allow, remember in
+            Task { await self?.respondToPairing(request, allow: allow, remember: remember) }
+        }
+        pairNotifications.onDecision = { [weak self] number, allow, remember in
+            guard let self, let request = self.pendingPair, request.number == number else { return }
+            Task { await self.respondToPairing(request, allow: allow, remember: remember) }
+        }
+    }
+
     func prepareIdentity(for role: DeviceRole) async {
         if role == .controller ? !controllerID.isEmpty : !hostID.isEmpty { return }
 
@@ -612,6 +636,10 @@ final class LocalConnection: ObservableObject {
     }
 
     func refreshDesktopPermissions() {
+        Task {
+            let status = await pairNotifications.authorizationStatus()
+            if notificationPermission != status { notificationPermission = status }
+        }
         let screen = hasScreenCapturePermission(request: false)
         let input = hasInputPermission(request: false)
         let screenState: ScreenPermission = screen ? .granted : .required
@@ -646,6 +674,13 @@ final class LocalConnection: ObservableObject {
         defer { isCheckingInputPermission = false }
         _ = await Task.detached { hasInputPermission(request: true) }.value
         refreshDesktopPermissions()
+    }
+
+    func requestNotificationPermission() async {
+        guard !isCheckingNotificationPermission else { return }
+        isCheckingNotificationPermission = true
+        defer { isCheckingNotificationPermission = false }
+        notificationPermission = await pairNotifications.requestAuthorization()
     }
 
     /// Whether the person left sharing on. New installs start with it on.

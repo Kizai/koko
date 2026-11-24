@@ -106,6 +106,8 @@ private final class KokoAppDelegate: NSObject, NSApplicationDelegate {
         }
         CloseAction.observeWindows()
         KeepAwake.shared.update(hosting: false)
+        connection.pairNotifications.configure()
+        connection.pairNotifications.onOpenMain = { [weak self] in self?.opener.openMain() }
         Task { await connection.restoreSharing() }
     }
 

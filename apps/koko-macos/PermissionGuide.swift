@@ -50,13 +50,14 @@ struct PermissionGuide: View {
     }
 
     private enum Item: String, CaseIterable, Identifiable {
-        case screen = "屏幕录制", input = "辅助功能", files = "文件与文件夹"
+        case screen = "屏幕录制", input = "辅助功能", notifications = "消息通知", files = "文件与文件夹"
         var id: Self { self }
 
         var icon: String {
             switch self {
             case .screen: "display"
             case .input: "accessibility"
+            case .notifications: "bell.badge.fill"
             case .files: "folder.fill"
             }
         }
@@ -65,6 +66,7 @@ struct PermissionGuide: View {
             switch self {
             case .screen: .purple
             case .input: .blue
+            case .notifications: .red
             case .files: .orange
             }
         }
@@ -73,6 +75,7 @@ struct PermissionGuide: View {
             switch self {
             case .screen: "让对方看到这台 Mac 的屏幕"
             case .input: "让对方使用键盘和鼠标操作这台 Mac"
+            case .notifications: "后台运行时在右上角提醒远程请求"
             case .files: "收发文件时访问相应文件夹"
             }
         }
@@ -81,6 +84,7 @@ struct PermissionGuide: View {
             switch self {
             case .screen: "Privacy_ScreenCapture"
             case .input: "Privacy_Accessibility"
+            case .notifications: "Notifications"
             case .files: "Privacy_FilesAndFolders"
             }
         }
@@ -208,6 +212,9 @@ struct PermissionGuide: View {
             case .input:
                 Text("点击右侧「开启」，按系统提示在「辅助功能」或「设备控制和数据访问」中启用 Koko。")
                 Text("此页会自动检查。若已允许辅助功能但仍无法控制键鼠，再点一次「开启」以完成系统请求。")
+            case .notifications:
+                Text("点击右侧「开启」，允许 Koko 发送系统通知。在「系统设置 → 通知 → Koko」中建议选择「横幅」或「提醒」。")
+                Text("后台或菜单栏运行期间收到远程请求时，屏幕右上角会同时弹出可操作提醒。")
             case .files:
                 Text("macOS 按文件夹管理访问。点击「检查」会在当前接收位置创建并移除一个临时文件夹。")
                 Text(downloadDirectory).font(.caption).textSelection(.enabled)
@@ -219,7 +226,9 @@ struct PermissionGuide: View {
             }
             HStack(spacing: 10) {
                 Button("打开系统设置") {
-                    let pane = "x-apple.systempreferences:com.apple.preference.security?" + selected.settingsPane
+                    let pane = selected == .notifications
+                        ? "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+                        : "x-apple.systempreferences:com.apple.preference.security?" + selected.settingsPane
                     if let url = URL(string: pane), NSWorkspace.shared.open(url) { return }
                     if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.systempreferences") {
                         NSWorkspace.shared.open(url)
@@ -267,6 +276,10 @@ struct PermissionGuide: View {
             status = connection.inputPermission.title
             checking = connection.isCheckingInputPermission
             granted = connection.inputPermission == .granted
+        case .notifications:
+            status = connection.notificationPermission.title
+            checking = connection.isCheckingNotificationPermission
+            granted = connection.notificationPermission == .granted
         case .files:
             status = folderAccess.title
             checking = folderAccess == .checking
@@ -297,6 +310,7 @@ struct PermissionGuide: View {
                         switch item {
                         case .screen: await connection.requestScreenPermission()
                         case .input: await connection.requestInputPermission()
+                        case .notifications: await connection.requestNotificationPermission()
                         case .files:
                             let path = downloadDirectory
                             folderAccess = .checking
