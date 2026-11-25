@@ -6,6 +6,7 @@
 | 安装 macOS 测试包，验证局域网连接、显示器唤醒与跨设备粘贴 | [macOS 双机测试](./macos.md) |
 | 本机系统权限、远端设备授权和截图验收 | [macOS 权限设计](./macos-permissions.md) |
 | 模块职责、设备授权和通信协议 | [架构设计](./architecture.md) |
+| 在两台 Mac 上采集真实 Desktop 回复及音视频协议样例 | [协议样例采集](./protocol-capture.md) |
 | Agent 身份、截图识别、远程操作、人工接管与 MCP 工具 | [Agent 与 MCP 设计规范](./agent.md) |
 | 当前要交付什么、按什么顺序验收 | [Phase 1 实现计划](./implementation.md) |
 | 如何设计、实现和评审改动 | [开发规则](./development.md) |

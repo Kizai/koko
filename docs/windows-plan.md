@@ -2,7 +2,7 @@
 
 [返回文档目录](./README.md)
 
-本文评估 KoKo 移植到 Windows 的工作量与风险，给出分阶段实施计划。阶段 0 和 0B 不需要 Windows 实机，可以立即开始。执行者（人或 Codex）在动手前先读 [开发规则](./development.md)、[架构设计](./architecture.md#当前实现macos-内测版) 和 [Agent 与 MCP 设计规范](./agent.md)。本文的每个任务都按一个 PR 的粒度拆分，附通过条件。
+本文评估 KoKo 移植到 Windows 的工作量与风险，给出分阶段实施计划。阶段 0 和 0B 的代码与文档交付可通过 CI 验证，Windows 实机验收在阶段 1 执行。执行者（人或 Codex）在动手前先读 [开发规则](./development.md)、[架构设计](./architecture.md#当前实现macos-内测版) 和 [Agent 与 MCP 设计规范](./agent.md)。本文按任务列出交付范围与通过条件，PR 拆分见第 7 节。
 
 ## 1. 现状评估
 
@@ -29,16 +29,16 @@ macOS 的原生层是约 8000 行 Swift（`apps/koko-macos/`），承担了以�
 - **控制端编排**：为不同用途启动多个 `koko-agent` 子进程，解码显示视频，合并键鼠事件队列，按 RTT 自适应画质，以及剪贴板和 outbox 的流程（集中在 `LocalConnection.swift`）。
 - **应用外壳**：配对和审批界面、设置、Agent 指示条、托盘或后台运行、开机自启、保持唤醒、自动更新。
 
-### 1.3 协议中只存在于 Swift 代码里的部分
+### 1.3 已按 Swift 源码核对的协议格式
 
-以下格式目前没有写进文档，Windows 实现必须与之逐字节兼容：
+以下格式已写入 [架构设计](./architecture.md)，供 Windows 实现及后续实机比对使用。
 
-- 视频记录类型 5、6、7（`audioFormat`、`audioFrame`、`syncFrame`）的载荷格式。编码为 AAC-LC，带 magic cookie 和时间戳，见 `apps/koko-macos/AudioSync.swift` 的 `AudioPacketCodec`。
-- 每种 `Desktop request` 对应的回复 JSON，例如 `displays` 回复里的 `host_name`、`video`、`clipboard`、`clipboard_stream` 能力标记和 `control`。
+- 视频记录类型 5、6、7（`audioFormat`、`audioFrame`、`syncFrame`）的载荷格式。当前音频优先 AAC-ELD、回退 AAC-LC，格式记录带 magic cookie，音频包带序号；类型 7 为历史带时间戳视频帧，仅保留接收兼容。源码依据及准确布局已补入 `architecture.md`。
+- 每种 `Desktop request` 对应的回复 JSON，例如 `displays` 的应用回复包含 `host_name`、`video`、`clipboard`、`clipboard_stream` 和 `outbox`，daemon 对外返回时丢弃 `outbox` 并加入 `control`。
 - `pointer` 中的 `scroll` 单位（macOS 用像素单位滚动，`wheel1 = dy`，`wheel2 = dx`），以及修饰键位（Core Graphics 修饰位右移 16 位，掩码 `0xbf`）。
-- `UiNode.role` 使用 AX 角色名（如 `AXButton`），`AXMenuBar` 会被跳过。
+- `UiNode.role` 使用去掉 `AX` 前缀的角色（如 `Button`），安全输入框和搜索框使用 `SecureTextField`、`SearchField`，并跳过 `AXMenuBar` 子树。
 
-**第一步先把这些格式写进 `docs/architecture.md`**，再按文档实现 Windows 端。不要让 Windows 实现去模仿 Swift 的内部细节。
+Windows 端按文档中的协议格式实现。实机样例与采集方法见 [协议样例采集](./protocol-capture.md)。
 
 ## 2. 三种方案
 
@@ -90,10 +90,10 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0.3 数据目录 | 在 `koko-p2p` 增加一个函数，返回 `~/.koko`（Unix 用 `HOME`，Windows 用 `USERPROFILE`），`koko-agent` 的 `koko_directory()` 改为调用它 | Windows 上 `koko-agent pair`、`koko-agent mcp` 无需显式传入密钥路径 |
 | 0.4 **剪贴板路径安全（P0）** | 接收端在 Windows 上额外拒绝：含 `\`、`:`、`<>"|?*` 和控制字符的分段；保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，不区分大小写，含扩展名形式）；以点或空格结尾的分段。拼接后再确认路径仍位于接收目录内。不合法时整批作废，返回 `clipboard_invalid`。错误码分两层：协议层（`koko_proto::safe_relative_path`，含 NUL、`.`、`..`、空段、绝对路径）在请求入口校验，所有平台都返回 `invalid_command`，保持不变；只有通过协议校验、但 Windows 文件系统不接受的名称才返回 `clipboard_invalid`。是否把 `\` 和 `:` 也加进跨平台的 `safe_relative_path`，在 PR 里给出影响评估，由用户决定 | 新增单元测试覆盖上述每一类输入，在 Windows CI 上运行 |
 | 0.5 视频通道 | 把 `serve_video` 的 Unix socket 抽成「本机私有视频通道」，Unix 用现有实现，Windows 用 `tokio::net::windows::named_pipe`：管道名随机生成（`\\.\pipe\koko-video-<随机>`），设置 `first_pipe_instance(true)` 和 `reject_remote_clients(true)`，并**显式指定只允许当前用户 SID 访问的安全描述符**（Windows 管道的默认 DACL 会给 Everyone 读权限）。`Desktop request` 的 `video_socket` 字段在 Windows 上承载管道名，字段名不变。实现 Windows 视频通道时移除 relay_feedback 上的 allow(dead_code)。 | 集成测试：一个模拟应用写入视频记录，经 QUIC 原样到达订阅端；另一用户身份无法连接管道（若 CI 不便测试，写进实机验收清单） |
-| 0.6 补全协议文档 | 把 1.3 节列出的格式写进 `docs/architecture.md`，并在 `koko-proto` 加上 `displays`、`ui_tree`、视频与音频记录的样例测试，样例取自 macOS 实机输出 | 文档与测试合入 |
+| 0.6 补全协议文档 | 本轮先将 1.3 节的格式、Desktop 实际回复与当前源码差异写进 `docs/architecture.md`；按 [协议样例采集](./protocol-capture.md) 交由用户在两台 Mac 上采集。拿到真实输出后再增加 `koko-proto` 的 displays、ui_tree、音视频样例测试，不手工编造样例 | 本轮验收文档；实机采集与样例测试后续补齐 |
 | 0.7 子进程生命周期 | 记录 Windows 上的约定，供阶段 1 使用：外壳启动 daemon 和 agent 时使用 `CREATE_NO_WINDOW`，并放进设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，保证外壳退出时子进程一并退出 | 文档说明 |
 
-阶段 0 的总验收：在 Windows 上运行 `koko-daemon serve-pair %USERPROFILE%\.koko\host.key 0.0.0.0:27688`，Mac 的 Koko.app 能通过局域网发现它并用连接码配对，截图请求返回 `desktop_unavailable`。这一步证明网络、mDNS 和防火墙路径都是通的，需要在 Windows 防火墙放行 UDP 27688 和 5353，并且网络配置文件为「专用网络」。
+阶段 0 的跨平台能力在阶段 1 一并进行 Windows 实机验收：在 Windows 上运行 `koko-daemon serve-pair %USERPROFILE%\.koko\host.key 0.0.0.0:27688`，Mac 的 Koko.app 能通过局域网发现它并用连接码配对，截图请求返回 `desktop_unavailable`。这一步证明网络、mDNS 和防火墙路径都是通的，需要在 Windows 防火墙放行 UDP 27688 和 5353，并且网络配置文件为「专用网络」。
 
 #### 0.7 Windows 子进程生命周期约定
 
@@ -120,8 +120,8 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0B.3 键位映射 | Mac 虚拟键码到 Windows 扫描码（含扩展键标志）的对照表；Windows 虚拟键码到 Mac 键码的反向表（供阶段 2 控制端使用）；修饰位（Core Graphics 修饰位右移 16 位）与 Windows 修饰键的互转，以及 `source_os` 两种取值下的映射规则（见 1.2） | 单元测试：两张表互为逆映射（不可逆的键单独列出）；常见快捷键（复制、粘贴、切换应用、截图）的映射结果符合预期 |
 | 0B.4 滚动换算 | 协议中的像素滚动量与 `WHEEL_DELTA` 的换算，方向约定写进文档 | 单元测试；方向在阶段 1 实机复核 |
 | 0B.5 H.264 封装 | Annex B 到 AVCC 的转换，从码流中提取 SPS/PPS 并生成 `format` 记录；视频记录的读写（长度、类型、载荷） | 单元测试使用 0.6 采集的 macOS 实机样例，生成的 `format` 记录与 macOS 字节一致 |
-| 0B.6 音频封装 | AAC 的 AudioSpecificConfig（magic cookie）生成，5、6、7 号记录的载荷编码 | 单元测试使用 0.6 采集的样例，编码结果能被 macOS 的解码逻辑接受（字节级比对） |
-| 0B.7 UI 树映射 | UI Automation 的 ControlType 到 AX 角色名的映射表；遍历结果展平为 `UiNode` 列表的逻辑（父节点索引、截断、密码框去值），输入用简单的树结构表示 | 单元测试 |
+| 0B.6 音频封装 | AAC 的 AudioSpecificConfig（magic cookie）生成，5、6 号记录的载荷编码，以及 7 号历史视频记录的接收兼容 | 单元测试使用 0.6 采集的样例，编码结果能被 macOS 的解码逻辑接受（字节级比对） |
+| 0B.7 UI 树映射 | UI Automation 的 ControlType 到 协议角色名（省略 AX 前缀，见 3.1）的映射表；遍历结果展平为 `UiNode` 列表的逻辑（父节点索引、截断、密码框去值），输入用简单的树结构表示 | 单元测试 |
 | 0B.8 高危规则匹配 | Windows 侧的规则判定：进程名或 AUMID 匹配、快捷键规则、关键词规则，读取同一份 `agent-policy.json`，含 Windows 默认值 | 单元测试覆盖 `agent.md` 中列出的每类规则 |
 
 阶段 0B 的总验收：上述测试在 macOS 和 Windows CI 上全部通过；阶段 1 的各任务只剩下调用 Windows API 和实机验收。
@@ -138,7 +138,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 1.2 键鼠 | `pointer`：`SendInput` 搭配 `MOUSEEVENTF_ABSOLUTE \| MOUSEEVENTF_VIRTUALDESK`，0–9999 坐标映射到对应显示器的矩形。`scroll` 把像素换算成 `WHEEL_DELTA` 倍数（可用高精度滚轮的任意值），方向要实测对齐。键盘：建立「Mac 虚拟键码 → Windows 扫描码」对照表，用 `KEYEVENTF_SCANCODE` 发送，注意扩展键标志，确保与键盘布局无关。修饰键：`source_os=windows` 时 Command→Win、Option→Alt 原样还原；`source_os=macos` 时默认把 ⌘ 映射为 Ctrl，做成可关闭的设置项，与 macOS 的「跨系统键位映射」对称。`text` 用 `KEYEVENTF_UNICODE`，正确处理代理对。收到 `Pointer closed` 或 `release` 时释放所有按住的键和按钮。前台是高权限窗口时（比较前台进程的完整性级别），返回 `input_failed` 并在被控端提示原因；若要新增错误码，先在 PR 中说明 | Mac 控制 Windows：拖动窗口、右键菜单、双击、滚动、Ctrl+C / Ctrl+V / Alt+Tab、中文与 emoji 文本输入都正确；对高权限窗口操作时有明确提示 |
 | 1.3 视频 | Windows.Graphics.Capture 输出 D3D11 纹理，送入 Media Foundation H.264 编码器（优先硬件 MFT，通过 DXGI Device Manager 零拷贝；不可用时回退到软件 MFT）。设置 `CODECAPI_AVLowLatencyMode`、关闭 B 帧、最长 2 秒一个关键帧。把 MF 输出的 Annex B 转成 AVCC，提取 SPS/PPS 写成 `format` 记录，格式变化时重发。按所选 `edge` 缩放，`fps` 档位对应采集的最小帧间隔。用 `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 把 KoKo 自己的窗口排除在画面外 | Mac 端稳定显示 1080p60；切换显示器、改变分辨率、锁定再解锁后都能恢复；记录被控端 CPU、内存、编码器类型和接收帧率；另一用户无法连接管道：同机另一普通用户以 In、Out、InOut 连接均须明确拒绝访问（超时或找不到管道不算通过），当前用户仍能正常传输 |
 | 1.4 剪贴板 | `clipboard_read`：模拟 Ctrl+C，读取 `CF_UNICODETEXT` 或 `CF_HDROP`。`clipboard_target`：在 `%LOCALAPPDATA%\Koko\Received\<transfer>` 新建目录。`clipboard_publish`：写入 `CF_HDROP`（附带 `Preferred DropEffect = copy`）或文本，再模拟 Ctrl+V。文件字节仍由 daemon 读写 | Mac 与 Windows 之间双向传输文字、单个大文件（大于 4 GB）、含中文名和空文件夹的目录；含非法字符的 Mac 文件名得到明确的错误提示 |
-| 1.5 音频与音量 | WASAPI loopback 采集，经 MF AAC-LC 编码，按 0.6 节写进文档的格式发送 5、6、7 号记录。`audio_volume` 通过 `IAudioEndpointVolume` 读取和设置系统音量 | Mac 端声画同步，误差在 macOS 互控的水平以内；双向调节音量有效 |
+| 1.5 音频与音量 | WASAPI loopback 采集，经 MF AAC-LC 编码，按 0.6 核对的格式经独立音频流发送 5、6 号记录。`audio_volume` 通过 `IAudioEndpointVolume` 读取和设置系统音量 | Mac 端声画同步，误差在 macOS 互控的水平以内；双向调节音量有效 |
 | 1.6 本机输入检测 | 用 `WH_MOUSE_LL` / `WH_KEYBOARD_LL` 钩子监听本机实体输入，按 `LLMHF_INJECTED` / `LLKHF_INJECTED` 过滤掉自己注入的事件，检测到真实输入时向 daemon 写 `local-input` | Agent 操作期间动一下本机鼠标，Agent 即被暂停 |
 | 1.7 outbox | 暂只提供命令行入口 `koko-host send <路径...>`，写 `outbox {"paths":[…]}`。拖拽发送浮窗放到阶段 2 | Mac 控制端能收到 Windows 发出的文件 |
 
@@ -152,7 +152,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | --- | --- | --- |
 | 2.1 外壳 | 主窗口（本机共享开关、连接码、直连邀请、设备列表、配对审批弹窗）、设置（常规、安全、清除信任、跨系统键位映射）、托盘图标、关闭窗口后后台运行、单实例、开机自启（`HKCU\...\Run`）、保持唤醒（`SetThreadExecutionState`）。界面文案沿用 macOS 版 | 被控端的全部操作都能在界面上完成，不再依赖控制台 |
 | 2.2 控制端连接 | 按 macOS 的方式为各用途启动 `koko-agent` 子进程（`discover`、`pair`、`remote-stream`、`remote-video`、`clipboard-pull` / `clipboard-push`、`outbox-pull`、`remote`），逻辑对应 `LocalConnection.swift` 的控制端部分。先保持子进程模型以对齐行为，合并成单进程留作后续优化 | 局域网发现、连接码、直连邀请三种方式都能连上 Mac |
-| 2.3 视频显示 | `remote-video` 的输出经 Tauri 二进制通道送到前端，用 WebCodecs `VideoDecoder`（硬件加速）解码 AVCC，绘制到 canvas；音频用 `AudioDecoder` 和 WebAudio，按 pts 同步。根据 `path` 记录的 RTT 自适应分辨率和画质，规则与 macOS 一致。**先做一个原型测量延迟**，触发 2 节的切换条件时改为原生 D3D11 渲染 | Windows 控制 Mac 达到 1080p60，延迟与 Mac 互控相近 |
+| 2.3 视频显示 | `remote-video` 的输出经 Tauri 二进制通道送到前端，用 WebCodecs `VideoDecoder`（硬件加速）解码 AVCC，绘制到 canvas；音频用 `AudioDecoder` 和 WebAudio，原型需验证当前独立音频流的播放时序。根据 `path` 记录的 RTT 自适应分辨率和画质，规则与 macOS 一致。**先做一个原型测量延迟**，触发 2 节的切换条件时改为原生 D3D11 渲染 | Windows 控制 Mac 达到 1080p60，延迟与 Mac 互控相近 |
 | 2.4 控制端输入 | 远控窗口获得焦点时安装低级键盘钩子，截获 Win 键、Alt+Tab 等系统组合键。Windows 虚拟键码映射为 Mac 键码，`source_os=windows`。鼠标坐标归一化到 0–9999。移植 Swift 的键鼠事件队列合并逻辑。远控时关闭本机 IME，让按键原样发给被控端，由被控端的输入法处理 | Windows 控制 Mac：快捷键映射、中文输入、拖拽都正确 |
 | 2.5 剪贴板与发送 | 控制端的 ⌘C / ⌘V 流程改用 Ctrl+C / Ctrl+V；被控时拖拽文件弹出发送浮窗 | 与 macOS 功能对齐 |
 | 2.6 安装与更新 | 用 Tauri bundler 打包 NSIS 安装包（按机器安装，以便添加防火墙规则），安装时为 `koko-daemon.exe` 和 `koko-agent.exe` 添加入站防火墙规则；用 Tauri updater 从 GitHub Releases 检查更新，更新包签名。`scripts/` 下新增 `build-windows.ps1` | 全新的 Windows 机器上安装后无需手动放行防火墙；能从旧版本应用内升级 |
@@ -163,7 +163,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 | 任务 | 内容 | 通过条件 |
 | --- | --- | --- |
-| 3.1 UI 树 | 用 UI Automation 遍历前台窗口的 Control View，把 ControlType 映射到 AX 角色名（Button→`AXButton`、Edit→`AXTextField` 等），保证 `koko-agent` 的格式化逻辑和 Agent 看到的词汇与 macOS 一致。密码框（`IsPassword`）不输出值；边框按所在显示器归一化 | `koko_get_ui_tree` 在记事本、资源管理器、Edge 中能返回可点击的元素 |
+| 3.1 UI 树 | 用 UI Automation 遍历前台窗口的 Control View，把 ControlType 映射到协议角色名（Button→`Button`、Edit→`TextField`，密码框→`SecureTextField` 等），保证 `koko-agent` 的格式化逻辑和 Agent 看到的词汇与 macOS 一致。密码框（`IsPassword`）不输出值；边框按所在显示器归一化 | `koko_get_ui_tree` 在记事本、资源管理器、Edge 中能返回可点击的元素 |
 | 3.2 高危规则 | 沿用 `~/.koko/agent-policy.json` 的同一格式。`command_apps` 和 `protected_apps` 在 Windows 上按进程名或 AUMID 匹配，默认值换成 Windows 对应程序（`WindowsTerminal.exe`、`cmd.exe`、`powershell.exe`、`pwsh.exe`、`regedit.exe`、`mmc.exe`、`Taskmgr.exe`、`SystemSettings.exe` 等）。快捷键规则增加 Win+R、Alt+F4、Ctrl+Shift+Esc、Shift+Delete、Win+X。关键词规则按点击位置的 UIA 元素名称判断 | [Agent 设计规范](./agent.md#高危操作审批)中的审批场景在 Windows 上全部通过 |
 | 3.3 指示条与停止 | 置顶的分层窗口作为指示条，用 `WDA_EXCLUDEFROMCAPTURE` 排除在采集画面外。提供停止、让 Agent 继续、求助卡片、审批按钮。停止快捷键用 `RegisterHotKey` 注册 Ctrl+Alt+Win+.，先确认与系统快捷键不冲突 | 指示条不出现在 Agent 的截图里；快捷键在任意应用中都能停止 Agent |
 
@@ -189,17 +189,29 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 1. 动手前读 `AGENTS.md` 和 `docs/development.md`，严格遵守其中的验证与文档规则。
 2. **不修改 Swift 代码**。改动共享 Rust 代码（`koko-proto`、`koko-p2p`、`koko-daemon`、`koko-agent`）时，必须保证 macOS 行为不变，并在 macOS 和 Windows 两个平台的 CI 上都通过。
-3. 每个任务一个 PR，按本文编号命名（例如 `windows: 0.4 剪贴板路径安全`）。PR 描述写明目标、改动、自动化验收结果，以及**仍需实机验证的场景**。
+3. 按任务编号提交 PR（例如 `windows: 0.4 剪贴板路径安全`）。0.7 生命周期文档随 0.5 一并交付（#7），原独立 PR #8 已关闭。PR 描述写明目标、改动、自动化验收结果，以及**仍需实机验证的场景**。
 4. 协议格式以 `docs/architecture.md` 为准。发现 Swift 实现与文档不一致时，先在 PR 里指出，不要自行选择其中一方。
 5. 任何新增错误码、新增命令字段或数据目录的变化，都属于接口变更，需要先说明影响、经用户同意后再实现，并同步更新文档。
 6. 每个阶段结束时更新本文的状态，并在 `docs/README.md` 的索引中保持本文可以找到。
+7. 同时开放的 PR 最多两个。前序 PR 合并后才能创建下一任务分支。临时验证分支仅在本地使用。
 
 ## 8. 进度
 
 | 阶段 | 状态 |
 | --- | --- |
-| 0 工作区跨平台化 | 未开始 |
-| 0B 可脱离实机的平台逻辑 | 未开始 |
+| 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
+| 0B 可脱离实机的平台逻辑 | 0.6 文档 PR 合并后启动 |
 | 1 Windows 被控端 | 未开始 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
+
+| 阶段 0 任务 | 交付与剩余验证 |
+| --- | --- |
+| 前置编译修复、0.2、0.1、方案文档 | #4、#1、#2、#5 已合入；0.1/0.2 均经完整 macOS / Windows CI；阶段名及任务编号已改为 0B、0B.1–0B.8 |
+| 0.3 数据目录 | #6 已合入，两平台完整 CI 通过；真实 Windows↔Mac 配对纳入阶段 1 实机验收 |
+| 0.4 剪贴板路径安全 | #3 已合入，rebase 后完整两平台 CI 通过；真实应用双向文件传输待阶段 1 |
+| 0.5 视频通道 | 已在 #7 实现并覆盖真实 QUIC 和实际管道 DACL 测试；另一用户身份拒绝访问及真实应用接入纳入阶段 1 实机验收，见 #7 清单 |
+| 0.7 生命周期 | 文档约定并入 #7；创建、退出与崩溃清理的代码和实机验收属于阶段 1/2 |
+| 0.6 协议 | 架构文档已记录源码核对后的格式，并提供[两台 Mac 的采集步骤](./protocol-capture.md)。待用户提供实机原始样例后补入样例和对应测试。已记录 `audio_volume` 缺字段的现存问题 |
+
+执行顺序为 #7 合并后发布 0.6 文档 PR，再于 0.6 合并后依次推进 0B.1 至 0B.8。若推进到 0B.5、0B.6 时仍缺少 0.6 实机样例，则暂缓相应任务，继续 0B.7、0B.8，并在进度中记录暂缓项。
