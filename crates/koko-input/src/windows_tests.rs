@@ -4,14 +4,14 @@ use std::collections::VecDeque;
 
 #[derive(Default)]
 struct TestSink {
-    foreground: Option<&'static str>,
+    foreground: Option<ForegroundIntegrity>,
     attempted: Vec<Vec<Record>>,
     counts: VecDeque<usize>,
 }
 
 impl Sink for TestSink {
-    fn check_foreground(&self) -> Result<(), String> {
-        self.foreground.map_or(Ok(()), |error| Err(error.into()))
+    fn foreground_integrity(&self) -> Option<ForegroundIntegrity> {
+        self.foreground
     }
 
     fn send(&mut self, records: &[Record]) -> usize {
@@ -151,7 +151,11 @@ fn missing_display_still_cleans_up_and_release_needs_no_foreground() {
             &[key(0x37, 16, true)],
         )
         .unwrap();
-    input.sink.foreground = Some("higher integrity");
+    input.sink.foreground = Some(ForegroundIntegrity {
+        host: 0x2000,
+        target: 0x3000,
+        process_id: 42,
+    });
     assert!(matches!(
         input.pointer(
             || None,
@@ -217,15 +221,59 @@ fn keyboard_mapping_off_and_unicode_packets() {
 }
 
 #[test]
-fn refuses_new_input_when_foreground_is_higher_or_unknown() {
-    for reason in ["higher integrity", "could not query foreground process"] {
+fn refuses_only_confirmed_higher_integrity_foreground() {
+    for (host, target, allowed) in [
+        (0x2000, 0x3000, false),
+        (0x2000, 0x2000, true),
+        (0x3000, 0x2000, true),
+    ] {
         let mut input = input(true);
-        input.sink.foreground = Some(reason);
-        assert!(
-            matches!(input.text("blocked"), Err(InputError::Failed(message)) if message == reason)
-        );
-        assert!(input.sink.attempted.is_empty());
+        input.sink.foreground = Some(ForegroundIntegrity {
+            host,
+            target,
+            process_id: 42,
+        });
+        let result = input.text("中文😀👍");
+        assert_eq!(result.is_ok(), allowed);
+        if allowed {
+            assert!(!input.sink.attempted.is_empty());
+        } else {
+            assert!(
+                matches!(result, Err(InputError::Failed(message)) if message.contains("higher integrity") && message.contains("42"))
+            );
+            assert!(input.sink.attempted.is_empty());
+        }
     }
+}
+
+#[test]
+fn absent_foreground_allows_a_click_to_restore_focus() {
+    let mut input = input(true);
+    // No foreground HWND or no confirmed integrity comparison: Windows UIPI
+    // still decides whether the actual SendInput operation is allowed.
+    input.sink.foreground = None;
+    input.click(Some(geometry()), (0, 0)).unwrap();
+    assert_eq!(
+        sent(&input),
+        [
+            Record::Move(0, 0),
+            Record::Edge(Control::Button(Button::Left), true),
+            Record::Edge(Control::Button(Button::Left), false),
+        ]
+    );
+    assert!(input.held.is_empty());
+}
+
+#[test]
+fn unavailable_foreground_does_not_hide_send_input_failure() {
+    let mut input = input(true);
+    input.sink.foreground = None;
+    input.sink.counts.push_back(0);
+    assert!(
+        matches!(input.click(Some(geometry()), (0, 0)), Err(InputError::Failed(message)) if message.contains("SendInput inserted 0"))
+    );
+    assert_eq!(input.sink.attempted.len(), 1);
+    assert!(input.held.is_empty());
 }
 
 #[test]
@@ -332,7 +380,11 @@ fn held_control_is_borrowed_for_semantic_key_and_release_skips_display_lookup() 
         )
         .unwrap();
     input.key(RemoteKey::Paste).unwrap();
-    input.sink.foreground = Some("higher integrity");
+    input.sink.foreground = Some(ForegroundIntegrity {
+        host: 0x2000,
+        target: 0x3000,
+        process_id: 42,
+    });
     input
         .pointer(
             || panic!("release must bypass display lookup"),

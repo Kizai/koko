@@ -60,8 +60,29 @@ enum Record {
     Wheel { horizontal: bool, delta: i32 },
 }
 
+#[derive(Clone, Copy)]
+struct ForegroundIntegrity {
+    host: u32,
+    target: u32,
+    process_id: u32,
+}
+
 trait Sink {
-    fn check_foreground(&self) -> Result<(), String>;
+    /// None means there is no confirmed foreground integrity comparison.
+    fn foreground_integrity(&self) -> Option<ForegroundIntegrity>;
+
+    fn check_foreground(&self) -> Result<(), String> {
+        if let Some(foreground) = self.foreground_integrity()
+            && foreground.target > foreground.host
+        {
+            return Err(format!(
+                "Windows input blocked: foreground process {} has higher integrity ({:#x} > {:#x})",
+                foreground.process_id, foreground.target, foreground.host,
+            ));
+        }
+        Ok(())
+    }
+
     fn send(&mut self, records: &[Record]) -> usize;
 }
 

@@ -1,4 +1,4 @@
-use super::{Button, Control, Geometry, Input, InputError, Record, Sink};
+use super::{Button, Control, ForegroundIntegrity, Geometry, Input, InputError, Record, Sink};
 use crate::keyboard::KeyboardSource;
 use koko_proto::{PointerEvent, RemoteKey};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -26,9 +26,7 @@ pub struct WindowsInput(Input<Win32>);
 
 impl WindowsInput {
     pub fn new(cross_system_shortcuts: bool) -> Self {
-        let integrity = integrity_level(unsafe { GetCurrentProcess() }).map_err(|error| {
-            format!("Windows input blocked: cannot query host integrity: {error}")
-        });
+        let integrity = integrity_level(unsafe { GetCurrentProcess() }).ok();
         Self(Input::new(Win32 { integrity }, cross_system_shortcuts))
     }
 
@@ -63,34 +61,32 @@ impl WindowsInput {
 }
 
 struct Win32 {
-    integrity: Result<u32, String>,
+    integrity: Option<u32>,
 }
 
 impl Sink for Win32 {
-    fn check_foreground(&self) -> Result<(), String> {
-        let host = self.integrity.as_ref().map_err(Clone::clone)?;
+    fn foreground_integrity(&self) -> Option<ForegroundIntegrity> {
         let (window, mut pid) = (unsafe { GetForegroundWindow() }, 0);
-        if window.0.is_null() || unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) } == 0 {
-            return Err("Windows input blocked: cannot identify the foreground window".into());
+        // NULL is normal during activation transitions. Let a click recover focus.
+        // If a comparison is unavailable, SendInput still enforces Windows UIPI.
+        if window.0.is_null() {
+            return None;
         }
-
+        let host = self.integrity?;
+        if unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) } == 0 {
+            return None;
+        }
         let target = (|| {
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)? };
             let process = unsafe { OwnedHandle::from_raw_handle(process.0) };
             integrity_level(HANDLE(process.as_raw_handle()))
         })()
-        .map_err(|error| {
-            format!(
-                "Windows input blocked: cannot query foreground process {pid} integrity: {error}"
-            )
-        })?;
-
-        if target > *host {
-            return Err(format!(
-                "Windows input blocked: foreground process {pid} has higher integrity ({target:#x} > {host:#x})"
-            ));
-        }
-        Ok(())
+        .ok()?;
+        Some(ForegroundIntegrity {
+            host,
+            target,
+            process_id: pid,
+        })
     }
 
     fn send(&mut self, records: &[Record]) -> usize {
