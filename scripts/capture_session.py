@@ -166,7 +166,7 @@ def wait_for(state, name, app, seconds, instance=None):
     raise CaptureError("Timed out waiting for " + name + ". Check sharing, permissions, and the GUI approval prompt.")
 
 
-def package(folder, destination, verify):
+def prepare_manifest(folder):
     names = set(NAMES)
     if set(p.name for p in folder.iterdir()) != names:
         raise ValueError("unexpected artifact set")
@@ -181,13 +181,19 @@ def package(folder, destination, verify):
                 digest.update(block)
         lines.append(f"{digest.hexdigest()}  {name}\n")
     (folder / "SHA256SUMS").write_text("".join(lines), encoding="ascii")
-    verify()
+
+
+def capture_and_package(state, destination, source_dirty):
+    run_session(state, source_dirty)
+    # Returning from run_session confirms every writer and the final scanner have exited.
+    check_session(state)
+    folder = state / "artifacts"
     with tempfile.NamedTemporaryFile(dir=destination.parent) as tmp:
         with tarfile.open(fileobj=tmp, mode="w:gz") as archive:
-            for name in sorted(names | {"SHA256SUMS"}):
+            for name in sorted((*NAMES, "SHA256SUMS")):
                 archive.add(folder / name, arcname=name, recursive=False)
         tmp.flush()
-        os.link(tmp.name, destination)  # Publish once; never overwrite a previous run.
+        publish(state, tmp.name, destination)
 
 
 def configure_capture_plist(path, env):
@@ -283,7 +289,7 @@ def prepare_capture_app(state, env):
     return app, plist
 
 
-def run_session(state, output, source_dirty):
+def run_session(state, source_dirty):
     env = dict(os.environ, HOME=str(state / "home"), CFFIXED_USER_HOME=str(state / "home"),
                KOKO_CAPTURE_STATE=str(state))
     (state / "home").mkdir()
@@ -360,10 +366,9 @@ def run_session(state, output, source_dirty):
                     utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), displays=displays,
                     requests=settings, media=reports)
         (folder / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
-        def verify():
-            (instance / "scan-request").touch()
-            wait_for(state, "scan-complete", gui, 60, instance)
-        package(folder, output, verify)
+        prepare_manifest(folder)
+        (instance / "scan-request").touch()
+        wait_for(state, "scan-complete", gui, 60, instance)
 
 
 def verify_audio_windows(arrivals, windows):
@@ -495,11 +500,8 @@ def main():
                 except ProcessLookupError:
                     pass
     destination = output_directory / "capture.tar.gz"
-    with private_session() as state, tempfile.TemporaryDirectory(dir=output_directory) as staging:
-        pending = Path(staging) / "verified.tar.gz"
-        run_session(state, pending, source_dirty)
-        # Publication follows confirmed GUI, wrapper and daemon termination.
-        publish(state, pending, destination)
+    with private_session() as state:
+        capture_and_package(state, destination, source_dirty)
     print("Archive:", destination)
 
 
