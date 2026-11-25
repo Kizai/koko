@@ -6,6 +6,7 @@ members = [
     "crates/koko-input",
     "crates/koko-daemon",
     "crates/koko-agent",
+    "crates/koko-host-windows",
 ]
 resolver = "3"
 

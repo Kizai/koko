@@ -19,3 +19,6 @@ koko-capture.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
+
+[dev-dependencies]
+koko-host-windows = { path = "../koko-host-windows" }

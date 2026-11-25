@@ -1456,6 +1456,7 @@ dependencies = [
  "base64 0.22.1",
  "iroh",
  "koko-capture",
+ "koko-host-windows",
  "koko-p2p",
  "koko-proto",
  "serde",
@@ -1463,6 +1464,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows",
+]
+
+[[package]]
+name = "koko-host-windows"
+version = "0.1.25"
+dependencies = [
+ "koko-proto",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
