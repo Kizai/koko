@@ -159,7 +159,7 @@ impl<S: Sink> Input<S> {
 
     fn click(&mut self, geometry: Option<Geometry>, point: (u16, u16)) -> Result<(), InputError> {
         let button = Control::Button(Button::Left);
-        if self.owns(button) {
+        if !self.cleanup_pending && self.owns(button) {
             return Err(InputError::Failed(
                 "Windows click blocked: the remote left button is already held".into(),
             ));

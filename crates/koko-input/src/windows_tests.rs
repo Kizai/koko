@@ -529,3 +529,29 @@ fn unmatched_up_does_not_release_explicitly_owned_modifier_on_other_side() {
         [scan(0x1d, true, true), scan(0x1d, true, false)]
     );
 }
+
+#[test]
+fn semantic_click_retries_pending_left_release_before_a_new_click() {
+    let mut input = input(true);
+    input.sink.counts.extend([2, 0]);
+    let click = [
+        Record::Move(0, 0),
+        Record::Edge(Control::Button(Button::Left), true),
+        Record::Edge(Control::Button(Button::Left), false),
+    ];
+    assert!(matches!(
+        input.click(Some(geometry()), (0, 0)),
+        Err(InputError::Failed(_))
+    ));
+    input.click(Some(geometry()), (0, 0)).unwrap();
+    assert_eq!(
+        input.sink.attempted,
+        [
+            click.to_vec(),
+            vec![click[2]],
+            vec![click[2]],
+            click.to_vec(),
+        ]
+    );
+    assert!(input.held.is_empty());
+}
