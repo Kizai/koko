@@ -260,6 +260,10 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 按钮为 left、right、middle、back、forward。滚动量为有符号像素单位，保留 AppKit `scrollingDeltaX/Y` 的符号：精确滚动乘 1，普通滚轮乘 12，向远离零的方向取整（例如 1.1 → 2，−1.1 → −2），再饱和到 i16；连续同屏滚动可饱和相加，双零丢弃。主机创建 Core Graphics `.pixel` 双轴滚动事件，`wheel1=dy`、`wheel2=dx`，附带当前按住的修饰键。依据 `RemoteControlView.swift`、`LocalConnection.swift` 的滚动合并及 `DesktopInput.swift`。
 
+Windows 适配层采用 12 协议像素对应一个 `WHEEL_DELTA`（120 滚轮单位）的换算比例。实际滚动距离取决于 Windows 设置和应用。换算到 Windows 时，竖轴保留 `dy` 的符号，横轴把 `dx` 取反。Windows 竖向正值代表滚轮向前（远离用户），横向正值代表向右。协议与 Windows 的方向对应关系在阶段 1 实机复核。[Microsoft MOUSEINPUT 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
+
+反向换算按轴累计不足一个协议像素的有符号余量，整像素向零截断，方向反转时先抵消余量。输出饱和到 `i16`，丢弃超出的整像素并保留亚像素余量。新输入流从零余量开始。
+
 键码是 Mac 虚拟键位置。flags 等于设备无关的 Core Graphics 修饰位右移 16 位，允许掩码 `0xbf`：
 
 | 位 | 含义 |

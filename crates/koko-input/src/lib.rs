@@ -2,3 +2,4 @@
 
 pub mod coordinates;
 pub mod keyboard;
+pub mod scroll;
