@@ -121,7 +121,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0B.4 滚动换算 | 协议中的像素滚动量与 `WHEEL_DELTA` 的换算，方向约定写进文档 | 单元测试；方向在阶段 1 实机复核 |
 | 0B.5 H.264 封装 | Annex B 到 AVCC 的转换，从码流中提取 SPS/PPS 并生成 `format` 记录；视频记录的读写（长度、类型、载荷） | 单元测试使用 0.6 采集的 macOS 实机样例，生成的 `format` 记录与 macOS 字节一致 |
 | 0B.6 音频封装 | AAC 的 AudioSpecificConfig（magic cookie）生成，5、6 号记录的载荷编码，以及 7 号历史视频记录的接收兼容 | 单元测试使用 0.6 采集的样例，编码结果能被 macOS 的解码逻辑接受（字节级比对） |
-| 0B.7 UI 树映射 | UI Automation 的 ControlType 到 AX 角色名的映射表；遍历结果展平为 `UiNode` 列表的逻辑（父节点索引、截断、密码框去值），输入用简单的树结构表示 | 单元测试 |
+| 0B.7 UI 树映射 | UI Automation 的 ControlType 到 协议角色名（省略 AX 前缀，见 3.1）的映射表；遍历结果展平为 `UiNode` 列表的逻辑（父节点索引、截断、密码框去值），输入用简单的树结构表示 | 单元测试 |
 | 0B.8 高危规则匹配 | Windows 侧的规则判定：进程名或 AUMID 匹配、快捷键规则、关键词规则，读取同一份 `agent-policy.json`，含 Windows 默认值 | 单元测试覆盖 `agent.md` 中列出的每类规则 |
 
 阶段 0B 的总验收：上述测试在 macOS 和 Windows CI 上全部通过；阶段 1 的各任务只剩下调用 Windows API 和实机验收。
