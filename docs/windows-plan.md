@@ -90,7 +90,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0.3 数据目录 | 在 `koko-p2p` 增加一个函数，返回 `~/.koko`（Unix 用 `HOME`，Windows 用 `USERPROFILE`），`koko-agent` 的 `koko_directory()` 改为调用它 | Windows 上 `koko-agent pair`、`koko-agent mcp` 无需显式传入密钥路径 |
 | 0.4 **剪贴板路径安全（P0）** | 接收端在 Windows 上额外拒绝：含 `\`、`:`、`<>"|?*` 和控制字符的分段；保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，不区分大小写，含扩展名形式）；以点或空格结尾的分段。拼接后再确认路径仍位于接收目录内。不合法时整批作废，返回 `clipboard_invalid`。错误码分两层：协议层（`koko_proto::safe_relative_path`，含 NUL、`.`、`..`、空段、绝对路径）在请求入口校验，所有平台都返回 `invalid_command`，保持不变；只有通过协议校验、但 Windows 文件系统不接受的名称才返回 `clipboard_invalid`。是否把 `\` 和 `:` 也加进跨平台的 `safe_relative_path`，在 PR 里给出影响评估，由用户决定 | 新增单元测试覆盖上述每一类输入，在 Windows CI 上运行 |
 | 0.5 视频通道 | 把 `serve_video` 的 Unix socket 抽成「本机私有视频通道」，Unix 用现有实现，Windows 用 `tokio::net::windows::named_pipe`：管道名随机生成（`\\.\pipe\koko-video-<随机>`），设置 `first_pipe_instance(true)` 和 `reject_remote_clients(true)`，并**显式指定只允许当前用户 SID 访问的安全描述符**（Windows 管道的默认 DACL 会给 Everyone 读权限）。`Desktop request` 的 `video_socket` 字段在 Windows 上承载管道名，字段名不变。实现 Windows 视频通道时移除 relay_feedback 上的 allow(dead_code)。 | 集成测试：一个模拟应用写入视频记录，经 QUIC 原样到达订阅端；另一用户身份无法连接管道（若 CI 不便测试，写进实机验收清单） |
-| 0.6 补全协议文档 | 本轮先将 1.3 节的格式、Desktop 实际回复与当前源码差异写进 `docs/architecture.md`；按 [协议样例采集](./protocol-capture.md) 交由用户在两台 Mac 上采集。拿到真实输出后再增加 `koko-proto` 的 displays、ui_tree、音视频样例测试，不手工编造样例 | 本轮验收文档；实机采集与样例测试后续补齐 |
+| 0.6 补全协议文档 | 本轮先将 1.3 节的格式、Desktop 实际回复与当前源码差异写进 `docs/architecture.md`；按 [协议样例采集](./protocol-capture.md) 由用户在一台 Mac 上运行脚本采集。拿到真实输出后再增加 `koko-proto` 的 displays、ui_tree、音视频样例测试，不手工编造样例 | 本轮验收文档；实机采集与样例测试后续补齐 |
 | 0.7 子进程生命周期 | 记录 Windows 上的约定，供阶段 1 使用：外壳启动 daemon 和 agent 时使用 `CREATE_NO_WINDOW`，并放进设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，保证外壳退出时子进程一并退出 | 文档说明 |
 
 阶段 0 的跨平台能力在阶段 1 一并进行 Windows 实机验收：在 Windows 上运行 `koko-daemon serve-pair %USERPROFILE%\.koko\host.key 0.0.0.0:27688`，Mac 的 Koko.app 能通过局域网发现它并用连接码配对，截图请求返回 `desktop_unavailable`。这一步证明网络、mDNS 和防火墙路径都是通的，需要在 Windows 防火墙放行 UDP 27688 和 5353，并且网络配置文件为「专用网络」。
@@ -123,6 +123,8 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0B.6 音频封装 | AAC 的 AudioSpecificConfig（magic cookie）生成，5、6 号记录的载荷编码，以及 7 号历史视频记录的接收兼容 | 单元测试使用 0.6 采集的样例，编码结果能被 macOS 的解码逻辑接受（字节级比对） |
 | 0B.7 UI 树映射 | UI Automation 的 ControlType 到 协议角色名（省略 AX 前缀，见 3.1）的映射表；遍历结果展平为 `UiNode` 列表的逻辑（父节点索引、截断、密码框去值），输入用简单的树结构表示 | 单元测试 |
 | 0B.8 高危规则匹配 | Windows 侧的规则判定：进程名或 AUMID 匹配、快捷键规则、关键词规则，读取同一份 `agent-policy.json`，含 Windows 默认值 | 单元测试覆盖 `agent.md` 中列出的每类规则 |
+
+0B.1 的假桌面后端允许使用合成回复，只用于检查行协议驱动。实现时须在测试源码中标注这项例外及数据来源。0B.5、0B.6 的字节级比对仍使用 0.6 的实机样例。
 
 阶段 0B 的总验收：上述测试在 macOS 和 Windows CI 上全部通过；阶段 1 的各任务只剩下调用 Windows API 和实机验收。
 
@@ -200,7 +202,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 阶段 | 状态 |
 | --- | --- |
 | 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
-| 0B 可脱离实机的平台逻辑 | 0.6 文档 PR 合并后启动 |
+| 0B 可脱离实机的平台逻辑 | 0.6 采集脚本合入后推进 0B.1–0B.4、0B.7 和 0B.8；0B.5、0B.6 等待实机样例 |
 | 1 Windows 被控端 | 未开始 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
@@ -212,6 +214,6 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0.4 剪贴板路径安全 | #3 已合入，rebase 后完整两平台 CI 通过；真实应用双向文件传输待阶段 1 |
 | 0.5 视频通道 | 已在 #7 实现并覆盖真实 QUIC 和实际管道 DACL 测试；另一用户身份拒绝访问及真实应用接入纳入阶段 1 实机验收，见 #7 清单 |
 | 0.7 生命周期 | 文档约定并入 #7；创建、退出与崩溃清理的代码和实机验收属于阶段 1/2 |
-| 0.6 协议 | 架构文档已记录源码核对后的格式，并提供[两台 Mac 的采集步骤](./protocol-capture.md)。待用户提供实机原始样例后补入样例和对应测试。已记录 `audio_volume` 缺字段的现存问题 |
+| 0.6 协议 | 协议文档 #9 已合入。采集入口与验收见[单机自动采集步骤](./protocol-capture.md)。待用户提供实机原始样例后补入样例和对应测试。已记录 `audio_volume` 缺字段的现存问题 |
 
-执行顺序为 #7 合并后发布 0.6 文档 PR，再于 0.6 合并后依次推进 0B.1 至 0B.8。若推进到 0B.5、0B.6 时仍缺少 0.6 实机样例，则暂缓相应任务，继续 0B.7、0B.8，并在进度中记录暂缓项。
+0.6 协议文档 #9 已合入。采集脚本合入后先推进 0B.1–0B.4。若推进到 0B.5、0B.6 时仍缺少 0.6 实机样例，则暂缓相应任务，继续 0B.7、0B.8，并在进度中记录暂缓项。

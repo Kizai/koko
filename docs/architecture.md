@@ -141,7 +141,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `path` | 4 | 由控制端 `koko-agent` 每秒插入：八字节大端 RTT 毫秒数，加一字节是否为 IP 直连。 |
 | `audioFormat` | 5 | 14 字节固定头：`u32be formatID`、`u32be sampleRate`、`u16be channels`、`u32be framesPerPacket`，随后是非空 Magic Cookie，直至记录末尾，无独立 cookie 长度。 |
 | `audioFrame` | 6 | `u32be sequence`，随后是原始 AAC 数据；通常每条记录一个压缩包，若编码器未提供包描述，则整块非空压缩缓冲区写成一条记录。KoKo 不添加 ADTS、PTS 或时长。序号从 0 开始，按 2³² 回绕。 |
-| `syncFrame` | 7 | 有符号 `i64be ptsUs`（二进制补码），随后是四字节长度前缀 NAL 单元。历史发送端相对初始采集主机时钟换算并四舍五入到微秒；当前只保留接收兼容，不再发送此记录。 |
+| `syncFrame` | 7 | 有符号 `i64be ptsUs`（二进制补码），随后是四字节长度前缀 NAL 单元。历史发送端相对初始采集主机时钟换算并四舍五入到微秒；当前版本不再发送，Windows 端不实现发送。历史接收兼容仍保留。 |
 | `hevcFormat` | 8 | `u32be` 参数集数量，随后每个参数集为 `u32be` 长度和参数集字节（通常 VPS、SPS、PPS）。 |
 | `streamInfo` | 10 | JSON：首条含被控端编码器（`hardware` / `software`）、采集方式（`ScreenCaptureKit`）和起始码率，在第一帧之前；之后码率每次调整再发一条只含 `bitrate`。只发给请求了 `feedback` 的控制端。 |
 | `sequencedFrame` | 9 | 四字节大端帧序号、一字节标志（第 0 位为关键帧），后接与 `frame` 相同的载荷。只发给请求了 `feedback` 的控制端。 |
