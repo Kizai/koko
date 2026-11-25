@@ -367,7 +367,8 @@ mod tests {
         io::stdin().read_line(&mut line).unwrap();
         assert_eq!(line.trim(), "hello child");
         println!("ready from child");
-        thread::sleep(Duration::from_secs(30));
+        // The parent keeps stdin open until it has observed termination.
+        assert_eq!(io::stdin().read_line(&mut line).unwrap(), 0);
     }
 
     #[test]
@@ -415,7 +416,9 @@ mod tests {
             unsafe { WaitForSingleObject(raw(&process), 5000) },
             WAIT_OBJECT_0
         );
-        assert!(!wait(&process)?.success());
+        // Kill-on-close guarantees termination; Windows does not specify its exit code.
+        wait(&process)?;
+        drop(stdin);
         Ok(())
     }
 }
