@@ -1099,6 +1099,7 @@ mod tests {
 
         let app_folder = folder.clone();
         let paste_target = pasted.path().join("KoKo-paste");
+        let pasted_upload = paste_target.join("upload.bin");
         let app = tokio::spawn(async move {
             let mut published = Vec::new();
             while let Some(request) = requests.recv().await {
@@ -1142,23 +1143,13 @@ mod tests {
         let started = std::time::Instant::now();
         push(&client, transfer, None, vec![upload], |_, _| {}).await?;
         let push_rate = SIZE as f64 / started.elapsed().as_secs_f64() / 1e6;
-        assert_eq!(
-            std::fs::read(pasted.path().join("KoKo-paste/upload.bin"))?.len(),
-            SIZE
-        );
+        assert_eq!(std::fs::read(&pasted_upload)?.len(), SIZE);
         eprintln!("loopback clipboard: pull {pull_rate:.0} MB/s, push {push_rate:.0} MB/s");
 
         client.close().await;
         router.shutdown().await?;
         let published = app.await?;
-        assert_eq!(
-            published,
-            [pasted
-                .path()
-                .join("KoKo-paste/upload.bin")
-                .to_string_lossy()
-                .into_owned()]
-        );
+        assert_eq!(published, [pasted_upload.to_string_lossy().into_owned()]);
         Ok(())
     }
 

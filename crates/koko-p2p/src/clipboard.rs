@@ -335,7 +335,6 @@ mod tests {
         std::fs::create_dir_all(album.join("Empty"))?;
         std::fs::write(album.join("a.bin"), vec![7; 700_000])?;
         std::fs::write(source.path().join("Notes.txt"), b"hello")?;
-        std::os::unix::fs::symlink("/etc/hosts", album.join("link"))?;
         let other = tempfile::tempdir()?;
         std::fs::write(other.path().join("Notes.txt"), b"second")?;
 
@@ -353,8 +352,7 @@ mod tests {
                 "Album/a.bin",
                 "Notes.txt",
                 "Notes 2.txt"
-            ],
-            "symbolic links inside folders are left out"
+            ]
         );
 
         let mut wire = Vec::new();
@@ -394,6 +392,42 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn collect_skips_symlinks_inside_folders() -> io::Result<()> {
+        let source = tempfile::tempdir()?;
+        let album = source.path().join("Album");
+        std::fs::create_dir(&album)?;
+        let file = album.join("file.txt");
+        std::fs::write(&file, b"hello")?;
+        let link = album.join("link.txt");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&file, &link)?;
+
+        #[cfg(windows)]
+        {
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            match std::os::windows::fs::symlink_file(&file, &link) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                    eprintln!(
+                        "Skipping Windows symlink test because symlink creation requires Developer Mode or SeCreateSymbolicLinkPrivilege"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let (entries, sources) = collect(&[album])?;
+        let paths: Vec<_> = entries.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, ["Album", "Album/file.txt"]);
+        assert_eq!(sources, [file]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn unreadable_files_report_a_permission_problem() -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -406,5 +440,30 @@ mod tests {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))?;
         assert_eq!(error_code(&error), "clipboard_file_permission");
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_files_report_a_permission_problem() -> io::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let locked = folder.path().join("locked.txt");
+        std::fs::write(&locked, b"hello")?;
+
+        // Denying only read-data to Everyone keeps metadata access and deletion available.
+        let output = std::process::Command::new("icacls.exe")
+            .arg(&locked)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "icacls failed ({}): {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let error = collect(&[locked]).unwrap_err();
+        assert_eq!(error_code(&error), "clipboard_file_permission");
+        folder.close()
     }
 }
