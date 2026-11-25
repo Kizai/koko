@@ -8,11 +8,24 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use iroh::{Endpoint, EndpointAddr, SecretKey, endpoint::presets};
 use koko_proto::{ALPN, CONTROL_HELLO, CONTROL_READY, PAIR_ALPN, REMOTE_ALPN};
 use tempfile::NamedTempFile;
+
+/// Resolves Koko's data directory under `USERPROFILE` on Windows and `HOME` on Unix.
+/// Callers create the directory as needed.
+pub fn data_directory() -> io::Result<PathBuf> {
+    let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    let home = std::env::var_os(home_variable).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{home_variable} is missing"),
+        )
+    })?;
+    Ok(PathBuf::from(home).join(".koko"))
+}
 
 pub fn load_identity(path: &Path) -> io::Result<SecretKey> {
     let bytes = fs::read(path)?
@@ -121,6 +134,18 @@ pub async fn check_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_directory_resolves_platform_home() {
+        let home_variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        match std::env::var_os(home_variable) {
+            Some(home) => assert_eq!(data_directory().unwrap(), Path::new(&home).join(".koko")),
+            None => assert_eq!(
+                data_directory().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            ),
+        }
+    }
 
     #[tokio::test]
     async fn bind_host_available_falls_back_when_port_is_occupied() -> Result<(), Box<dyn Error>> {

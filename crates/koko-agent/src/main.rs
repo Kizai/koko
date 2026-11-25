@@ -14,7 +14,7 @@ use koko_p2p::pairing::{
     lan_request, parse_device_id, request_human_pairing, resolve_invite,
 };
 use koko_p2p::remote::{RemoteClient, send_command};
-use koko_p2p::{check_host, load_identity, load_or_create_identity};
+use koko_p2p::{check_host, data_directory, load_identity, load_or_create_identity};
 use koko_proto::{
     FEEDBACK_ACK, MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH,
     VIDEO_SEQUENCED_FRAME, feedback_length,
@@ -276,8 +276,8 @@ fn print_line(value: &serde_json::Value) {
 }
 
 fn koko_directory() -> Result<PathBuf, Box<dyn Error>> {
-    let home = std::env::var_os("HOME").ok_or("HOME is missing; pass a key file explicitly")?;
-    let directory = PathBuf::from(home).join(".koko");
+    let directory =
+        data_directory().map_err(|error| format!("{error}; pass a key file explicitly"))?;
     std::fs::create_dir_all(&directory)?;
     Ok(directory)
 }
