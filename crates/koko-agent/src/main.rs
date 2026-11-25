@@ -16,7 +16,8 @@ use koko_p2p::pairing::{
 use koko_p2p::remote::{RemoteClient, send_command};
 use koko_p2p::{check_host, load_identity, load_or_create_identity};
 use koko_proto::{
-    MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH, feedback_length,
+    FEEDBACK_ACK, MAX_REMOTE_REQUEST, MAX_VIDEO_PACKET, RemoteCommand, VIDEO_PATH,
+    VIDEO_SEQUENCED_FRAME, feedback_length,
 };
 
 #[tokio::main]
@@ -141,6 +142,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let (closed, input_closed) = tokio::sync::oneshot::channel();
             // The app writes feedback records to stdin and closes it to end the stream.
             let (feedback, feedback_records) = tokio::sync::mpsc::channel(64);
+            let acks = feedback.clone();
             std::thread::spawn(move || {
                 read_feedback(&mut io::stdin().lock(), &feedback);
                 let _ = io::copy(&mut io::stdin(), &mut io::sink());
@@ -149,7 +151,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let client = RemoteClient::connect(key, target).await?;
             let result = tokio::select! {
                 _ = input_closed => Ok(()),
-                result = stream_video(&client, &request, feedback_records) => result,
+                result = stream_video(&client, &request, acks, feedback_records) => result,
             };
             client.close().await;
             result?;
@@ -374,6 +376,13 @@ async fn stream_commands(key: iroh::SecretKey, target: EndpointAddr) -> Result<(
     Ok(())
 }
 
+fn ack_record(sequence: &[u8]) -> Vec<u8> {
+    let mut record = 5u32.to_be_bytes().to_vec();
+    record.push(FEEDBACK_ACK);
+    record.extend_from_slice(sequence);
+    record
+}
+
 /// Passes whole feedback records from the app on, until stdin closes or holds something else.
 /// A record is dropped rather than queued when the stream is behind; the next ack replaces it.
 fn read_feedback(input: &mut impl Read, records: &tokio::sync::mpsc::Sender<Vec<u8>>) {
@@ -397,10 +406,12 @@ fn read_feedback(input: &mut impl Read, records: &tokio::sync::mpsc::Sender<Vec<
 async fn stream_video(
     client: &RemoteClient,
     request: &RemoteCommand,
+    acks: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut feedback: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), Box<dyn Error>> {
     let want_audio = matches!(request, RemoteCommand::Video { audio: true, .. });
-    let video_recv = if matches!(request, RemoteCommand::Video { feedback: true, .. }) {
+    let wants_feedback = matches!(request, RemoteCommand::Video { feedback: true, .. });
+    let video_recv = if wants_feedback {
         // The request stream stays open so acknowledgements reach the host on it.
         let (mut send, recv) = client.open_stream(request).await?;
         tokio::spawn(async move {
@@ -420,14 +431,16 @@ async fn stream_video(
         None
     };
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    // A short queue to the app: when it falls behind, reading stops and so do the acks.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
     let video_tx = tx.clone();
-    let video_task =
-        tokio::spawn(async move { read_media_records(video_recv, video_tx, false).await });
+    let video_task = tokio::spawn(async move {
+        read_media_records(video_recv, video_tx, false, wants_feedback.then_some(acks)).await
+    });
     let audio_task = audio_recv.map(|recv| {
         let audio_tx = tx.clone();
         tokio::spawn(async move {
-            let _ = read_media_records(recv, audio_tx, true).await;
+            let _ = read_media_records(recv, audio_tx, true, None).await;
         })
     });
     drop(tx);
@@ -454,10 +467,14 @@ async fn stream_video(
     Ok(())
 }
 
+/// Copies media records to the app. With `acks`, every sequenced frame is acknowledged as soon
+/// as it is queued for the app, so the host measures the network and this helper, not how busy
+/// the app's main thread happens to be.
 async fn read_media_records(
     mut recv: iroh::endpoint::RecvStream,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ignore_error_record: bool,
+    acks: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 ) -> Result<(), String> {
     let mut length = [0u8; 4];
     while recv
@@ -481,8 +498,13 @@ async fn read_media_records(
         if ignore_error_record && frame[4] == koko_proto::VIDEO_ERROR {
             return Ok(());
         }
+        let ack = (frame[4] == VIDEO_SEQUENCED_FRAME && frame.len() >= 9)
+            .then(|| ack_record(&frame[5..9]));
         if tx.send(frame).await.is_err() {
             break;
+        }
+        if let (Some(acks), Some(ack)) = (&acks, ack) {
+            let _ = acks.try_send(ack);
         }
     }
     Ok(())
@@ -492,6 +514,13 @@ async fn read_media_records(
 mod tests {
     use super::*;
     use koko_proto::{FEEDBACK_ACK, FEEDBACK_KEY_FRAME};
+
+    #[test]
+    fn acks_are_well_formed_feedback() {
+        let record = ack_record(&[0, 0, 1, 2]);
+        assert_eq!(record, [0, 0, 0, 5, FEEDBACK_ACK, 0, 0, 1, 2]);
+        assert_eq!(feedback_length(record[4]), Some(5));
+    }
 
     #[test]
     fn feedback_is_forwarded_as_whole_records_until_one_is_malformed() {

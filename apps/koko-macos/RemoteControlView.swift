@@ -304,6 +304,7 @@ struct RemoteControlView: View {
                 networkRow(stats?.isVideo == true ? "首帧耗时" : "帧请求耗时", stats.map { "\($0.frameMS) ms" } ?? "—")
                 networkRow("接收帧率", stats?.framesPerSecond.map { String(format: "%.1f fps", $0) } ?? "—")
                 networkRow("码率", stats?.kilobitsPerSecond.map(Self.bitrateText) ?? "—")
+                networkRow("目标码率", info?.targetBitrate.map { Self.bitrateText(Double($0) / 1000) } ?? "—")
                 networkRow("分辨率", connection.remoteVideoSize.map { "\(Int($0.width)) × \(Int($0.height))" } ?? "—")
                 Divider()
                 networkRow("加密通道", stats?.direct.map { $0 ? "UDP 直连 · QUIC" : "QUIC 中继" } ?? "—")
@@ -350,6 +351,12 @@ struct RemoteControlView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                     }
+                }
+                if let display = connection.selectedDisplay {
+                    // Presets cannot exceed the remote screen; say which screen and how big it is.
+                    Text("被控屏幕：\(display.name) · \(display.width) × \(display.height)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Text("传输分辨率").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                 ForEach(FrameResolution.allCases) { resolution in

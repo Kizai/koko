@@ -13,6 +13,8 @@ struct VideoPipelineInfo: Equatable {
     /// Reported by hosts that support feedback.
     var hardwareEncode: Bool?
     var capture: String?
+    /// The bitrate the host currently encodes at, which drops while the link is congested.
+    var targetBitrate: Int?
 }
 
 /// A VideoToolbox decoder that hands back each decoded frame before returning.
@@ -230,10 +232,11 @@ final class MetalVideoRenderer: @unchecked Sendable {
         }
     }
 
-    func setStreamInfo(hardwareEncode: Bool?, capture: String?) {
+    func setStreamInfo(_ update: VideoStreamInfo) {
         shared.withLock {
-            $0.info.hardwareEncode = hardwareEncode
-            $0.info.capture = capture
+            if let encoder = update.encoder { $0.info.hardwareEncode = encoder == "hardware" }
+            if let capture = update.capture { $0.info.capture = capture }
+            if let bitrate = update.bitrate { $0.info.targetBitrate = bitrate }
         }
     }
 

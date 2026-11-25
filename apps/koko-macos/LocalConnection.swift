@@ -1604,12 +1604,10 @@ final class LocalConnection: ObservableObject {
                 case .frame, .syncFrame, .sequencedFrame:
                     var payload = bytes
                     if kind == .sequencedFrame {
+                        // The helper acknowledges the frame on arrival; here only the key flag matters.
                         guard bytes.count > 5 else { throw VideoError.packet }
-                        let sequence = bytes.prefix(4).reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
                         let key = bytes[bytes.startIndex + 4] & 1 != 0
                         payload = bytes.subdata(in: (bytes.startIndex + 5)..<bytes.endIndex)
-                        // Every frame is acknowledged, shown or not, so the host knows it arrived.
-                        defer { receiver.acknowledge(sequence) }
                         if awaitingKeyFrame && !key { continue }
                         guard selectedDisplay?.id == settings.display else { continue }
                         if videoSurface.hasFailed { throw CommandError(errorDescription: "video_codec_failed") }

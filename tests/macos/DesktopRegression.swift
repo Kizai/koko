@@ -243,6 +243,27 @@ struct DesktopRegression {
         }
         guard flow.bitrate > lowered else { throw Failure("网络恢复后应逐步提高码率") }
 
+        // One slow frame among quick ones is not congestion.
+        var steady = VideoFlow(fps: 60, bitrate: 50_000_000)
+        for step in 0..<120 {
+            let at = Double(step) / 60
+            let frame = steady.send(now: at)
+            steady.acknowledge(frame, now: at + (step == 60 ? 0.08 : 0.003))
+        }
+        guard steady.bitrate == 50_000_000 else { throw Failure("单个慢帧不应降低码率：\(steady.bitrate)") }
+
+        // A still screen sends almost nothing; the first frame after it is back at full bitrate.
+        for step in 201...240 {
+            now = Double(step) * 0.05
+            let frame = flow.send(now: now)
+            flow.acknowledge(frame, now: now + 0.004 + min(0.12, Double(step - 200) * 0.01))
+        }
+        guard flow.bitrate < 50_000_000 else { throw Failure("再次拥塞时应降低码率") }
+        _ = flow.takeBitrateChange()
+        guard flow.admits(now: now + 1.5), flow.takeBitrateChange() == 50_000_000 else {
+            throw Failure("画面静止一段时间后应恢复满码率")
+        }
+
         // A controller without feedback is never held back for long.
         var silent = VideoFlow(fps: 60, bitrate: 10_000_000)
         for _ in 0..<10 { _ = silent.send(now: 0) }

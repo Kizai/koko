@@ -73,6 +73,13 @@ enum VideoRecord: UInt8 {
     case streamInfo
 }
 
+/// A `streamInfo` record: the first names the encoder and capture, later ones only the bitrate.
+struct VideoStreamInfo: Codable {
+    var encoder: String? = nil
+    var capture: String? = nil
+    var bitrate: Int? = nil
+}
+
 /// Records a controller writes back on a video stream that has feedback.
 enum VideoFeedback: UInt8 {
     case ack = 1, keyFrame
@@ -96,8 +103,11 @@ struct VideoFlow {
     private var fastestAt = 0.0
     private var queueing = 0.0
     private var adjustedAt = 0.0
-    private var quietSince: Double?
-    private var held = false
+    private var heldFrames = 0
+    private var congestedChecks = 0
+    private var congestedAt = -Double.infinity
+    private var raisedAt = -Double.infinity
+    private var sentAt = -Double.infinity
     private var bitrateChanged = false
     private var keyFrameRequested = false
     private var keyFrameAt = -Double.infinity
@@ -109,7 +119,7 @@ struct VideoFlow {
     }
 
     /// The lowest bitrate congestion may push the stream to.
-    var minimumBitrate: Int { max(1_000_000, maxBitrate / 5) }
+    var minimumBitrate: Int { max(1_000_000, maxBitrate / 4) }
 
     /// Frames allowed on their way: one round trip plus two frame intervals, plus one frame.
     var window: Int {
@@ -120,15 +130,19 @@ struct VideoFlow {
     /// Whether to capture another frame now. A controller that never acknowledges within two
     /// seconds is treated as one without feedback and is never held back.
     mutating func admits(now: Double) -> Bool {
+        // A still screen sends almost nothing, so nothing could show the link recovering; the
+        // first frame after a quiet second starts again at full quality.
+        if now - sentAt > 1, now - congestedAt > 1 { setBitrate(maxBitrate) }
         if !acknowledged, let startedAt, now - startedAt > 2 { return true }
         guard unacknowledged.count >= window else { return true }
-        held = true
+        heldFrames += 1
         return false
     }
 
     /// Records a frame about to be sent and returns its sequence number.
     mutating func send(now: Double) -> UInt32 {
         if startedAt == nil { startedAt = now }
+        sentAt = now
         let sequence = nextSequence
         nextSequence &+= 1
         unacknowledged.append((sequence, now))
@@ -148,22 +162,25 @@ struct VideoFlow {
         queueing += (max(0, delay - fastest) - queueing) * 0.2
         guard now - adjustedAt >= 0.25 else { return }
         adjustedAt = now
-        let previous = bitrate
-        if held || queueing > max(0.02, 2 * interval) {
-            bitrate = max(minimumBitrate, Int(Double(bitrate) * 0.85))
-            quietSince = nil
-        } else if queueing < max(0.008, interval / 2) {
-            let since = quietSince ?? now
-            quietSince = since
-            if now - since >= 1 {
-                bitrate = min(maxBitrate, Int(Double(bitrate) * 1.1))
-                quietSince = now
-            }
-        } else {
-            quietSince = nil
+        // One large frame or a busy moment is not congestion: it takes half a second of frames
+        // arriving late, or several held back, before the bitrate goes down.
+        let congested = heldFrames >= 3 || queueing > max(0.03, 3 * interval)
+        heldFrames = 0
+        congestedChecks = congested ? congestedChecks + 1 : 0
+        if congestedChecks >= 2 {
+            setBitrate(max(minimumBitrate, Int(Double(bitrate) * 0.85)))
+            congestedAt = now
+            congestedChecks = 0
+        } else if !congested, now - congestedAt >= 1, now - raisedAt >= 0.5, bitrate < maxBitrate {
+            setBitrate(min(maxBitrate, Int(Double(bitrate) * 1.15)))
+            raisedAt = now
         }
-        held = false
-        if bitrate != previous { bitrateChanged = true }
+    }
+
+    private mutating func setBitrate(_ value: Int) {
+        guard value != bitrate else { return }
+        bitrate = value
+        bitrateChanged = true
     }
 
     /// A new bitrate for the encoder, once per change.
@@ -428,7 +445,8 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
             let start = VideoFlow(fps: settings.fps, bitrate: encoder.bitrate)
             flow.withLock { $0 = start }
             // Older controllers would reject a record kind they do not know.
-            let info = ["encoder": encoder.isHardware ? "hardware" : "software", "capture": "ScreenCaptureKit"]
+            let info = VideoStreamInfo(encoder: encoder.isHardware ? "hardware" : "software",
+                                       capture: "ScreenCaptureKit", bitrate: encoder.bitrate)
             sendVideoFast(.streamInfo, bytes: try JSONEncoder().encode(info), to: connection)
         }
         config.width = videoWidth
@@ -465,7 +483,13 @@ func streamDesktopVideo(_ settings: VideoSettings, socket: String) async {
                 }
                 held.withLock { $0 = nil }
                 newest = frame.buffer.presentationTimeStamp
-                if let bitrate { encoder.setBitrate(bitrate) }
+                if let bitrate {
+                    encoder.setBitrate(bitrate)
+                    // The controller's network panel shows the bitrate the host is aiming for.
+                    if let update = try? JSONEncoder().encode(VideoStreamInfo(bitrate: bitrate)) {
+                        sendVideoFast(.streamInfo, bytes: update, to: connection)
+                    }
+                }
                 guard let encoded = try await encoder.encode(frame.buffer, keyFrame: keyFrame),
                       let block = encoded.dataBuffer, let nextFormat = encoded.formatDescription else { continue }
                 if format != nextFormat {
@@ -715,11 +739,10 @@ final class VideoSurface {
         renderer.decode(sample)
     }
 
-    /// The host's encoder and capture, from its `streamInfo` record.
+    /// The host's encoder, capture and current bitrate, from its `streamInfo` records.
     func setStreamInfo(_ bytes: Data) {
-        struct Info: Decodable { var encoder: String?; var capture: String? }
-        guard let info = try? JSONDecoder().decode(Info.self, from: bytes) else { return }
-        renderer.setStreamInfo(hardwareEncode: info.encoder.map { $0 == "hardware" }, capture: info.capture)
+        guard let info = try? JSONDecoder().decode(VideoStreamInfo.self, from: bytes) else { return }
+        renderer.setStreamInfo(info)
     }
 
     /// Called by the view when its size or backing scale changes.
@@ -796,13 +819,6 @@ final class VideoReceiver {
     /// Closing stdin lets the helper close its QUIC connection, which tells the host at once
     /// that this stream ended. Killing it first would leave the host waiting for a timeout and
     /// refusing the next stream meanwhile, so the helper is only killed if it does not exit.
-    /// Tells the host this frame arrived; it sends new frames only while few are unacknowledged.
-    func acknowledge(_ sequence: UInt32) {
-        var record = Data([0, 0, 0, 5, VideoFeedback.ack.rawValue])
-        withUnsafeBytes(of: sequence.bigEndian) { record.append(contentsOf: $0) }
-        write(record)
-    }
-
     /// Asks the host for a key frame after this Mac had to skip one it could not show.
     func requestKeyFrame() {
         write(Data([0, 0, 0, 1, VideoFeedback.keyFrame.rawValue]))
