@@ -6,15 +6,15 @@
 
 ## 环境与记录
 
-两台 Mac 分别作为被控端和人类控制端，使用已知提交的 Koko.app。在被控端运行 `./scripts/build-macos.sh --allow-ad-hoc` 构建测试应用，启动共享并授予屏幕录制、辅助功能权限，完成真实配对。裸 `serve` / `serve-pair` 不提供完整应用桥接；采集目标应是应用以 `--app-desktop` 启动的 daemon。
+两台 Mac 分别作为被控端和人类控制端，使用已知提交的 Koko.app。在被控端运行 `./scripts/build-macos.sh --allow-ad-hoc` 构建测试应用（默认输出 `target/koko-macos/local/Koko.app`），启动共享并授予屏幕录制、辅助功能权限，完成真实配对。裸 `serve` / `serve-pair` 不提供完整应用桥接；采集目标应是应用以 `--app-desktop` 启动的 daemon。
 
 每次记录提交、应用和 macOS 版本、显示器、采集时间、编码器及请求选项。使用专用测试窗口、音频和剪贴板内容，不包含身份私钥、邀请或验证码。原始数据先保存在本机，不直接提交完整屏幕或私人 UI 树。
 
 ## Desktop 行协议
 
-在临时测试构建中，对 `LocalConnection.swift` 的 host-daemon 管道增加本地 trace：在 `Desktop request: ` 分支解码前保存完整原始请求行，在 `command.send` 写入 `desktop-reply` 前保存实际编码后的回复行（含最终一个 LF）。只记录这两类行并保留请求编号。本次文档 PR 不修改 Swift；此处的临时 trace 由操作者在采集时执行。CLI 返回值已经经过 Rust 解码和再次序列化，不能替代原始本机回复。
+在临时测试构建中，对 `LocalConnection.swift` 的 host-daemon 管道增加本地 trace：在 `updatePairingStatus` 的 `Desktop request: ` 分支解码前保存完整请求行，在 `respondToDesktopRequest` 中把传给 `command.send` 的同一个完整编码字符串保存为回复行。`LocalCommand.result` 传入的请求行和 `command.send` 接收的回复字符串均不含 LF，写入采集日志时各追加一个 LF。用一个本地文件按行追加，只记录这两类行并保留请求编号。本次文档 PR 不修改 Swift；此处的临时 trace 由操作者在采集时执行。CLI 返回值已经经过 Rust 解码和再次序列化，不能替代原始本机回复。
 
-逐项触发以下动作，保存对应请求和回复：
+逐项触发以下动作，保存对应请求和回复。对无需持续二进制流的动作，可将一条请求 JSON 通过 stdin 传给下节的 `remote-stream` 命令，例如把 `displays` 输入换成 `{"action":"ui_tree","max_nodes":50}`、`{"action":"screenshot"}` 或 `{"action":"audio_volume"}`。音量设置测试前在被控 Mac 的系统设置记录原值。
 
 - 显示器枚举、主屏 PNG screenshot、指定显示器 JPEG/PNG capture、wallpaper、前台测试应用 ui_tree。
 - 音量读取、受控设置再恢复原值；保留当前 `audio_volume` 实际缺字段的回复及 CLI 错误，不补写 level/muted。
@@ -26,7 +26,7 @@
 
 ## 二进制媒体
 
-先关闭 GUI 的视频订阅，避免占用唯一视频槽位。在人类控制端设置下列变量为已配对会话的真实值：`KOKO_AGENT`（辅助进程路径）、`KOKO_CONTROLLER_KEY`、`KOKO_HOST_ID`、`KOKO_HOST_ADDRESS`。不要把密钥内容复制进采集材料。
+先关闭 GUI 的视频订阅，避免占用唯一视频槽位。在人类控制端设置下列变量为已配对会话的真实值：`KOKO_AGENT`（辅助进程路径）、`KOKO_CONTROLLER_KEY`、`KOKO_HOST_ID`、`KOKO_HOST_ADDRESS`。辅助进程位于 `Koko.app/Contents/Helpers/koko-agent`，图形应用的人类控制端身份默认是 `$HOME/.koko/controller.key`。如需获取准确的主机 ID 和地址，可用同一身份做一次人类配对，从 `koko-agent pair <身份文件> -` 的 `paired` 输出读取 `host_id` 和 `address`，配对目标从 stdin 输入；使用设备 ID 和验证码时加 `--code-stdin`，第二行输入验证码。不要把密钥内容或配对输入复制进采集材料。
 
 ```sh
 umask 077
@@ -51,10 +51,10 @@ capture_media true
 
 依次读取四字节大端长度，确认 1–8 MiB，再精确读取相应字节，首字节为类型。验证存在类型 5、6：类型 5 固定头是 14 字节，余下 cookie 非空；类型 6 前四字节序号在同一编码器内连续，然后是 AAC 包。无反馈时应有类型 2，有反馈时应有 9、10；类型 4 是辅助进程插入的链路状态。保留完整记录后再裁切必要片段，记录裁切位置，不手工重构载荷。
 
-当前主机不发送类型 7。若确需该历史样例，另行使用已确认可运行且发送该记录的历史构建（发送源码见 `9a20fec`，后在 `ff0cd1a` 移除），记录独立的版本和兼容会话；不能用当前帧加上手写时间戳替代。历史音频语义也须与当前类型 5/6 分开标注。
+当前主机不发送类型 7。若确需该历史样例，另行使用确认可运行的历史主机及兼容控制端，在历史构建中开启音频订阅（`9a20fec` 的发送分支要求 `settings.audio`，后在 `ff0cd1a` 移除），记录独立的版本和兼容会话；不能用当前帧加上手写时间戳替代。历史音频语义也须与当前类型 5/6 分开标注。
 
 ## 交回材料与后续测试
 
-交回脱敏后的原始 JSONL、完整媒体记录片段、分离的 stderr、元数据和每个文件的 SHA-256（`shasum -a 256`）。脱敏仅改文本标识并附变更说明，不改字段集合、类型、可选字段存在性或二进制载荷；不宜公开的图像/音频应重新用测试内容采集。
+交回保留两种前缀的脱敏本机行日志、对应的 CLI JSONL、完整媒体记录片段、分离的 stderr、元数据和每个文件的 SHA-256（`shasum -a 256`）。脱敏仅改文本标识并附变更说明，不改字段集合、类型、可选字段存在性或二进制载荷；不宜公开的图像/音频应重新用测试内容采集。
 
 收到真实材料后，再为 displays、ui_tree 和音视频格式增加 koko-proto 样例测试，并用于 0B 的字节级比对。当前阶段 0.6 的样例采集和测试仍待完成；阶段 0B 不因此提前开始。

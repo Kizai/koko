@@ -140,7 +140,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `error` | 3 | UTF-8 错误码，随后流结束。 |
 | `path` | 4 | 由控制端 `koko-agent` 每秒插入：八字节大端 RTT 毫秒数，加一字节是否为 IP 直连。 |
 | `audioFormat` | 5 | 14 字节固定头：`u32be formatID`、`u32be sampleRate`、`u16be channels`、`u32be framesPerPacket`，随后是非空 Magic Cookie，直至记录末尾，无独立 cookie 长度。 |
-| `audioFrame` | 6 | `u32be sequence`，随后一个原始 AAC 压缩包；不添加 ADTS、PTS 或时长。序号从 0 开始，按 2³² 回绕。 |
+| `audioFrame` | 6 | `u32be sequence`，随后是原始 AAC 数据；通常每条记录一个压缩包，若编码器未提供包描述，则整块非空压缩缓冲区写成一条记录。KoKo 不添加 ADTS、PTS 或时长。序号从 0 开始，按 2³² 回绕。 |
 | `syncFrame` | 7 | 有符号 `i64be ptsUs`（二进制补码），随后是四字节长度前缀 NAL 单元。历史发送端相对初始采集主机时钟换算并四舍五入到微秒；当前只保留接收兼容，不再发送此记录。 |
 | `hevcFormat` | 8 | `u32be` 参数集数量，随后每个参数集为 `u32be` 长度和参数集字节（通常 VPS、SPS、PPS）。 |
 | `streamInfo` | 10 | JSON：首条含被控端编码器（`hardware` / `software`）、采集方式（`ScreenCaptureKit`）和起始码率，在第一帧之前；之后码率每次调整再发一条只含 `bitrate`。只发给请求了 `feedback` 的控制端。 |
@@ -166,7 +166,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 上述布局依据 `apps/koko-macos/AudioSync.swift` 的 `AudioPacketCodec`、`VideoStream.swift` 的 `VideoStreamRecord` / 编码器与 `LocalConnection.swift` 的接收分支核对（源码基线 `8b10240`）。此前文档中的 40 字节音频头、无序号音频包与缺少数量前缀的 HEVC 头均与该源码不符，此处按当前实现记录；没有借此修改线上的格式。类型 7 的发送布局来自历史提交 `9a20fec`，发送器在 `ff0cd1a` 被移除；当前接收器跳过前 8 字节，不使用其时间戳。
 
-当前 macOS 音频为 48,000 Hz 双声道，优先 AAC-ELD（`formatID=0x61616365`，FourCC `aace`，480 采样/包，即 10 ms），失败回退 AAC-LC（`0x61616320`，FourCC `aac `，1024 采样/包，约 21.33 ms）。编码器取得非空 cookie 后先发一次类型 5，再发类型 6；解码器跳过类型 6 的四字节序号，把余下字节作为一个压缩包解码。
+当前 macOS 音频为 48,000 Hz 双声道，优先 AAC-ELD（`formatID=0x61616365`，FourCC `aace`，480 采样/包，即 10 ms），失败回退 AAC-LC（`0x61616320`，FourCC `aac `，1024 采样/包，约 21.33 ms）。发送端首次取得非空 cookie 时发送一次类型 5，排在该次编码产生的类型 6 之前。类型 6 的发送本身不等待 cookie。解码器跳过类型 6 的四字节序号，把余下字节作为一个压缩包解码。
 
 `remote-video` 的 `audio:true` 让辅助进程额外打开独立 `audio` 请求；主机视频采集本身仍禁用音频。音频请求不携带显示器 ID，macOS 为 ScreenCaptureKit 过滤器选择主屏或首个可用屏。辅助进程把两个流的完整记录合并到 stdout，不按跨流时间戳重排；音频流类型 3 错误只结束音频读取，不混入 stdout。当前视频发送类型 2 或 9，不能以缺少类型 7 判断采集失败。实机样例的采集与校验见[协议样例采集](./protocol-capture.md)，本轮尚未生成样例文件。
 
@@ -216,7 +216,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 #### Desktop request 与回复 JSON
 
-本机桥接是 UTF-8 行协议：daemon 输出 `Desktop request: <u64十进制编号> <JSON>\n`，应用写回 `desktop-reply <同一编号> <JSON>\n`。编号从 1 开始，用于关联并发请求。请求以 `action`、回复以 `status` 标记；下表描述字段类型，属于格式定义，不是实机采集样例。`?` 表示可省略，Swift 编码器不输出值为 nil 的可选字段。依据 `LocalConnection.swift` 的 `DesktopRequest`、`RemoteReply` 和 `handleDesktopRequest`，以及 `koko-daemon/src/desktop.rs` 的 `AppDesktop`（基线 `8b10240`）。
+本机桥接是 UTF-8 行协议：daemon 输出 `Desktop request: <u64十进制编号> <JSON>\n`，应用写回 `desktop-reply <同一编号> <JSON>\n`。编号从 1 开始，用于关联并发请求。请求以 `action`、回复以 `status` 标记；下表描述字段类型，属于格式定义，不是实机采集样例。`?` 表示可省略，Swift 编码器不输出值为 nil 的可选字段。Swift 源码见 `apps/koko-macos/LocalConnection.swift` 的 `RemoteAction`、`RemoteReply`、`respondToDesktopRequest` 和 `executeDesktopAction`（Swift 基线 `8b10240`），daemon 侧见 `crates/koko-daemon/src/desktop.rs` 的 `AppDesktopRequests`。
 
 | `action` | 请求中除 `action` 外的字段 | 应用实际成功回复（除 `status` 外的字段） |
 | --- | --- | --- |
@@ -224,7 +224,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `clipboard_target` | `transfer:String` | `status=clipboard_folder`，`path:String`（新建接收目录的绝对路径） |
 | `clipboard_publish` | `transfer:String`、`text:String?`、`paths:[String]` | `status=ok`；发布收到的文本或绝对路径并按 Paste |
 | `displays` | 无 | `status=displays`，`host_name:String`、`displays:[Display]`、`clipboard:true`、`video:true`、`clipboard_stream:true`、`outbox:true` |
-| `video` | `display:u32`、`edge:u16`、`quality:u8`、`fps:u16`、`audio:bool?`、`hevc:bool?`、`chroma444:bool?`、`feedback:bool?`、`video_socket:String` | `status=ok`；表示已调度捕获，后续数据或捕获错误经本机通道传输；视频端忽略 `audio`，使用独立音频通道 |
+| `video` | `display:u32`、`edge:u16`、`quality:u8`、`fps:u16`、`audio:bool?`、`hevc:bool?`、`chroma444:bool?`、`feedback:bool?`、`video_socket:String` | `status=ok`；表示已调度捕获，后续数据或捕获错误经本机通道传输；视频端忽略 `audio`，使用独立音频通道；四个布尔选项为 false 时 daemon 省略该键 |
 | `audio` | `video_socket:String` | `status=ok`；表示已调度独立音频捕获，后续错误经该通道传输 |
 | `audio_volume` | `level:u8?`（0–100；省略为读取） | 当前实际仅编码 `status=audio_volume`，见下述已知差异 |
 | `wallpaper` | 无 | `status=image`，`image:String`（Base64 JPEG）、`width:Int`、`height:Int`、`format=jpeg` |
@@ -236,7 +236,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `key` | `key:String` | `status=ok`；支持 enter、escape、tab、backspace、space、up、down、left、right、copy、paste、select_all、undo |
 | `text` | `text:String` | `status=ok`；Agent 操作也可能回复审批请求；网络入口限制非空、无 NUL、至多 2048 个 UTF-8 字节 |
 
-`Display` 含 `id:u32`、`name:String`、`width:Int`、`height:Int`，主屏在前，宽高优先取显示模式的原生像素。`UINode` 必含 `role:String`、`enabled:Bool`、`focused:Bool`、`display:u32`、`x:Int`、`y:Int`、`width:Int`、`height:Int`，另有 `label:String?`、`value:String?`、`parent:Int?`。节点按深度优先展平，parent 是最近保留祖先的数组下标；密码框省略 value，坐标 0–9999，尺寸 1–10000。角色保留 AX 名称；`AXMenuBar` 不输出。Rust 对外重新序列化时省略 `enabled:true` 和 `focused:false`，节点坐标与尺寸类型为无符号整数。
+`Display` 含 `id:u32`、`name:String`、`width:Int`、`height:Int`，主屏在前，宽高优先取显示模式的原生像素。`UINode` 必含 `role:String`、`enabled:Bool`、`focused:Bool`、`display:u32`、`x:Int`、`y:Int`、`width:Int`、`height:Int`，另有 `label:String?`、`value:String?`、`parent:Int?`。节点按深度优先展平，parent 是最近保留祖先的数组下标；密码框省略 value，坐标 0–9999，尺寸 1–10000。按 `UITree.swift` 的 `makeNode`，角色值去掉 `AX` 前缀（例如 `AXButton` 输出 `Button`），安全输入框和搜索框分别输出 `SecureTextField` 和 `SearchField`。`AXMenuBar` 子树会跳过。Rust 对外重新序列化时省略 `enabled:true` 和 `focused:false`，节点坐标与尺寸类型为无符号整数。
 
 失败回复含 `status=error`、`code:String`；应用会返回 `invalid_command`、`input_permission_required`、`input_failed`、`screen_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed` 及 `ClipboardError` 定义的剪贴板错误。Agent 的 pointer/text 请求增加 `actor=agent`，已获批准重试时才增加 `approved:true`；命中规则的应用回复为 `status=approval_required`、`reason:String`，由 daemon 处理审批，远端最终收到执行结果或 `approval_declined` / `approval_timeout`。
 
@@ -258,7 +258,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `key_up` | `code:u8`（0–127）、`flags:u8` |
 | `release` | 无；释放仍按下的键和按钮 |
 
-按钮为 left、right、middle、back、forward。滚动量为有符号像素单位，保留 AppKit `scrollingDeltaX/Y` 的符号：精确滚动乘 1，普通滚轮乘 12，四舍五入（半值远离零）后饱和到 i16；连续同屏滚动可饱和相加，双零丢弃。主机创建 Core Graphics `.pixel` 双轴滚动事件，`wheel1=dy`、`wheel2=dx`，附带当前按住的修饰键。依据 `RemoteControlView.swift`、`LocalConnection.swift` 的滚动合并及 `DesktopInput.swift`。
+按钮为 left、right、middle、back、forward。滚动量为有符号像素单位，保留 AppKit `scrollingDeltaX/Y` 的符号：精确滚动乘 1，普通滚轮乘 12，向远离零的方向取整（例如 1.1 → 2，−1.1 → −2），再饱和到 i16；连续同屏滚动可饱和相加，双零丢弃。主机创建 Core Graphics `.pixel` 双轴滚动事件，`wheel1=dy`、`wheel2=dx`，附带当前按住的修饰键。依据 `RemoteControlView.swift`、`LocalConnection.swift` 的滚动合并及 `DesktopInput.swift`。
 
 键码是 Mac 虚拟键位置。flags 等于设备无关的 Core Graphics 修饰位右移 16 位，允许掩码 `0xbf`：
 
