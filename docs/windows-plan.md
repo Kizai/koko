@@ -79,6 +79,56 @@ Windows 端按文档中的协议格式实现。实机样例与采集方法见 [�
 
 Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接两块缩放比例不同的显示器（例如 100% 和 150%）。不要用 Apple Silicon Mac 上的 ARM 版 Windows 虚拟机，也不要通过远程桌面（RDP）测试采集和编码：这两种环境没有真实的硬件编码器，显示驱动也不同，结果不可信。阶段 1 完成后，可以从 Mac 用 KoKo 本身控制这台电脑来调试。
 
+### 阶段 1 Windows 实机准备
+
+- 使用 x64 实机和本地交互桌面。优先选已更新的 Windows 11，KoKo 的最低目标仍为 Windows 10 21H2（19044）。接两块物理显示器，将缩放分别设为 100% 和 150%，并能把副屏放到主屏左侧或上方。Apple Silicon 上的 ARM Windows 虚拟机和 RDP 会改变采集与显示环境，实机验收使用直接登录的桌面。
+- 使用带 H.264 硬件编码能力的 GPU（例如支持该功能的 Intel 核显或独立显卡），安装设备厂商当前适用的正式驱动。验收时用 Media Foundation 枚举并确认实际启用硬件 H.264 编码器。建议至少 16 GB 内存、SSD 预留约 40 GB 给工具链和构建产物。[Microsoft Media Foundation 编码器枚举](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mftenumex)
+- Windows 实机与 Mac 接入同一可互通的局域网。将可信的 Windows 网络设为「专用」，在该配置文件放行入站 UDP 27688（KoKo）和 UDP 5353（mDNS）。准备两个不同的本地标准用户。主账号运行 KoKo，第二个账号验证同机另一 SID 无法连接私有视频命名管道。
+
+#### 安装 Windows 原生工具链和 Codex CLI
+
+1. 安装 Git for Windows x64。安装独立的 Visual Studio Build Tools，选择「使用 C++ 的桌面开发」，确认包含 MSVC C++ x64/x86 工具及一个 Windows 10 或 11 SDK。完整 Visual Studio IDE 可选。[Git for Windows](https://git-scm.com/install/windows) · [Microsoft C++ Build Tools](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line)
+2. 下载并运行 x64 版 `rustup-init.exe`，然后在新 PowerShell 窗口安装并检查工具链。预期 `rustc -vV` 报告 `host: x86_64-pc-windows-msvc`。[Rust 安装](https://rust-lang.org/tools/install/) · [Rust MSVC 先决条件](https://rust-lang.github.io/rustup/installation/windows-msvc.html)
+
+   ```powershell
+   rustup default stable-x86_64-pc-windows-msvc
+   rustup component add rustfmt clippy --toolchain stable-x86_64-pc-windows-msvc
+   rustc -vV
+   git --version
+   ```
+
+3. 在 Windows 原生 PowerShell 中使用 OpenAI 独立安装器。安装或更新使用同一条命令。这条命令为安装脚本启动单独的 PowerShell 进程，无需 Node.js。安装后重开 PowerShell，用 ChatGPT 账号在浏览器登录。[OpenAI CLI 安装](https://learn.chatgpt.com/docs/codex/cli#getting-started) · [CLI 登录](https://learn.chatgpt.com/docs/developer-commands#codex-login)
+
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
+   ```
+
+   ```powershell
+   codex --version
+   codex login
+   codex login status
+   ```
+
+4. 用 Git 将仓库克隆到标准用户可写的本地目录，例如 `C:\src\koko`。在仓库根目录运行 `codex`，并读取仓库 `AGENTS.md`、`docs/development.md`、`docs/windows-plan.md`。若要由本机 CLI 创建 PR，可另装 GitHub CLI，运行 `gh auth login --git-protocol https --web` 和 `gh auth setup-git`。[GitHub CLI 认证](https://cli.github.com/manual/gh_auth_login)
+
+5. 在用户配置 `%USERPROFILE%\.codex\config.toml`（自定义时用 `%CODEX_HOME%\config.toml`）合并以下项目。原生 `elevated` 沙箱首次设置需要管理员批准，之后从普通用户终端运行 Codex。用 `/status`、`/debug-config` 和 `/permissions` 检查生效配置及工作区权限。受管设备遵循 IT 策略；MXC 是兼容设备可选的沙箱，不是 KoKo 的实机验收环境。[OpenAI Windows 沙箱设置](https://learn.chatgpt.com/docs/windows/windows-sandbox#configure-a-legacy-fallback) · [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml)
+
+   ```toml
+   [windows]
+   sandbox = "elevated"
+   ```
+
+6. 在仓库根目录运行开发检查。若诊断提示缺少 MSVC 链接器或 SDK 环境，先确认组件已安装，再从开始菜单打开 `x64 Native Tools Command Prompt`，输入 `powershell` 启动继承工具链环境的 PowerShell 后重试。若沙箱阻止首次依赖下载，可在普通用户终端运行 `cargo fetch --locked`。启动 `codex` 后也可在同一仓库运行这些检查，确认它能调用本机工具链。[Microsoft 开发者命令提示符](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line#developer-command-prompt-shortcuts) · [OpenAI 沙箱网络排查](https://learn.chatgpt.com/docs/windows/windows-sandbox#sandboxed-commands-cannot-reach-the-network)
+
+   ```powershell
+   cargo fmt --all -- --check
+   cargo clippy --workspace --all-targets --locked -- -D warnings
+   cargo test --workspace --locked
+   codex
+   ```
+
+采集、硬件编码、UI Automation、SendInput、命名管道 ACL 和 Mac 配对测试在真实 Windows 用户会话中执行。用普通用户终端启动 KoKo，保留 Codex 沙箱用于代码和构建任务。实机准备完成后，记录 Windows build、显卡与驱动版本、两块屏幕的缩放以及工作区检查结果。
+
 ## 5. 分阶段实施
 
 ### 阶段 0：工作区跨平台化（纯 Rust，CI 可验证）
@@ -220,8 +270,8 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 | 阶段 | 状态 |
 | --- | --- |
 | 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
-| 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3 已交付可移植键位映射。0B.4 已交付双向滚动量换算，方向待阶段 1 实机复核。0B.7 已交付可移植 UI 树映射，UI Automation 接入留到阶段 3。0B.8 待实现，0B.5、0B.6 等待实机样例 |
-| 1 Windows 被控端 | 未开始 |
+| 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3 已交付可移植键位映射。0B.4 已交付双向滚动量换算，方向待阶段 1 实机复核。0B.7 已交付可移植 UI 树映射，UI Automation 接入留到阶段 3。0B.8 已交付可移植高危规则判定，实机审批留到阶段 3。0B.5、0B.6 等待 Mac 实机样例 |
+| 1 Windows 被控端 | 等待 Windows 实机。准备步骤见[阶段 1 Windows 实机准备](#阶段-1-windows-实机准备) |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
 

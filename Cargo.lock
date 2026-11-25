@@ -1474,9 +1474,11 @@ dependencies = [
 name = "koko-host-windows"
 version = "0.1.25"
 dependencies = [
+ "koko-input",
  "koko-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
