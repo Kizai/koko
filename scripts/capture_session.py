@@ -132,10 +132,22 @@ def stop_owned_processes(executables, initial, state):
     raise CaptureError("Private capture processes did not exit.")
 
 
+def check_session(state):
+    if (state / "bridge-error").exists():
+        raise CaptureError("Capture bridge rejected data or failed to forward it. Start a fresh capture.")
+
+
+def publish(state, staged, destination):
+    # All writers have exited. A failed earlier instance invalidates the entire run.
+    check_session(state)
+    os.link(staged, destination)
+
+
 def wait_for(state, name, app, seconds, instance=None):
     deadline = time.monotonic() + seconds
     missing_since = None
     while time.monotonic() < deadline:
+        check_session(state)
         current = (state / "current").resolve()
         if instance is not None and (instance != current or not (instance / "running").exists()):
             raise CaptureError("Test daemon restarted during capture; rerun after permission setup.")
@@ -262,7 +274,7 @@ def run_session(state, output, source_dirty):
         remote({"action": "disconnect"}, "ok")
         (folder / "desktop.cli.jsonl").write_bytes(b"".join(cli))
         for name in ("requests.jsonl", "replies.jsonl"):
-            shutil.copyfile(state / name, folder / name)
+            shutil.copyfile(instance / name, folder / name)
         requests = desktop_lines(folder / "requests.jsonl", b"Desktop request: ")
         replies = desktop_lines(folder / "replies.jsonl", b"desktop-reply ")
         verify_exchanges(requests, replies, expected_exchanges)
@@ -357,6 +369,8 @@ def verify_exchanges(requests, replies, expected):
             break
         else:
             raise CaptureError("Missing required raw desktop exchange: " + wanted["action"])
+    if unused:
+        raise CaptureError("Unexpected desktop exchange in the approved capture instance.")
 
 
 def desktop_lines(path, prefix):
@@ -409,7 +423,7 @@ def main():
             pending = Path(staging) / "verified.tar.gz"
             run_session(state, pending, source_dirty)
             # Publication follows confirmed GUI, wrapper and daemon termination.
-            os.link(pending, destination)
+            publish(state, pending, destination)
     finally:
         if (state / "cleanup-incomplete").exists():
             print("Process cleanup could not be verified; private state retained at", state, file=sys.stderr)

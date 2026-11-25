@@ -86,3 +86,93 @@ class ReviewRegressionTests(unittest.TestCase):
             self.assertIsNotNone(process.poll())
             self.assertTrue(late_attempts)
             self.assertFalse(any(late_attempts))
+
+    def test_previous_failure_blocks_new_listener_and_final_publication(self):
+        from unittest.mock import Mock
+        from capture_session import publish
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            second = state / "second"
+            second.mkdir()
+            (state / "current").symlink_to(second)
+            for marker in ("running", "listener.json", "scan-complete"):
+                (second / marker).touch()
+            (state / "bridge-error").touch()
+            app = Mock()
+            app.poll.return_value = None
+            for name in ("listener.json", "scan-complete"):
+                with self.assertRaises(CaptureError):
+                    wait_for(state, name, app, 1)
+            staged, final = state / "verified", state / "public"
+            staged.touch()
+            with self.assertRaises(CaptureError):
+                publish(state, staged, final)
+            self.assertFalse(final.exists())
+
+    def test_unrequested_complete_exchange_is_rejected(self):
+        with self.assertRaises(CaptureError):
+            verify_exchanges({1: dict(action="audio", video_socket="pipe"), 2: dict(action="text")},
+                             {1: dict(status="ok"), 2: dict(status="ok")},
+                             [(dict(action="audio"), "ok")])
+
+    def test_restarted_wrappers_keep_separate_trace_files(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve()
+            wrapper = state / "koko-daemon"
+            shutil.copyfile(Path(__file__).with_name("capture_bridge.py"), wrapper)
+            real = state / "koko-daemon-real"
+            real.write_text("#!/bin/sh\nprintf '%s %s {}\\n' 'Desktop request:' \"$5\"\n")
+            real.chmod(0o700)
+            logs = []
+            for number in ("1", "2"):
+                with subprocess.Popen([sys.executable, wrapper, "serve-pair", "unused", "unused",
+                                       "--app-desktop", number], env=dict(os.environ, KOKO_CAPTURE_STATE=str(state)),
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE) as proc:
+                    self.assertEqual(proc.wait(timeout=5), 0)
+                logs.append((state / "current").resolve() / "requests.jsonl")
+            self.assertNotEqual(logs[0], logs[1])
+            self.assertEqual([path.read_bytes() for path in logs],
+                             [b"Desktop request: 1 {}\n", b"Desktop request: 2 {}\n"])
+            self.assertFalse((state / "requests.jsonl").exists())
+            self.assertFalse((state / "bridge-error").exists())
+
+    def test_real_rejection_survives_real_wrapper_restart(self):
+        import os
+        import shutil
+        import subprocess
+        import sys
+        from capture_session import publish
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp).resolve()
+            wrapper = state / "koko-daemon"
+            shutil.copyfile(Path(__file__).with_name("capture_bridge.py"), wrapper)
+            real = state / "koko-daemon-real"
+            real.write_text("""#!/bin/sh
+if [ "$5" = rejected ]; then
+    echo 'Desktop request: 1 {"text":"koko://pair/v1/invalid-test-input"}'
+else
+    echo 'Listening on 127.0.0.1:12345'
+    echo 'Device ID: 123456789'
+fi
+""")
+            real.chmod(0o700)
+            for mode in ("rejected", "restarted"):
+                with subprocess.Popen([sys.executable, wrapper, "serve-pair", "unused", "unused",
+                                       "--app-desktop", mode], env=dict(os.environ, KOKO_CAPTURE_STATE=str(state)),
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE) as proc:
+                    status = proc.wait(timeout=5)
+                if mode == "rejected":
+                    self.assertNotEqual(status, 0)
+                    self.assertFalse((state / "current/requests.jsonl").exists())
+                else:
+                    self.assertEqual(status, 0)
+                    self.assertTrue((state / "current/listener.json").exists())
+            staged, final = state / "staged", state / "published"
+            staged.touch()
+            with self.assertRaises(CaptureError):
+                publish(state, staged, final)
+            self.assertFalse(final.exists())

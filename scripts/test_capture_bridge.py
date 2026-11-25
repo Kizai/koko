@@ -38,6 +38,8 @@ import os, sys
 from pathlib import Path
 state = Path(os.environ['KOKO_CAPTURE_STATE'])
 (state/'child.pid').write_text(str(os.getpid()))
+if (state/'tee-failure').exists():
+    (state/'current'/'requests.jsonl').mkdir()
 print('Pair code: ABCD1234', flush=True)
 print('Pair invite: koko://pair/v1/ABCD1234/test', flush=True)
 sample = b'Desktop request: 3 { "action" : "displays" }\\n'
@@ -53,7 +55,7 @@ if reply == b'desktop-reply 3 {"status":"ok"}\\n':
             if fail == "credential":
                 (state / "leak").touch()
             elif fail == "tee":
-                (state / "requests.jsonl").mkdir()
+                (state / "tee-failure").touch()
             with subprocess.Popen([sys.executable, wrapper, "serve-pair", "unused", "unused",
                                    "--app-desktop", "test"], env=dict(os.environ, KOKO_CAPTURE_STATE=directory),
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0) as proc:
@@ -74,11 +76,11 @@ if reply == b'desktop-reply 3 {"status":"ok"}\\n':
                         self.assertNotEqual(status, 0)
                         self.assertTrue((state / "bridge-error").exists())
                         if fail == "credential":
-                            self.assertFalse((state / "requests.jsonl").exists())
+                            self.assertFalse((state / "current" / "requests.jsonl").exists())
                     else:
                         self.assertEqual(status, 0)
-                        self.assertEqual((state / "requests.jsonl").read_bytes(), request)
-                        self.assertEqual((state / "replies.jsonl").read_bytes(), reply)
+                        self.assertEqual((state / "current" / "requests.jsonl").read_bytes(), request)
+                        self.assertEqual((state / "current" / "replies.jsonl").read_bytes(), reply)
                     pid = int((state / "child.pid").read_text())
                     with self.assertRaises(ProcessLookupError):
                         os.kill(pid, 0)

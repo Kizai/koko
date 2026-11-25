@@ -107,12 +107,16 @@ def run_bridge(real, args, state):
 
     def abort(*_):
         failure.set()
-        (instance / "failed").touch()
         (state / "bridge-error").touch()
+        (instance / "failed").touch()
         daemon.kill()
 
-    signal.signal(signal.SIGTERM, abort)
-    signal.signal(signal.SIGINT, abort)
+    def terminate(*_):
+        # Normal permission relaunch and cleanup may terminate this wrapper.
+        daemon.terminate()
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
 
     def pump(source, target, prefix, filename, host):
         address = None
@@ -123,7 +127,7 @@ def run_bridge(real, args, state):
                     if (state / "current").resolve() != instance:
                         raise ValueError("host changed")
                     guard.candidate(line, prefix)
-                    subprocess.run(["/usr/bin/tee", "-a", str(state / filename)],
+                    subprocess.run(["/usr/bin/tee", "-a", str(instance / filename)],
                                    input=line, stdout=target, stderr=subprocess.DEVNULL,
                                    timeout=30, check=True)
                 else:
@@ -142,6 +146,9 @@ def run_bridge(real, args, state):
             if not host:
                 daemon.stdin.close()
                 daemon.terminate()
+        except BrokenPipeError:
+            if daemon.poll() is None and not (state / "stop-bridge").exists():
+                abort()
         except Exception:
             abort()
 
