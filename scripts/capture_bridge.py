@@ -122,6 +122,9 @@ def run_bridge(real, args, state):
         address = None
         try:
             for line in source:
+                if not host and line.startswith(b"custom-code ") and line[len(b"custom-code "):].strip():
+                    # The app clears its shared Keychain entry if the real daemon rejects a code.
+                    raise ValueError("custom verification setting encountered")
                 guard.observe(line)
                 if line.startswith(prefix):
                     if (state / "current").resolve() != instance:

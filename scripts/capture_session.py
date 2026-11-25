@@ -190,6 +190,16 @@ def package(folder, destination, verify):
         os.link(tmp.name, destination)  # Publish once; never overwrite a previous run.
 
 
+def configure_capture_plist(path, env):
+    plist = plistlib.loads(path.read_bytes())
+    plist.update(CFBundleIdentifier="io.github.kizai.koko.capture",
+                 CFBundleName="Koko Protocol Capture", CFBundleDisplayName="Koko Protocol Capture")
+    # LaunchServices must preserve private identity paths when reopening after a permission grant.
+    plist["LSEnvironment"] = {key: env[key] for key in ("HOME", "CFFIXED_USER_HOME", "KOKO_CAPTURE_STATE")}
+    path.write_bytes(plistlib.dumps(plist))
+    return plist
+
+
 def run_session(state, output, source_dirty):
     env = dict(os.environ, HOME=str(state / "home"), CFFIXED_USER_HOME=str(state / "home"),
                KOKO_CAPTURE_STATE=str(state))
@@ -212,9 +222,7 @@ def run_session(state, output, source_dirty):
     daemon = helpers / "koko-daemon"
     real = helpers / "koko-daemon-real"
     agent = helpers / "koko-agent"
-    # PermissionGuide relaunches through LaunchServices. Preserve private identity paths there too.
-    plist["LSEnvironment"] = {key: env[key] for key in ("HOME", "CFFIXED_USER_HOME", "KOKO_CAPTURE_STATE")}
-    (app / "Contents/Info.plist").write_bytes(plistlib.dumps(plist))
+    plist = configure_capture_plist(app / "Contents/Info.plist", env)
     daemon.rename(real)
     shutil.copyfile(ROOT / "scripts/capture_bridge.py", daemon)
     daemon.chmod(0o700)
@@ -224,6 +232,7 @@ def run_session(state, output, source_dirty):
     host = run([real, "identity", state / "host.key"], env=env).decode().strip()
     if not re.fullmatch('[a-f0-9]{64}', host):
         raise ValueError("unexpected host public identity")
+    print("如果 Koko Protocol Capture 请求访问日常 Koko 自定义验证码的钥匙串项目，请点“拒绝”。", flush=True)
     with test_app(app / "Contents/MacOS" / plist["CFBundleExecutable"], state, env) as gui:
         print("请在测试 App 中授予权限、开启共享；看到 Protocol Capture 配对请求时点击仅允许本次。", flush=True)
         instance = wait_for(state, "listener.json", gui, 300)
@@ -279,7 +288,7 @@ def run_session(state, output, source_dirty):
         replies = desktop_lines(folder / "replies.jsonl", b"desktop-reply ")
         verify_exchanges(requests, replies, expected_exchanges)
         meta = dict(commit=run(["git", "-C", ROOT, "rev-parse", "HEAD"]).decode().strip(),
-                    source_dirty=source_dirty, macos=platform.mac_ver()[0], app_version=plist["CFBundleShortVersionString"],
+                    bundle_id=plist["CFBundleIdentifier"], source_dirty=source_dirty, macos=platform.mac_ver()[0], app_version=plist["CFBundleShortVersionString"],
                     utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), displays=displays,
                     requests=settings, media=reports)
         (folder / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
