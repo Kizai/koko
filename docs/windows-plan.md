@@ -95,6 +95,20 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 阶段 0 的总验收：在 Windows 上运行 `koko-daemon serve-pair %USERPROFILE%\.koko\host.key 0.0.0.0:27688`，Mac 的 Koko.app 能通过局域网发现它并用连接码配对，截图请求返回 `desktop_unavailable`。这一步证明网络、mDNS 和防火墙路径都是通的，需要在 Windows 防火墙放行 UDP 27688 和 5353，并且网络配置文件为「专用网络」。
 
+#### 0.7 Windows 子进程生命周期约定
+
+本节只确定阶段 1 被控端和阶段 2 应用外壳的实现约定；当前 PR 不增加进程管理代码。
+
+外壳启动 `koko-daemon.exe`、`koko-agent.exe` 时使用 `CREATE_NO_WINDOW`，标准输入、输出和错误仍通过各自的重定向管道连接。该标志用于控制台程序，不能与 `CREATE_NEW_CONSOLE` 或 `DETACHED_PROCESS` 混用；隐藏控制台不负责进程回收。[Microsoft：进程创建标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)
+
+外壳创建并持有一个不继承的 Job Object 句柄，通过 `SetInformationJobObject(JobObjectExtendedLimitInformation)` 设置 `BasicLimitInformation.LimitFlags` 中的 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`。最后一个 Job 句柄关闭时，系统终止关联进程；因此不能把该句柄继承或复制给子进程，也不启用 breakaway。普通创建的后代进程默认属于同一 Job。[Microsoft：Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)、[终止标志](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_limit_information)
+
+外壳先建立 Job 并设置限制，再将 Job 句柄加入 `STARTUPINFOEXW` 的 `PROC_THREAD_ATTRIBUTE_JOB_LIST`，调用 `CreateProcessW` 时同时指定 `EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW`。Windows 10/11 支持在创建进程时关联 Job，外壳在启动期间被终止也不会留下已创建但尚未归属的子进程。创建成功后，关闭不再使用的线程句柄和父进程中留给子进程的管道副本，保留进程句柄以等待退出并读取退出码。设置 Job、准备启动属性或创建进程失败时，报告原始 Win32 错误并释放本次启动占用的资源。[Microsoft 进程创建属性](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)
+
+正常退出时先结束会话并关闭对应输入管道，在宽限期内等待子进程退出。无论子进程是否在宽限期内退出，外壳都关闭最后一个 Job 句柄，随后等待仍未退出的直接子进程终止，再释放进程句柄。宽限期时长在实现阶段确定。外壳崩溃或被终止时，系统通过关闭最后一个 Job 句柄回收子进程。关闭窗口并选择后台运行时，外壳继续持有 Job。外壳本身可能已在启动器或 CI 的 Job 中。Windows 10/11 支持嵌套 Job，启动仍须检查 `CreateProcessW` 的结果，并遵守上层 Job 的限制。
+
+阶段 1/2 实机验收覆盖正常退出、子进程在宽限期内未退出、外壳崩溃，以及在启动期间和已启动后强制结束外壳。每种退出场景都应确认无 daemon、agent 或其后代残留。后台运行时会话保持，重启外壳可重新绑定端口与本机通道，启动失败无挂起子进程，从已有 Job 的启动器启动时正常归属或给出明确错误。覆盖正常用户桌面和含空格的安装路径，确认不弹控制台且行协议仍双向工作。
+
 ### 阶段 0B：可脱离 Windows 实机的平台逻辑
 
 阶段 1 中有一部分是纯计算或纯协议逻辑，不调用 Windows API，可以先写成平台无关的函数，用单元测试锁定行为，在任何电脑上开发、在两个平台的 CI 上验证。到了阶段 1 只需要把它们接到 Windows API 上。这些代码放在阶段 1 将要使用的 crate 中（`koko-host-windows`、`koko-capture`、`koko-input`），不加 `cfg(windows)`，以便在所有平台上测试。
