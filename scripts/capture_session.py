@@ -200,16 +200,68 @@ def configure_capture_plist(path, env):
     return plist
 
 
-def run_session(state, output, source_dirty):
-    env = dict(os.environ, HOME=str(state / "home"), CFFIXED_USER_HOME=str(state / "home"),
-               KOKO_CAPTURE_STATE=str(state))
-    (state / "home").mkdir()
-    folder = state / "artifacts"
-    folder.mkdir()
-    home = run(["/usr/bin/swift", "-e", "import Foundation; print(FileManager.default.homeDirectoryForCurrentUser.path)"],
-               env=env, timeout=120).decode().strip()
-    if Path(home).resolve() != (state / "home"):
-        raise CaptureError("Foundation did not select the private identity directory.")
+def check_build_paths():
+    # Check ancestors first, before walking a possibly redirected build output.
+    target = ROOT / "target"
+    for path in (target, target / "koko-macos", APP.parent, APP, target / "sparkle"):
+        if path.is_symlink():
+            raise CaptureError("Local build path is a symlink; capture stopped before writing.")
+    for arch in ("aarch64-apple-darwin", "x86_64-apple-darwin"):
+        release = target / arch / "release"
+        for path in (release.parent, release, release / "koko-agent", release / "koko-daemon"):
+            if path.is_symlink():
+                raise CaptureError("Local Rust build path is a symlink.")
+    if not APP.parent.exists():
+        return
+    for path in APP.parent.iterdir():
+        if path.is_symlink():
+            raise CaptureError("Symlink in local build outputs.")
+    framework = APP / "Contents/Frameworks/Sparkle.framework"
+    for tree in (APP, APP.parent / "KoKo.iconset"):
+        for parent, dirs, files in os.walk(tree, followlinks=False):
+            for name in dirs + files:
+                path = Path(parent) / name
+                if not path.is_symlink():
+                    continue
+                # Sparkle uses relative version links within its own framework.
+                if framework in path.parents:
+                    link = os.readlink(path)
+                    if not os.path.isabs(link) and framework in Path(os.path.abspath(path.parent / link)).parents:
+                        continue
+                raise CaptureError("Unsafe symlink in the local build output.")
+
+
+def new_output(path):
+    if path is None:
+        target = ROOT / "target"
+        target.mkdir(mode=0o700, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="protocol-capture-", dir=target))
+    directory = path.parent.resolve() / path.name
+    if not directory.parent.is_dir() or any(part.lower().endswith(".app") for part in directory.parts):
+        raise CaptureError("Choose a new output directory outside application bundles.")
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        raise CaptureError("Output directory already exists; choose a new name.") from None
+    return directory
+
+
+@contextlib.contextmanager
+def private_session():
+    check_build_paths()
+    state = Path(tempfile.mkdtemp(prefix=".capture-", dir=APP.parent))
+    try:
+        yield state
+    finally:
+        if (state / "cleanup-incomplete").exists():
+            print("Process cleanup could not be verified; private state retained at", state, file=sys.stderr)
+        else:
+            shutil.rmtree(state)
+
+
+def prepare_capture_app(state, env):
+    if state.parent != APP.parent or not state.name.startswith(".capture-") or state.is_symlink():
+        raise CaptureError("Disposable app must be inside the private local build session.")
     app = state / "Koko.app"
     run(["/usr/bin/ditto", APP, app], timeout=120)
     plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
@@ -221,7 +273,6 @@ def run_session(state, output, source_dirty):
     helpers = app / "Contents/Helpers"
     daemon = helpers / "koko-daemon"
     real = helpers / "koko-daemon-real"
-    agent = helpers / "koko-agent"
     plist = configure_capture_plist(app / "Contents/Info.plist", env)
     daemon.rename(real)
     shutil.copyfile(ROOT / "scripts/capture_bridge.py", daemon)
@@ -229,6 +280,23 @@ def run_session(state, output, source_dirty):
     run(["codesign", "--force", "--sign", "-", daemon])
     run(["codesign", "--force", "--sign", "-", app])
     run(["codesign", "--verify", "--deep", "--strict", app])
+    return app, plist
+
+
+def run_session(state, output, source_dirty):
+    env = dict(os.environ, HOME=str(state / "home"), CFFIXED_USER_HOME=str(state / "home"),
+               KOKO_CAPTURE_STATE=str(state))
+    (state / "home").mkdir()
+    folder = state / "artifacts"
+    folder.mkdir()
+    home = run(["/usr/bin/swift", "-e", "import Foundation; print(FileManager.default.homeDirectoryForCurrentUser.path)"],
+               env=env, timeout=120).decode().strip()
+    if Path(home).resolve() != (state / "home"):
+        raise CaptureError("Foundation did not select the private identity directory.")
+    app, plist = prepare_capture_app(state, env)
+    helpers = app / "Contents/Helpers"
+    real = helpers / "koko-daemon-real"
+    agent = helpers / "koko-agent"
     host = run([real, "identity", state / "host.key"], env=env).decode().strip()
     if not re.fullmatch('[a-f0-9]{64}', host):
         raise ValueError("unexpected host public identity")
@@ -397,14 +465,15 @@ def desktop_lines(path, prefix):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("capture-" + time.strftime("%Y%m%d-%H%M%S") + ".tar.gz"))
+    parser.add_argument("--output", type=Path, metavar="NEW_DIRECTORY",
+                        help="create a private directory for capture.tar.gz (default: target/protocol-capture-*)")
     args = parser.parse_args()
     if sys.platform != "darwin":
         parser.error("macOS GUI login required")
-    if args.output.exists() or not args.output.parent.is_dir():
-        parser.error("choose a new archive path in an existing directory")
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    check_build_paths()
+    output_directory = new_output(args.output)
     print("Building the local ad hoc app…", flush=True)
     source_dirty = bool(run(["git", "-C", ROOT, "status", "--porcelain"]))
     build_env = dict(os.environ, KOKO_SIGN_IDENTITY="-", KOKO_UPDATE_ASSETS="0")
@@ -425,20 +494,13 @@ def main():
                     os.killpg(build.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-    state = Path(tempfile.mkdtemp(prefix="koko-capture-")).resolve()
-    try:
-        destination = args.output.resolve()
-        with tempfile.TemporaryDirectory(dir=destination.parent) as staging:
-            pending = Path(staging) / "verified.tar.gz"
-            run_session(state, pending, source_dirty)
-            # Publication follows confirmed GUI, wrapper and daemon termination.
-            publish(state, pending, destination)
-    finally:
-        if (state / "cleanup-incomplete").exists():
-            print("Process cleanup could not be verified; private state retained at", state, file=sys.stderr)
-        else:
-            shutil.rmtree(state)
-    print("Archive:", args.output)
+    destination = output_directory / "capture.tar.gz"
+    with private_session() as state, tempfile.TemporaryDirectory(dir=output_directory) as staging:
+        pending = Path(staging) / "verified.tar.gz"
+        run_session(state, pending, source_dirty)
+        # Publication follows confirmed GUI, wrapper and daemon termination.
+        publish(state, pending, destination)
+    print("Archive:", destination)
 
 
 if __name__ == "__main__":
