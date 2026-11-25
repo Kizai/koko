@@ -125,6 +125,8 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 
 剪贴板文件在 Rust 中流式传输（`crates/koko-p2p/src/clipboard.rs`）：一次复制或粘贴只用一条 QUIC 流，不再按块往返，也不做 Base64 编码，速度取决于网络和磁盘。请求头以换行结尾，之后是正文；没有正文的请求仍可像以前一样直接结束发送。清单中的路径必须是相对路径，不能含 `.`、`..` 或空段；接收方只在新建的目录中创建文件，字节数与清单不符时整次传输作废。文件夹中的符号链接和特殊文件会被跳过，选中的符号链接本身会被拒绝。被控端的应用只负责按 ⌘C / ⌘V、提供文件路径和接收目录，文件内容由 daemon 读写；控制端由 `koko-agent clipboard-pull` / `clipboard-push` 读写文件，并按行输出进度。
 
+各平台在请求入口通过 `koko_proto::safe_relative_path` 校验清单路径。路径含 NUL，使用 `.`、`..` 或空段，或以 `/` 开头时，请求返回 `invalid_command`。Windows 接收方在写入前进一步检查通过协议校验的整份文件清单，并确认拼接后的路径均位于接收目录内。路径段不能含反斜杠、冒号、`<>"|?*` 或其余控制字符，不能以点或空格结尾，也不能使用 Windows 保留设备名及其带扩展名形式。Windows 接收检查失败时，整批不写入，并返回 `clipboard_invalid`。
+
 以图形版模式运行时，所有命令都交给 `Koko.app`。单独运行 `koko-daemon serve-pair` 时，`screenshot`、`click`、`key` 和 `text` 由同目录的 `koko-desktop` 执行，其余命令返回 `desktop_unavailable`。
 
 ### 音视频记录

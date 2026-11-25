@@ -132,25 +132,23 @@ fn changed() -> io::Error {
     )
 }
 
-/// Recreates the entries under `folder`, which must be new and empty, reading exactly the
-/// listed bytes and then requiring the end of the stream. Returns the top-level items.
+/// Validates all paths before recreating entries under `folder`, which must be new and empty.
+/// Reads exactly the listed bytes, requires the end of the stream, and returns the top-level items.
 pub async fn receive_files(
     entries: &[ClipboardEntry],
     input: &mut (impl AsyncRead + Unpin),
     folder: &Path,
     mut progress: impl FnMut(u64),
 ) -> io::Result<Vec<PathBuf>> {
+    let paths = entries
+        .iter()
+        .map(|entry| receive_path(folder, &entry.path, cfg!(windows)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let mut top = Vec::new();
     let mut received = 0;
     let mut buffer = vec![0; BUFFER];
-    for entry in entries {
-        if !koko_proto::safe_relative_path(&entry.path) {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unsafe path"));
-        }
-        let path = entry
-            .path
-            .split('/')
-            .fold(folder.to_owned(), |path, part| path.join(part));
+    for (entry, path) in entries.iter().zip(paths) {
         let first = folder.join(entry.path.split('/').next().unwrap_or_default());
         if !top.contains(&first) {
             top.push(first);
@@ -192,11 +190,80 @@ pub async fn receive_files(
     Ok(top)
 }
 
+#[derive(Debug)]
+struct UnsafeClipboardPath;
+
+impl std::fmt::Display for UnsafeClipboardPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("unsafe clipboard path")
+    }
+}
+
+impl std::error::Error for UnsafeClipboardPath {}
+
+fn receive_path(
+    folder: &Path,
+    relative: &str,
+    windows: bool,
+) -> Result<PathBuf, UnsafeClipboardPath> {
+    if !koko_proto::safe_relative_path(relative) {
+        return Err(UnsafeClipboardPath);
+    }
+    let mut path = folder.to_owned();
+    for part in relative.split('/') {
+        if windows && !safe_windows_name(part) {
+            return Err(UnsafeClipboardPath);
+        }
+        path.push(part);
+    }
+    // The caller provides a newly created, empty directory. Check the joined path
+    // before using it for any filesystem operation.
+    if !path.starts_with(folder) {
+        return Err(UnsafeClipboardPath);
+    }
+    Ok(path)
+}
+
+fn safe_windows_name(name: &str) -> bool {
+    if name.ends_with(['.', ' '])
+        || name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        })
+    {
+        return false;
+    }
+    // Windows matches device names before the first dot, ignoring spaces before it.
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return false;
+    }
+    // Windows also reserves COM and LPT device names with these superscript digits.
+    !matches!(
+        stem.strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT")),
+        Some("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³")
+    )
+}
+
 /// The error code a person sees for a failed transfer.
 pub fn error_code(error: &io::Error) -> &'static str {
     match error.kind() {
         io::ErrorKind::PermissionDenied => "clipboard_file_permission",
         io::ErrorKind::Unsupported => "clipboard_unsupported",
+        io::ErrorKind::InvalidData
+            if error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<UnsafeClipboardPath>()) =>
+        {
+            "clipboard_invalid"
+        }
         _ => "clipboard_failed",
     }
 }
@@ -327,6 +394,133 @@ pub async fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_rejects_forbidden_characters_in_path_segments() {
+        let folder = Path::new("received");
+        for name in [
+            r"one\two.txt",
+            "file:stream",
+            "C:file.txt",
+            "quote\".txt",
+            "left<.txt",
+            "right>.txt",
+            "pipe|.txt",
+            "question?.txt",
+            "star*.txt",
+            "nul\0.txt",
+            "control\u{1f}.txt",
+            "delete\u{7f}.txt",
+        ] {
+            let path = format!("folder/{name}");
+            assert!(receive_path(folder, &path, true).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn windows_rejects_reserved_device_names_with_or_without_extensions() {
+        let folder = Path::new("received");
+        let numbered = ["cOm", "LpT"].into_iter().flat_map(|prefix| {
+            ('1'..='9')
+                .chain(['¹', '²', '³'])
+                .map(move |digit| format!("{prefix}{digit}"))
+        });
+        for device in ["conIN$", "ConOUT$", "coN", "pRn", "auX", "NuL"]
+            .map(str::to_owned)
+            .into_iter()
+            .chain(numbered)
+        {
+            for path in [
+                format!("{device}.tar.gz"),
+                format!("folder/{device}/file.txt"),
+            ] {
+                assert!(receive_path(folder, &path, true).is_err(), "{path:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn windows_rejects_reserved_device_stems_with_spaces_before_an_extension() {
+        let folder = Path::new("received");
+        assert!(receive_path(folder, "NUL .txt", true).is_err());
+    }
+
+    #[test]
+    fn windows_rejects_path_segments_ending_in_a_dot_or_space() {
+        let folder = Path::new("received");
+        for path in [
+            "folder./file.txt",
+            "folder /file.txt",
+            "folder/file.",
+            "folder/file ",
+        ] {
+            assert!(receive_path(folder, path, true).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn windows_accepts_ordinary_names_under_the_destination_folder() {
+        let folder = Path::new("received");
+        let path = receive_path(folder, "AUXiliary/COM10/.报告 LPT0.txt", true).unwrap();
+        assert_eq!(
+            path,
+            folder
+                .join("AUXiliary")
+                .join("COM10")
+                .join(".报告 LPT0.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unsafe_path_before_receiving_any_entries() -> io::Result<()> {
+        let invalid_paths = ["folder/../invalid.txt"];
+        #[cfg(windows)]
+        let invalid_paths = invalid_paths
+            .into_iter()
+            .chain(["folder/cOm1.txt/child.txt"]);
+
+        for path in invalid_paths {
+            let entries = [
+                ClipboardEntry {
+                    path: "first.txt".into(),
+                    size: 5,
+                    dir: false,
+                },
+                ClipboardEntry {
+                    path: path.into(),
+                    size: 0,
+                    dir: false,
+                },
+            ];
+            let target = tempfile::tempdir()?;
+            let mut input = b"hello".as_slice();
+            let error = receive_files(&entries, &mut input, target.path(), |_| {})
+                .await
+                .unwrap_err();
+            assert!(target.path().read_dir()?.next().is_none(), "{path}");
+            assert_eq!(input, b"hello", "{path}");
+            assert_eq!(error_code(&error), "clipboard_invalid", "{path}");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn receives_macos_names_that_are_reserved_on_windows() -> io::Result<()> {
+        let names = [r"one\two.txt", "one:two.txt", "NUL.txt"];
+        let entries = names.map(|name| ClipboardEntry {
+            path: name.into(),
+            size: 1,
+            dir: false,
+        });
+        let target = tempfile::tempdir()?;
+        let paths = receive_files(&entries, &mut b"abc".as_slice(), target.path(), |_| {}).await?;
+        assert_eq!(paths, names.map(|name| target.path().join(name)));
+        for (path, byte) in paths.iter().zip(b"abc") {
+            assert_eq!(std::fs::read(path)?, [*byte]);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn copies_folders_and_files_byte_for_byte() -> io::Result<()> {
