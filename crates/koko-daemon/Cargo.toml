@@ -16,3 +16,6 @@ tokio = { workspace = true, features = ["io-util", "net", "signal", "sync", "tim
 
 [target.'cfg(target_os = "macos")'.dependencies]
 koko-capture.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }

@@ -582,9 +582,9 @@ pub(crate) async fn serve(
                 audit: directory.map(Audit::new),
                 outbox: outbox.clone(),
                 pointer: tokio::sync::Mutex::new(()),
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 video: Default::default(),
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 audio: Default::default(),
             },
         )

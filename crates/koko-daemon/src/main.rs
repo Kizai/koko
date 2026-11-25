@@ -1,6 +1,8 @@
 mod arbiter;
 mod audit;
 mod desktop;
+#[cfg(any(unix, windows))]
+mod media_channel;
 mod outbox;
 mod pairing;
 mod session;
