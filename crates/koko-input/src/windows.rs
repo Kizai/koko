@@ -158,11 +158,16 @@ impl<S: Sink> Input<S> {
     }
 
     fn click(&mut self, geometry: Option<Geometry>, point: (u16, u16)) -> Result<(), InputError> {
+        let button = Control::Button(Button::Left);
+        if self.owns(button) {
+            return Err(InputError::Failed(
+                "Windows click blocked: the remote left button is already held".into(),
+            ));
+        }
         let Some(geometry) = geometry else {
             return Err(self.abort(InputError::DisplayUnavailable));
         };
         self.ready()?;
-        let button = Control::Button(Button::Left);
         self.mouse(
             geometry,
             point,
@@ -211,34 +216,34 @@ impl<S: Sink> Input<S> {
         };
 
         let mut records = Vec::new();
+        let flags = WindowsModifiers::from_mac_flags(flags, source, self.cross_system_shortcuts);
         if let Some(group) = Modifier::of(control) {
-            if down {
-                // Replace a synthesized left key when the sender supplies a real side.
+            if down || !group.is_set(flags) {
+                // A physical down replaces a fallback on the other side. An
+                // up with clear aggregate flags releases any remaining fallback.
                 records.extend(
                     self.held
                         .iter()
                         .filter(|key| {
                             key.source_key.is_none()
-                                && key.control != control
+                                && (!down || key.control != control)
                                 && Modifier::of(key.control) == Some(group)
                         })
                         .map(|key| Record::Edge(key.control, false)),
                 );
             }
         } else {
-            let flags =
-                WindowsModifiers::from_mac_flags(flags, source, self.cross_system_shortcuts);
-            for (group, wanted, left_code) in [
-                (Modifier::Shift, flags.shift, 0x38),
-                (Modifier::Ctrl, flags.ctrl, 0x3b),
-                (Modifier::Alt, flags.alt, 0x3a),
-                (Modifier::Win, flags.win, 0x37),
+            for (group, left_code) in [
+                (Modifier::Shift, 0x38),
+                (Modifier::Ctrl, 0x3b),
+                (Modifier::Alt, 0x3a),
+                (Modifier::Win, 0x37),
             ] {
                 let mut keys = self
                     .held
                     .iter()
                     .filter(|key| Modifier::of(key.control) == Some(group));
-                if wanted {
+                if group.is_set(flags) {
                     if keys.next().is_none() {
                         records.push(Record::Edge(native_scan(left_code), true));
                     }
@@ -403,6 +408,15 @@ enum Modifier {
 }
 
 impl Modifier {
+    fn is_set(self, flags: WindowsModifiers) -> bool {
+        match self {
+            Self::Shift => flags.shift,
+            Self::Ctrl => flags.ctrl,
+            Self::Alt => flags.alt,
+            Self::Win => flags.win,
+        }
+    }
+
     fn of(control: Control) -> Option<Self> {
         let Control::Scan(scan) = control else {
             return None;

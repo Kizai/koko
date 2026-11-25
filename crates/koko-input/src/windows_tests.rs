@@ -422,3 +422,110 @@ fn repeated_key_down_and_drag_release_once_in_reverse_order() {
         ]
     );
 }
+
+#[test]
+fn semantic_click_preserves_an_active_pointer_drag() {
+    let mut input = input(true);
+    input
+        .pointer(
+            || Some(geometry()),
+            KeyboardSource::Other,
+            &[PointerEvent::Down {
+                x: 0,
+                y: 0,
+                button: MouseButton::Left,
+                clicks: 1,
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        input.click(Some(geometry()), (5000, 5000)),
+        Err(InputError::Failed(_))
+    ));
+    input
+        .pointer(
+            || Some(geometry()),
+            KeyboardSource::Other,
+            &[
+                PointerEvent::Move { x: 9999, y: 9999 },
+                PointerEvent::Up {
+                    x: 0,
+                    y: 0,
+                    button: MouseButton::Left,
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        sent(&input),
+        [
+            Record::Move(0, 0),
+            Record::Edge(Control::Button(Button::Left), true),
+            Record::Move(28078, 49140),
+            Record::Move(0, 0),
+            Record::Edge(Control::Button(Button::Left), false),
+        ]
+    );
+}
+
+#[test]
+fn explicit_up_releases_fallback_only_when_the_aggregate_modifier_clears() {
+    for (left, right, flag, make, extended) in [
+        (0x38, 0x3c, 2, 0x2a, false),
+        (0x3b, 0x3e, 4, 0x1d, false),
+        (0x3a, 0x3d, 8, 0x38, false),
+        (0x37, 0x36, 16, 0x5b, true),
+    ] {
+        for (first_up, final_up) in [(left, right), (right, left)] {
+            let mut input = input(true);
+            input
+                .pointer(
+                    || Some(geometry()),
+                    KeyboardSource::Windows,
+                    &[
+                        key(0x00, flag, true),
+                        key(0x00, flag, false),
+                        key(first_up, flag, false),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                sent(&input),
+                [
+                    scan(make, extended, true),
+                    scan(0x1e, false, true),
+                    scan(0x1e, false, false),
+                ]
+            );
+            input
+                .pointer(
+                    || Some(geometry()),
+                    KeyboardSource::Windows,
+                    &[key(final_up, 0, false)],
+                )
+                .unwrap();
+            assert_eq!(
+                input.sink.attempted.last().unwrap(),
+                &[scan(make, extended, false)]
+            );
+        }
+    }
+}
+
+#[test]
+fn unmatched_up_does_not_release_explicitly_owned_modifier_on_other_side() {
+    let mut input = input(true);
+    input
+        .pointer(
+            || Some(geometry()),
+            KeyboardSource::MacOs,
+            &[key(0x36, 16, true), key(0x37, 0, false)],
+        )
+        .unwrap();
+    assert_eq!(sent(&input), [scan(0x1d, true, true)]);
+    input.release().unwrap();
+    assert_eq!(
+        sent(&input),
+        [scan(0x1d, true, true), scan(0x1d, true, false)]
+    );
+}
