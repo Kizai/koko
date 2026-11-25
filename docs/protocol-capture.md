@@ -17,8 +17,8 @@
 
 - `requests.jsonl`、`replies.jsonl` 保留 daemon 的 `Desktop request: N JSON` 与 App 的 `desktop-reply N JSON` 原行，包括空格和换行。脚本用编号对齐请求与回复。`desktop.cli.jsonl` 另存 CLI 实际返回的 JSON；CLI 会重新编码回复，并给部分回复增加连接信息。
 - 桌面请求覆盖主屏枚举、前台 UI 树、屏幕截图、壁纸及指定显示器的 JPEG / PNG 采集。两轮 H.264 录制分别关闭、开启反馈。`video-feedback-{off,on}.bin` 是 CLI 输出的完整合并流。`audio:true` 使 `remote-video` 另开真实 `audio` 请求，脚本把类型 5、6 的原始带长度记录复制到对应 `audio-feedback-*.bin`。当前 CLI 没有独立录音命令。
-- `metadata.json` 记录提交、macOS 与 App 版本、UTC 时间、显示器、请求参数、录制时长、记录数和音频格式。开启反馈时，从类型 10 读取实际硬件或软件编码器与采集 API。无反馈流没有这一报告。当前版本不再发送类型 7，Windows 端不实现发送。
-- `SHA256SUMS` 列出每个采集文件的相对路径和 SHA-256。解包到空目录，在该目录运行 `shasum -a 256 -c SHA256SUMS` 复核。
+- `metadata.json` 记录提交、构建前有无未提交文件（`source_dirty`）、macOS 与 App 版本、UTC 时间、显示器、请求参数、录制时长、记录数和音频格式。开启反馈时，从类型 10 读取实际硬件或软件编码器与采集 API。无反馈流没有这一报告。当前版本不再发送类型 7，Windows 端不实现发送。
+- `SHA256SUMS` 列出每个采集数据文件的相对路径和 SHA-256。清单自身不参与散列。解包到空目录，在该目录运行 `shasum -a 256 -c SHA256SUMS` 复核。
 
 ## 本机隔离与边界
 

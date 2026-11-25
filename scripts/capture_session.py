@@ -123,7 +123,7 @@ def package(folder, destination, verify):
         os.link(tmp.name, destination)  # Publish once; never overwrite a previous run.
 
 
-def run_session(state, output):
+def run_session(state, output, source_dirty):
     env = dict(os.environ, HOME=str(state / "home"), CFFIXED_USER_HOME=str(state / "home"),
                KOKO_CAPTURE_STATE=str(state))
     (state / "home").mkdir()
@@ -228,7 +228,7 @@ def run_session(state, output):
             if len(matched) < 2 or any(replies[n].get("status") != "ok" for n in matched):
                 raise ValueError("missing media handshake")
         meta = dict(commit=run(["git", "-C", ROOT, "rev-parse", "HEAD"]).decode().strip(),
-                    macos=platform.mac_ver()[0], app_version=plist["CFBundleShortVersionString"],
+                    source_dirty=source_dirty, macos=platform.mac_ver()[0], app_version=plist["CFBundleShortVersionString"],
                     utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), displays=displays,
                     requests=settings, media=reports)
         (folder / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
@@ -262,10 +262,27 @@ def main():
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     print("Building the local ad hoc app…", flush=True)
-    subprocess.run([ROOT / "scripts/build-macos.sh", "--allow-ad-hoc"], check=True,
-                   env=dict(os.environ, KOKO_SIGN_IDENTITY="-"), timeout=1800)
+    source_dirty = bool(run(["git", "-C", ROOT, "status", "--porcelain"]))
+    build_env = dict(os.environ, KOKO_SIGN_IDENTITY="-", KOKO_UPDATE_ASSETS="0")
+    build_env.pop("KOKO_PREVIOUS_APP", None)
+    with owned([ROOT / "scripts/build-macos.sh", "--allow-ad-hoc"], env=build_env) as build:
+        try:
+            if build.wait(timeout=1800):
+                raise CaptureError("Local ad hoc build failed. Check the repository's macOS build prerequisites.")
+        finally:
+            # Build tools inherit this new session. On interruption, stop the whole owned group.
+            if build.poll() is None:
+                os.killpg(build.pid, signal.SIGTERM)
+                try:
+                    build.wait(5)
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    os.killpg(build.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
     with tempfile.TemporaryDirectory(prefix="koko-capture-") as tmp:
-        run_session(Path(tmp).resolve(), args.output.resolve())
+        run_session(Path(tmp).resolve(), args.output.resolve(), source_dirty)
     print("Archive:", args.output)
 
 
