@@ -36,3 +36,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+      - name: Check macOS capture scripts
+        if: runner.os == 'macOS'
+        run: |
+          bash -n scripts/capture-protocol.sh
+          python3 -B -m unittest discover -s scripts -p 'test_capture_*.py'
