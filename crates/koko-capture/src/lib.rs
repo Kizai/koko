@@ -1,4 +1,6 @@
-//! macOS screen-recording permission checks for Koko hosts. Capture itself runs in the Swift app.
+//! Host-side capture support and portable UI tree conversion.
+
+pub mod ui_tree;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
