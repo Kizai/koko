@@ -1216,6 +1216,13 @@ final class LocalConnection: ObservableObject {
         if let process = hostCommand?.process, process.isRunning { process.interrupt() }
     }
 
+    /// Ends this Mac's remote session as a controller and stops sharing it, which ends every
+    /// controller's and agent's session here. Sharing stays off until turned back on.
+    func lockDown() {
+        if session != nil { disconnect() }
+        if isHosting { stopHosting() }
+    }
+
     func verify(code: String, viewOnly: Bool = false) async {
         await connect(target: code, verificationCode: nil, quiet: false, knownHost: nil, viewOnly: viewOnly)
     }

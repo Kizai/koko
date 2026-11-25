@@ -52,8 +52,7 @@ private struct KokoMenuIcon: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: connection.agentControl == "active" ? "sparkles.tv"
-              : connection.isSharingWithPeer || connection.agentSession != nil ? "display.2" : "display")
+        Image(nsImage: MenuBarIcon.image(active: connection.agentControl == "active" || connection.isSharingWithPeer))
             .onAppear {
                 opener.openMain = {
                     NSApp.setActivationPolicy(.regular)
@@ -78,7 +77,7 @@ private struct KokoMenu: View {
     var body: some View {
         Text(status)
         Divider()
-        Button("打开 KoKo") {
+        Button("显示主界面") {
             NSApp.setActivationPolicy(.regular)
             openWindow(id: "connection")
             NSApp.activate(ignoringOtherApps: true)
@@ -86,8 +85,15 @@ private struct KokoMenu: View {
         if connection.agentControl == "active" {
             Button("停止 Agent") { Task { await connection.stopAgent() } }
         }
+        // One click ends every remote session in both directions and stops listening, so nobody
+        // can reconnect until sharing is turned back on in the main window.
+        Button("安全锁定") { connection.lockDown() }
+            .disabled(!connection.isHosting && connection.session == nil)
+        Button("帮助与反馈") {
+            if let url = URL(string: "https://github.com/Kizai/koko/issues") { NSWorkspace.shared.open(url) }
+        }
         Divider()
-        Button("退出 KoKo") { NSApp.terminate(nil) }
+        Button("退出") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
     }
 }
