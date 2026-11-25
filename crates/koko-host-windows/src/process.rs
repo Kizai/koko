@@ -1,18 +1,23 @@
-use crate::{Command, DesktopRequest, Event, parse_frame};
+#[cfg(windows)]
+mod windows_child;
+#[cfg(any(windows, test))]
+mod windows_command;
+
+use crate::{Command, DesktopRequest, Event};
 use koko_proto::RemoteReply;
-use std::{
-    io,
-    net::SocketAddr,
-    path::Path,
-    process::{ExitStatus, Stdio},
-    time::Duration,
-};
+#[cfg(not(windows))]
+use std::process::Stdio;
+use std::{io, net::SocketAddr, path::Path, process::ExitStatus, time::Duration};
+use tokio::sync::mpsc;
+#[cfg(not(windows))]
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command as Process},
-    sync::mpsc,
     time::timeout,
 };
+
+#[cfg(windows)]
+use windows_child::{Child, ChildStdin};
 
 /// Implementations must apply the local input policy for requests from an agent.
 pub trait DesktopBackend {
@@ -26,6 +31,27 @@ pub struct Host {
 }
 impl Host {
     pub fn spawn(executable: &Path, key: &Path, bind: SocketAddr, name: &str) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            let (tx, events) = mpsc::channel(64);
+            let (child, stdin) = windows_child::spawn(executable, key, bind, name, tx)?;
+            Ok(Self {
+                child,
+                stdin: Some(stdin),
+                events,
+            })
+        }
+        #[cfg(not(windows))]
+        Self::spawn_portable(executable, key, bind, name)
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_portable(
+        executable: &Path,
+        key: &Path,
+        bind: SocketAddr,
+        name: &str,
+    ) -> io::Result<Self> {
         let mut child = Process::new(executable)
             .arg("serve-pair")
             .arg(key)
@@ -46,7 +72,7 @@ impl Host {
                 line.clear();
                 let event = match stdout.read_line(&mut line).await {
                     Ok(0) => break,
-                    Ok(_) => parse_frame(&line),
+                    Ok(_) => crate::parse_frame(&line),
                     Err(error) => Err(error),
                 };
                 let failed = event.is_err();
@@ -71,9 +97,19 @@ impl Host {
         let frame = command.encode()?;
         // An interrupted write can leave half a frame in the pipe. Closing that
         // pipe prevents the next command from being appended to the partial one.
-        let mut stdin = self.stdin.take().ok_or(io::ErrorKind::BrokenPipe)?;
-        stdin.write_all(frame.as_bytes()).await?;
-        stdin.flush().await?;
+        let stdin = self.stdin.take().ok_or(io::ErrorKind::BrokenPipe)?;
+        #[cfg(windows)]
+        let stdin = {
+            stdin.write(frame).await?;
+            stdin
+        };
+        #[cfg(not(windows))]
+        let stdin = {
+            let mut stdin = stdin;
+            stdin.write_all(frame.as_bytes()).await?;
+            stdin.flush().await?;
+            stdin
+        };
         self.stdin = Some(stdin);
         Ok(())
     }
@@ -90,10 +126,16 @@ impl Host {
     pub async fn shutdown(mut self, grace: Duration) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         self.events.close();
-        if let Ok(status) = timeout(grace, self.child.wait()).await {
-            return status;
+        #[cfg(windows)]
+        return self.child.shutdown(grace).await;
+
+        #[cfg(not(windows))]
+        {
+            if let Ok(status) = timeout(grace, self.child.wait()).await {
+                return status;
+            }
+            self.child.start_kill()?;
+            timeout(grace, self.child.wait()).await?
         }
-        self.child.start_kill()?;
-        timeout(grace, self.child.wait()).await?
     }
 }

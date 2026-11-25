@@ -8,3 +8,8 @@ mod protocol;
 pub use command::{CodeMode, Command, HelpAnswer};
 pub use process::{DesktopBackend, Host};
 pub use protocol::{DesktopRequest, Event, Origin, PairDetails, Secret, parse_frame};
+
+#[cfg(windows)]
+mod windows_backend;
+#[cfg(windows)]
+pub use windows_backend::WindowsDesktopBackend;

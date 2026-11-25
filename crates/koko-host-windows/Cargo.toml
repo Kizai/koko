@@ -13,3 +13,15 @@ tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+base64.workspace = true
+koko-capture.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
