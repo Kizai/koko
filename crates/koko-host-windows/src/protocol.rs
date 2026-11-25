@@ -160,20 +160,25 @@ pub fn parse_frame(frame: &str) -> io::Result<Event> {
     if line.contains(['\r', '\n']) {
         return Err(invalid());
     }
-    let exact = match line {
-        "Pair code locked" => PairCodeLocked,
-        "Custom code rejected" => CustomCodeRejected,
-        "Pair approved" => PairApproved,
-        "Pair declined" => PairDeclined,
-        "Pair request ended" => PairRequestEnded,
-        "Session closed" => SessionClosed,
-        "Agent session closed" => AgentSessionClosed,
-        "Outbox refused" => OutboxRefused,
-        "Pointer closed" => PointerClosed,
-        _ => Other,
-    };
-    if !matches!(exact, Other) {
-        return Ok(exact);
+    for (header, event) in [
+        ("Pair code locked", PairCodeLocked),
+        ("Custom code rejected", CustomCodeRejected),
+        ("Pair approved", PairApproved),
+        ("Pair declined", PairDeclined),
+        ("Pair request ended", PairRequestEnded),
+        ("Session closed", SessionClosed),
+        ("Agent session closed", AgentSessionClosed),
+        ("Outbox refused", OutboxRefused),
+        ("Pointer closed", PointerClosed),
+    ] {
+        if let Some(suffix) = line.strip_prefix(header) {
+            if suffix.is_empty() {
+                return Ok(event);
+            }
+            if suffix.starts_with(|ch: char| ch == ':' || ch.is_whitespace()) {
+                return Err(invalid());
+            }
+        }
     }
     // Split the two-word protocol header before parsing its payload: colons and
     // spaces inside a socket address, invite, or JSON string belong to the body.

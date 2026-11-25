@@ -86,3 +86,33 @@ fn preserves_pair_choices_and_encodes_only_one_command() {
     );
     assert!(!format!("{:?}", parse_frame("Pair invite: secret\n").unwrap()).contains("secret"));
 }
+
+#[test]
+fn terminal_statuses_reject_trailing_data_and_allow_distinct_extensions() {
+    use koko_host_windows::Event;
+    for status in [
+        "Pair code locked",
+        "Custom code rejected",
+        "Pair approved",
+        "Pair declined",
+        "Pair request ended",
+        "Session closed",
+        "Agent session closed",
+        "Outbox refused",
+        "Pointer closed",
+    ] {
+        assert!(!matches!(
+            parse_frame(&format!("{status}\n")).unwrap(),
+            Event::Other
+        ));
+        for suffix in [" extra", ": unexpected", "\textra"] {
+            assert!(
+                parse_frame(&format!("{status}{suffix}\n")).is_err(),
+                "{status}{suffix}"
+            );
+        }
+    }
+    for line in ["Session metrics: 4\n", "Pointer closedown: complete\n"] {
+        assert!(matches!(parse_frame(line).unwrap(), Event::Other));
+    }
+}
