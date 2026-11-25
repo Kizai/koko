@@ -119,7 +119,7 @@ Agent 的每条键鼠输入先交给被控端 `Koko.app` 按规则检查（`apps
 - **本次会话都允许**：同一类操作（同一快捷键、同一应用或同一关键词）在这个 Agent 断开前不再询问。
 - **拒绝**或 2 分钟无人回应：输入不执行，Agent 收到 `approval_declined` 或 `approval_timeout`，仍保有控制权，可以改做别的或询问用户。
 - 等待期间人类控制端有输入，或被控端点「停止」，视为接管：输入不执行，Agent 暂停。
-- 每台被控端通过本机的 `~/.koko/agent-policy.json` 配置规则。可选键为 `shortcuts`（布尔）、`command_apps`、`protected_apps` 和 `keywords`（字符串列表）。键缺失或为 `null` 时保留默认值，空列表关闭相应规则，`shortcuts: false` 关闭快捷键规则。文件缺失时直接使用默认规则，格式错误或读取失败时整份配置回退到默认规则并提示。
+- 每台被控端通过本机的 `~/.koko/agent-policy.json` 配置规则。可选键为 `shortcuts`（布尔）、`command_apps`、`protected_apps` 和 `keywords`（字符串列表）。键缺失或为 `null` 时保留默认值，空列表关闭相应规则，`shortcuts: false` 关闭快捷键规则。文件缺失时直接使用默认规则，格式错误或读取失败时整份配置回退到默认规则并提示。 Windows 也可读取带 BOM 的 UTF-16LE 配置。
 - macOS 的应用列表接受 Bundle ID。Windows 的应用列表接受带 `.exe` 的进程文件名（不区分大小写）或按原大小写填写的 [AUMID](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/customize-start-layout)，不支持 macOS Bundle ID。
 - Windows 阶段 0B.8 提供独立规则判定。实际前台应用和 UIA 查询、审批界面接入和实机验收留到 [Windows 阶段 3](./windows-plan.md#阶段-3agent-能力对齐)。
 - 规则依赖 `Koko.app`。命令行单独运行的 daemon 无法检查规则，因此拒绝 Agent 的所有键鼠输入。旧的 `click` 与 `key` 命令只对人类控制端开放，Agent 只能用 `pointer` 和 `text`。

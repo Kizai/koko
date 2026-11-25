@@ -446,3 +446,115 @@ fn file_loader_distinguishes_missing_invalid_and_unreadable_config() {
     assert_eq!(unreadable.notice, Some(PolicyNotice::Unreadable));
     assert_eq!(unreadable.policy, AgentPolicy::default());
 }
+
+#[test]
+fn accepts_swift_supported_encodings_and_retains_config_values() {
+    let json = " \n\t".to_owned()
+        + r#"{"shortcuts":false,"shortcuts":true,"command_apps":[],"protected_apps":null,"keywords":["删除🚀"]}"#;
+    for (name, bom, body) in [
+        (
+            "UTF-16LE",
+            &[0xff, 0xfe][..],
+            json.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "UTF-16BE",
+            &[0xfe, 0xff][..],
+            json.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+        ),
+        (
+            "UTF-32LE",
+            &[][..],
+            json.chars()
+                .map(u32::from)
+                .flat_map(u32::to_le_bytes)
+                .collect(),
+        ),
+        (
+            "UTF-32BE",
+            &[0, 0, 0xfe, 0xff][..],
+            json.chars()
+                .map(u32::from)
+                .flat_map(u32::to_be_bytes)
+                .collect(),
+        ),
+    ] {
+        for prefix in [&[][..], bom] {
+            let bytes = [prefix, body.as_slice()].concat();
+            let loaded = AgentPolicy::parse(&bytes);
+            assert_eq!(loaded.notice, None, "{name}, BOM {prefix:?}");
+            assert!(!loaded.policy.shortcuts);
+            assert!(loaded.policy.command_apps.is_empty());
+            assert_eq!(
+                loaded.policy.protected_apps,
+                AgentPolicy::default().protected_apps
+            );
+            assert_eq!(loaded.policy.keywords, ["删除🚀"]);
+        }
+    }
+}
+
+#[test]
+fn invalid_wide_encodings_fall_back_without_using_partial_values() {
+    let utf16 =
+        r#"{"shortcuts":false}"#.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+    let utf32 = r#"{"shortcuts":false}"#.chars().map(u32::from).flat_map(u32::to_be_bytes).collect::<Vec<_>>();
+    let utf32le = r#"{"shortcuts":false}"#.chars().map(u32::from).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    // Put invalid Unicode inside an ignored field. The byte decoder must still reject it.
+    let head = r#"{"shortcuts":false,"unknown":""#;
+    let tail = r#""}"#;
+    let utf16_surrogate: Vec<_> = head
+        .encode_utf16()
+        .chain([0xd800])
+        .chain(tail.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let utf32_out_of_range: Vec<_> = head
+        .chars()
+        .map(u32::from)
+        .chain([0x11_0000])
+        .chain(tail.chars().map(u32::from))
+        .flat_map(u32::to_be_bytes)
+        .collect();
+    for data in [
+        &utf16[..utf16.len() - 1],
+        &utf32[..utf32.len() - 1],
+        &utf16_surrogate,
+        &utf32_out_of_range,
+        &[&[0xff, 0xfe, 0, 0], utf32le.as_slice()].concat(),
+        &[&[0xff, 0xfe, 0xff, 0xfe], utf16.as_slice()].concat(),
+        b"\xef\xbb\xbf\xef\xbb\xbf{}",
+    ] {
+        let loaded = AgentPolicy::parse(data);
+        assert_eq!(loaded.notice, Some(PolicyNotice::InvalidFormat));
+        assert_eq!(loaded.policy, AgentPolicy::default());
+    }
+}
+
+#[test]
+fn loads_custom_protection_from_a_utf16le_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("agent-policy.json");
+    let bytes: Vec<u8> = [0xff, 0xfe]
+        .into_iter()
+        .chain(
+            r#"{"protected_apps":["CustomPanel.exe"]}"#
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        )
+        .collect();
+    std::fs::write(&path, bytes).unwrap();
+    let loaded = AgentPolicy::load(&path);
+    assert_eq!(loaded.notice, None);
+    assert_eq!(
+        rule(loaded.policy.check(
+            &text(),
+            Some(app("CUSTOMPANEL.EXE")),
+            false,
+            |_, _, _| panic!()
+        )),
+        Some("app:CustomPanel.exe".into())
+    );
+}

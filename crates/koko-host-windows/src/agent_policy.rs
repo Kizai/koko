@@ -7,7 +7,7 @@ use serde::{
     Deserialize, Deserializer,
     de::{IgnoredAny, MapAccess, Visitor},
 };
-use std::{fmt, fs, io, path::Path};
+use std::{borrow::Cow, fmt, fs, io, path::Path};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentPolicy {
@@ -170,16 +170,56 @@ impl<'de> Deserialize<'de> for AgentPolicy {
     }
 }
 
+fn json_utf8(bytes: &[u8]) -> Option<Cow<'_, [u8]>> {
+    // A policy starts with ASCII JSON whitespace or an opening brace. The zero
+    // bytes in its first code unit identify the wide encoding without a BOM.
+    let decoded = match bytes {
+        // The macOS Foundation decoder rejects a UTF-32LE BOM.
+        [0xff, 0xfe, 0, 0, ..] => return None,
+        [0, 0, 0xfe, 0xff, rest @ ..] => decode_utf32(rest, u32::from_be_bytes),
+        [0xfe, 0xff, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        [0xff, 0xfe, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
+        [0xef, 0xbb, 0xbf, rest @ ..] => return Some(Cow::Borrowed(rest)),
+        [0, 0, 0, _, ..] => decode_utf32(bytes, u32::from_be_bytes),
+        [_, 0, 0, 0, ..] => decode_utf32(bytes, u32::from_le_bytes),
+        [0, _, ..] => decode_utf16(bytes, u16::from_be_bytes),
+        [_, 0, ..] => decode_utf16(bytes, u16::from_le_bytes),
+        _ => return Some(Cow::Borrowed(bytes)),
+    }?;
+    Some(Cow::Owned(decoded.into_bytes()))
+}
+
+fn decode_utf16(bytes: &[u8], code_unit: fn([u8; 2]) -> u16) -> Option<String> {
+    let (units, remainder) = bytes.as_chunks();
+    if !remainder.is_empty() {
+        return None;
+    }
+    char::decode_utf16(units.iter().copied().map(code_unit))
+        .collect::<Result<String, _>>()
+        .ok()
+}
+
+fn decode_utf32(bytes: &[u8], code_unit: fn([u8; 4]) -> u32) -> Option<String> {
+    let (units, remainder) = bytes.as_chunks();
+    if !remainder.is_empty() {
+        return None;
+    }
+    units
+        .iter()
+        .copied()
+        .map(|unit| char::from_u32(code_unit(unit)))
+        .collect()
+}
+
 impl AgentPolicy {
     /// Omitted and null keys inherit defaults. A present list replaces its entire default list.
     pub fn parse(json: &[u8]) -> LoadedPolicy {
-        let json = json.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(json);
-        match serde_json::from_slice(json) {
-            Ok(policy) => LoadedPolicy {
+        match json_utf8(json).and_then(|utf8| serde_json::from_slice(&utf8).ok()) {
+            Some(policy) => LoadedPolicy {
                 policy,
                 notice: None,
             },
-            Err(_) => LoadedPolicy {
+            None => LoadedPolicy {
                 policy: Self::default(),
                 notice: Some(PolicyNotice::InvalidFormat),
             },
