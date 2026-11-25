@@ -128,6 +128,24 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 阶段 0B 的总验收：上述测试在 macOS 和 Windows CI 上全部通过；阶段 1 的各任务只剩下调用 Windows API 和实机验收。
 
+#### 0B.3 键位映射的来源与边界
+
+`koko-input::keyboard` 以 macOS SDK 26.5 的 Carbon/HIToolbox `Events.h` 中的 `kVK_*` 为 Mac 键位来源。表中逐行标注 Apple 常量和 Keyboard/Keypad 页的 HID usage。Windows 扫描码取自 [Microsoft Scan 1 Make](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-keyboard-input#scan-codes)，分开保存 make 字节与 E0 标志。VK 取自 [Microsoft Virtual-Key Codes](https://learn.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes)，键盘等号补充参考 [Microsoft Keyboard Filter](https://learn.microsoft.com/en-us/windows/configuration/keyboard-filter/keyboardfilter-key-names)。ISO、JIS、Help/Insert 和菜单键的物理对应关系依据 [Apple IOHIDFamily 的 HID 映射](https://github.com/apple-oss-distributions/IOHIDFamily/blob/main/IOHIDFamily/Cosmo_USB2ADB.c)。键位表示物理位置，实际字符由目标布局决定。
+
+Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独立方向/编辑键与关闭 Num Lock 的小键盘、通用 VK 下的左右修饰键，以及布局相关的 OEM 键。缺少扫描码时，歧义 VK 丢弃，字母与数字的 VK 按美式 ANSI 位置处理。小键盘 Clear 对应 Num Lock 的物理位置，接受 `VK_NUMLOCK` 的原始 45 和旧式 E045；`VK_CLEAR` 加小键盘 5 的扫描码对应小键盘 5。只对含完整物理扫描信息的表项保证往返。
+
+| 键 | 映射与原因 |
+| --- | --- |
+| ISO Section、JIS ¥、JIS _、JIS 小键盘逗号 | 对应 HID 64、89、87、85（十六进制）的物理键位。OEM VK 与布局有关，小键盘逗号没有统一的 VK。 |
+| JIS 英数、かな | 丢弃。对应 HID LANG2/LANG1，Microsoft 记录其扫描码只发送释放事件。Windows 106 键盘的无转换、转换、假名模式另有各自的物理键，IME 模式切换留待实机确定。 |
+| PrintScreen、Scroll Lock、Pause/Break | 丢弃。Mac 虚拟键表没有独立位置。历史 HID 桥接会把它们与 F13–F15 合并，这里保留 F13–F15 自身的物理身份。Pause 的 E1 序列不进入 E0/单字节扫描码接口。 |
+| Windows 菜单键 | `VK_APPS` / E05D 对应 `kVK_ContextualMenu`。 |
+| Mac Fn 与音量键 | Fn 没有通用 Set 1 对应键。音量键属于 HID Consumer 页的媒体控制，本任务仅覆盖 Keyboard/Keypad 页。 |
+
+修饰位依据 Core Graphics 的 `CGEventFlags` 和 macOS SDK `IOKit/hidsystem/IOLLEvent.h` 的设备无关掩码，按右移 16 位后的字节转换。Shift、Ctrl、Option/Alt、Command/Win 与 Caps Lock 状态双向可表示，NumericPad、Help 与 Fn 没有对应的 Windows 聚合修饰状态。左右手来自单独的修饰键扫描码。Windows 控制端先把 Win 编为 Command、Alt 编为 Option。Windows 被控端在 `source_os=macos` 且启用跨系统键位映射时，按 Swift 的 `windowsShortcut` 对调左右 Ctrl/Command 键位和对应标志。Windows 来源、未知来源和关闭设置时按物理意义转换。组合键保留主键，例如 Mac 的 Command+Shift+3 在启用设置时转为 Ctrl+Shift+3。
+
+阶段 1 实机验证扫描码注入、目标键盘布局、Caps/Num Lock 切换和快捷键行为，阶段 2 实机验证 Windows 控制端采集到的 VK、扫描码和 E0 元数据。
+
 ### 阶段 1：Windows 被控端执行器（Mac 作为控制端验收）
 
 需要 Windows 实机。在阶段 0B 建好的 `crates/koko-host-windows` 上增加 Windows 桌面后端和可执行入口 `koko-host`。它启动 `koko-daemon serve-pair ... --app-desktop <设备名>`，按[应用与辅助进程的接口](./architecture.md#应用与辅助进程的接口)读写行协议，逻辑对应 `LocalConnection.swift` 的被控端部分。本阶段的审批交互用控制台完成：打印连接码，输入 `approve` / `decline`。平台实现放进 `koko-capture` 和 `koko-input` 的 `#[cfg(windows)]` 模块，macOS 的现有代码不动。
@@ -202,7 +220,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 阶段 | 状态 |
 | --- | --- |
 | 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
-| 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3、0B.4、0B.7、0B.8 待实现，0B.5、0B.6 等待实机样例 |
+| 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3 已交付可移植键位映射。0B.4、0B.7、0B.8 待实现，0B.5、0B.6 等待实机样例 |
 | 1 Windows 被控端 | 未开始 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
