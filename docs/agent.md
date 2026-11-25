@@ -41,7 +41,7 @@
 
 ## 身份与识别
 
-- **独立密钥**。Agent 默认使用 `~/.koko/agent.key`。`koko-agent mcp --identity <文件> --name <名称>` 可为不同 MCP 客户端指定不同身份。
+- **独立密钥**。Agent 默认使用 `~/.koko/agent.key`。Unix 从 `HOME` 解析主目录，Windows 的默认路径为 `%USERPROFILE%\.koko\agent.key`。`koko-agent pair <配对目标>` 默认在同一目录使用 `controller.key`。`koko-agent mcp --identity <文件> --name <名称>` 可为不同 MCP 客户端指定不同身份。
 - **识别依据**。被控端只依据 QUIC 握手确认的公钥识别 Agent。Agent 自报的名称和类型只用于显示。
 - **配对声明**。`koko/pair/1` 流中发送不超过 1 KiB 的 JSON（版本 3）。旧客户端发送的 `request` 仍按人类控制端的局域网申请处理。
 
