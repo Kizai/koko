@@ -1489,6 +1489,10 @@ dependencies = [
 [[package]]
 name = "koko-input"
 version = "0.1.25"
+dependencies = [
+ "koko-proto",
+ "windows",
+]
 
 [[package]]
 name = "koko-p2p"

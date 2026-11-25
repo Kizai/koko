@@ -36,23 +36,30 @@ mod console {
         desktop_worker::{Action, DesktopWorker, next_action},
         pair_decision,
     };
-    use koko_host_windows::{Command, DesktopBackend, Event, Host, WindowsDesktopBackend};
+    use koko_host_windows::{
+        Command, DesktopBackend, Event, Host, WindowsDesktopBackend, WindowsDesktopInput,
+    };
     use koko_proto::{RemoteCommand, RemoteReply};
     use std::{env, io, path::Path, thread, time::Duration};
     use tokio::sync::mpsc;
 
     pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = env::args().skip(1).collect();
-        const USAGE: &str = "usage: koko-host <key-file> <bind-ip:port> <device-name>";
+        const USAGE: &str = "usage: koko-host <key-file> <bind-ip:port> <device-name> [--no-cross-system-shortcuts]";
         if args == ["--help"] {
             println!("{USAGE}");
             return Ok(());
         }
-        let [key, bind, name] = args.as_slice() else {
-            return Err(USAGE.into());
+        let (key, bind, name, cross_system_shortcuts) = match args.as_slice() {
+            [key, bind, name] => (key, bind, name, true),
+            [key, bind, name, flag] if flag == "--no-cross-system-shortcuts" => {
+                (key, bind, name, false)
+            }
+            _ => return Err(USAGE.into()),
         };
         let bind = bind.parse()?;
         let mut backend = WindowsDesktopBackend::new(name.clone())?;
+        let mut input = WindowsDesktopInput::new(cross_system_shortcuts);
         let mut desktop = DesktopWorker::new(move |request| backend.handle(request))?;
         let daemon = env::current_exe()?.with_file_name("koko-daemon.exe");
         let (sender, mut lines) = mpsc::channel(1);
@@ -70,8 +77,9 @@ mod console {
         println!("Starting KoKo host {name:?} (PID {})", std::process::id());
         let result = tokio::select! {
             result = tokio::signal::ctrl_c() => result,
-            result = serve(&mut host, &mut desktop, &mut lines) => result,
+            result = serve(&mut host, &mut desktop, &mut input, &mut lines) => result,
         };
+        input.release();
         drop(desktop);
         let status = host.shutdown(Duration::from_secs(3)).await;
         result?;
@@ -85,6 +93,7 @@ mod console {
     async fn serve(
         host: &mut Host,
         desktop: &mut DesktopWorker,
+        input: &mut WindowsDesktopInput,
         lines: &mut mpsc::Receiver<io::Result<String>>,
     ) -> io::Result<()> {
         let mut pending = None;
@@ -118,17 +127,26 @@ mod console {
                         println!("Pair request closed");
                     }
                     Some(Event::PairCodeLocked) => println!("Pair code locked"),
+                    Some(Event::PointerClosed | Event::SessionClosed) => input.release(),
                     Some(Event::Desktop(request)) => {
-                        let result = match request.command {
+                        let id = request.id;
+                        let reply = match request.command {
                             RemoteCommand::Displays
                             | RemoteCommand::Screenshot
                             | RemoteCommand::Capture { .. }
-                            | RemoteCommand::Wallpaper => desktop.submit(request, DESKTOP_LIMIT),
-                            _ => Err((request.id, RemoteReply::error("desktop_unavailable"))),
+                            | RemoteCommand::Wallpaper => {
+                                match desktop.submit(request, DESKTOP_LIMIT) {
+                                    Ok(()) => continue,
+                                    Err((_, reply)) => reply,
+                                }
+                            }
+                            RemoteCommand::Pointer { .. }
+                            | RemoteCommand::Click { .. }
+                            | RemoteCommand::Key { .. }
+                            | RemoteCommand::Text { .. } => input.handle(&request),
+                            _ => RemoteReply::error("desktop_unavailable"),
                         };
-                        if let Err((id, reply)) = result {
-                            host.send(Command::DesktopReply(id, &reply)).await?;
-                        }
+                        host.send(Command::DesktopReply(id, &reply)).await?;
                     }
                     Some(_) => {}
                     None => return Ok(()),

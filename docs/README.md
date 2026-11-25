@@ -12,6 +12,7 @@
 | 如何设计、实现和评审改动 | [开发规则](./development.md) |
 | Windows 兼容的现状评估、方案选择与分阶段计划 | [Windows 兼容开发方案](./windows-plan.md) |
 | Windows 被控端启动、Mac 控制端验证、显示器与进程清理记录 | [Windows 1.1 实机验收](./windows-1.1-acceptance.md) |
+| Windows 工具链与启动命令、Mac 画面和键鼠、实机复核记录 | [Windows 1.1 和 1.2 实机验收](./windows-1.2-acceptance.md) |
 
 ## 临时笔记
 
