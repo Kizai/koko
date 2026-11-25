@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-#[cfg(unix)]
-use std::{fs::Permissions, os::unix::fs::PermissionsExt};
 
 use iroh::{
     EndpointId,
@@ -16,8 +14,6 @@ use koko_proto::{
     VIDEO_ERROR, feedback_length, valid_remote_command,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::sync::{Mutex, MutexGuard, mpsc, oneshot, watch};
 
 use std::sync::Arc;
@@ -145,27 +141,27 @@ pub(crate) struct RemoteHost {
     pub(crate) audit: Option<Audit>,
     pub(crate) outbox: Arc<Outbox>,
     pub(crate) pointer: Mutex<()>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) video: Arc<MediaSlot>,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) audio: Arc<MediaSlot>,
 }
 
 /// How long a new media request waits for the stream it replaces to wind down.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MEDIA_HANDOVER: Duration = Duration::from_secs(2);
 
 /// The one live stream of a media kind. A newer request from the same controller replaces the
 /// current stream at once, so switching displays never waits for the old stream to time out.
 /// Another controller's request is still refused while the stream is in use.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Default)]
 pub(crate) struct MediaSlot {
     active: Mutex<()>,
     current: std::sync::Mutex<Option<(EndpointId, Arc<tokio::sync::Notify>)>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl MediaSlot {
     /// Makes `peer`'s new stream the current one, ending `peer`'s previous stream first.
     /// Returns None while another controller's stream is live.
@@ -187,13 +183,13 @@ impl MediaSlot {
 }
 
 /// Forgets the current stream when it ends, unless a newer one already took its place.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct MediaTurn<'a> {
     slot: &'a MediaSlot,
     stop: Arc<tokio::sync::Notify>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for MediaTurn<'_> {
     fn drop(&mut self) {
         let mut current = self.slot.current.lock().unwrap();
@@ -320,7 +316,7 @@ impl RemoteHost {
                     let auth = authorization.clone();
                     let conn = connection.clone();
                     let app = self.app_desktop.clone();
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     let slot = if matches!(command, RemoteCommand::Audio) {
                         self.audio.clone()
                     } else {
@@ -338,7 +334,7 @@ impl RemoteHost {
                                 command,
                                 app,
                                 peer,
-                                #[cfg(unix)]
+                                #[cfg(any(unix, windows))]
                                 slot,
                                 &mut send,
                                 feedback,
@@ -515,7 +511,7 @@ impl RemoteHost {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     async fn serve_media(
         command: RemoteCommand,
         app: Option<AppDesktop>,
@@ -536,28 +532,19 @@ impl RemoteHost {
         let Some((_active, turn)) = slot.claim(peer).await else {
             return send_video_error(send, busy).await;
         };
-        let directory = tempfile::Builder::new()
-            .prefix("kv")
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir()
-            .map_err(AcceptError::from_err)?;
-        let path = directory.path().join(if is_audio { "a" } else { "v" });
-        let listener = UnixListener::bind(&path).map_err(AcceptError::from_err)?;
+        let mut channel =
+            crate::media_channel::MediaChannel::bind(is_audio).map_err(AcceptError::from_err)?;
         if let RemoteReply::Error { code } = app
-            .request(
-                command,
-                Some(path.to_string_lossy().into_owned()),
-                Origin::Person,
-            )
+            .request(command, Some(channel.name.clone()), Origin::Person)
             .await
         {
             return send_video_error(send, &code).await;
         }
-        let (source, _) = tokio::time::timeout(Duration::from_secs(9), listener.accept())
-            .await
-            .map_err(AcceptError::from_err)?
-            .map_err(AcceptError::from_err)?;
-        let (mut frames, mut to_app) = source.into_split();
+        let (mut frames, mut to_app) =
+            tokio::time::timeout(Duration::from_secs(9), channel.accept())
+                .await
+                .map_err(AcceptError::from_err)?
+                .map_err(AcceptError::from_err)?;
         // The relay keeps the socket's write half even after the controller stops sending
         // feedback, because closing it would tell the app to stop capturing.
         let relay = async {
@@ -577,7 +564,7 @@ impl RemoteHost {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     async fn serve_media(
         _command: RemoteCommand,
         _app: Option<AppDesktop>,
@@ -714,8 +701,6 @@ async fn send_items(
 /// Passes a controller's frame acknowledgements and key-frame requests to the app. Only
 /// well-formed feedback records are passed on; the first malformed one ends the relay, which
 /// leaves the video itself running.
-// Windows 的视频通道在 windows-plan 0.5 实现，届时移除此属性。
-#[cfg_attr(not(unix), allow(dead_code))]
 async fn relay_feedback(mut input: impl AsyncRead + Unpin, output: &mut (impl AsyncWrite + Unpin)) {
     let mut record = [0u8; 9];
     loop {
@@ -918,9 +903,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -980,9 +965,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1076,9 +1061,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1172,9 +1157,9 @@ mod tests {
                     audit: None,
                     outbox: outbox.clone(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1213,6 +1198,129 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(any(unix, windows))]
+    async fn connect_media_app(
+        requests: &mut mpsc::Receiver<DesktopRequest>,
+        response: &mut RecvStream,
+    ) -> Result<impl AsyncRead + AsyncWrite + Unpin + use<>, Box<dyn Error>> {
+        let request = tokio::select! {
+            request = requests.recv() => request.expect("the desktop channel is open"),
+            early = response.read_chunk(256) => {
+                panic!("daemon ended the QUIC stream before requesting the desktop app: {early:?}");
+            }
+        };
+        let name = request.video_socket.expect("media endpoint");
+        #[cfg(unix)]
+        let stream = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = std::path::Path::new(&name);
+            assert_eq!(
+                path.parent().unwrap().metadata()?.permissions().mode() & 0o777,
+                0o700
+            );
+            tokio::net::UnixStream::connect(path).await?
+        };
+        #[cfg(windows)]
+        let stream = {
+            assert!(name.starts_with(r"\\.\pipe\koko-video-"));
+            tokio::net::windows::named_pipe::ClientOptions::new().open(name)?
+        };
+        request.reply.send(RemoteReply::Ok).unwrap();
+        Ok(stream)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn media_app_relays_video_feedback_and_independent_audio_over_quic()
+    -> Result<(), Box<dyn Error>> {
+        let endpoint = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let host = EndpointAddr::new(endpoint.id()).with_ip_addr(endpoint.bound_sockets()[0]);
+        let person = SecretKey::generate();
+        let (sessions, _) = watch::channel(Sessions::human(person.public()));
+        let (app, mut requests) = AppDesktop::channel();
+        let router = Router::builder(endpoint)
+            .accept(
+                koko_proto::REMOTE_ALPN,
+                RemoteHost {
+                    sessions,
+                    app_desktop: Some(app),
+                    arbiter: Arc::new(Arbiter::new(Duration::ZERO, Duration::from_secs(60))),
+                    audit: None,
+                    outbox: Default::default(),
+                    pointer: Mutex::new(()),
+                    #[cfg(any(unix, windows))]
+                    video: Default::default(),
+                    #[cfg(any(unix, windows))]
+                    audio: Default::default(),
+                },
+            )
+            .spawn();
+        let client = RemoteClient::connect(person, host).await?;
+        let video = RemoteCommand::Video {
+            display: 1,
+            edge: 1280,
+            quality: 70,
+            fps: 30,
+            audio: false,
+            hevc: false,
+            chroma444: false,
+            feedback: true,
+        };
+        // Synthetic media records; their payloads are only used to check byte preservation.
+        use koko_proto::{FEEDBACK_ACK, VIDEO_SEQUENCED_FRAME};
+        const FRAME: [u8; 17] = [
+            0,
+            0,
+            0,
+            13,
+            VIDEO_SEQUENCED_FRAME,
+            0,
+            0,
+            0,
+            42,
+            1,
+            0,
+            0,
+            0,
+            3,
+            0x65,
+            255,
+            10,
+        ];
+        let ack = [0, 0, 0, 5, FEEDBACK_ACK, 0, 0, 0, 42];
+        let audio = [0, 0, 0, 7, 6, 0, 0, 0, 1, 255, 0];
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (mut feedback, mut frames) = client.open_stream(&video).await?;
+            let mut capture = connect_media_app(&mut requests, &mut frames).await?;
+            feedback.write_all(&ack).await?;
+            feedback.finish()?;
+            let mut received_ack = [0; 9];
+            capture.read_exact(&mut received_ack).await?;
+            assert_eq!(received_ack, ack);
+            capture.write_all(&FRAME).await?;
+            let mut received_frame = [0; FRAME.len()];
+            frames.read_exact(&mut received_frame).await?;
+            assert_eq!(received_frame, FRAME);
+
+            let mut sound = client.open_command(&RemoteCommand::Audio).await?;
+            let mut audio_capture = connect_media_app(&mut requests, &mut sound).await?;
+            let (_, mut replacement) = client.open_stream(&video).await?;
+            let mut new_capture = connect_media_app(&mut requests, &mut replacement).await?;
+            assert!(frames.read_to_end(64).await?.is_empty());
+            new_capture.write_all(&FRAME).await?;
+            drop(new_capture);
+            assert_eq!(replacement.read_to_end(64).await?, FRAME);
+            audio_capture.write_all(&audio).await?;
+            drop(audio_capture);
+            assert_eq!(sound.read_to_end(64).await?, audio);
+            Ok::<_, Box<dyn Error>>(())
+        })
+        .await??;
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn only_well_formed_feedback_reaches_the_app() {
         use koko_proto::{FEEDBACK_ACK, FEEDBACK_KEY_FRAME};
@@ -1234,7 +1342,7 @@ mod tests {
         assert_eq!(output, input[..valid]);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn a_new_stream_from_the_same_controller_replaces_the_old_one() {
         let slot = MediaSlot::default();
@@ -1289,9 +1397,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1372,9 +1480,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1425,9 +1533,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1494,9 +1602,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )
@@ -1532,9 +1640,9 @@ mod tests {
                     audit: None,
                     outbox: Default::default(),
                     pointer: Mutex::new(()),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     video: Default::default(),
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     audio: Default::default(),
                 },
             )

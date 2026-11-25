@@ -146,6 +146,24 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `streamInfo` | 10 | JSON：首条含被控端编码器（`hardware` / `software`）、采集方式（`ScreenCaptureKit`）和起始码率，在第一帧之前；之后码率每次调整再发一条只含 `bitrate`。只发给请求了 `feedback` 的控制端。 |
 | `sequencedFrame` | 9 | 四字节大端帧序号、一字节标志（第 0 位为关键帧），后接与 `frame` 相同的载荷。只发给请求了 `feedback` 的控制端。 |
 
+Windows daemon 为每次音频或视频请求创建独立的双向字节管道 `\\.\pipe\koko-video-<随机 GUID>`。创建时要求首个实例、仅一个实例、拒绝远程客户端。所有者与 DACL 唯一允许项均为 daemon 进程令牌的用户 SID。应用通过原有 `video_socket` 字段连接，向管道写媒体记录，从同一管道读视频反馈。
+
+验证跨用户隔离时，在 Windows 上用账号 A 调试 daemon 的 `media_app_relays_video_feedback_and_independent_audio_over_quic` 测试。在模拟应用读取 `video_socket` 后、打开管道前设置断点并暂停进程。用现有普通账号 B 在同一台机器上打开 PowerShell，把下面的名字替换为断点处的管道名（去掉 `\\.\pipe\` 前缀），逐项连接。三次均应得到「拒绝访问」；超时或找不到管道不能证明隔离。此时在账号 A 的 PowerShell 中对同一管道调用一次 InOut 连接，应成功。结束调试，去掉断点后重跑该测试以验证双向传输；测试中的超时会计入断点暂停时间。
+
+```powershell
+foreach ($direction in 'In', 'Out', 'InOut') {
+    $pipe = [IO.Pipes.NamedPipeClientStream]::new('.', 'koko-video-<GUID>', $direction)
+    try {
+        $pipe.Connect(2000)
+        throw "Unexpected connection ($direction)"
+    } catch [UnauthorizedAccessException] {
+        "Access denied ($direction)"
+    } finally {
+        $pipe.Dispose()
+    }
+}
+```
+
 ### 视频反馈与流控
 
 请求带 `feedback` 的控制端在视频流的发送方向回写反馈记录，格式与视频记录相同（四字节大端长度含类型字节，再接类型和载荷）：
@@ -185,7 +203,7 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `Agent approval: <JSON>` | 一条 Agent 输入等待批准，JSON 含 `reason` |
 | `Outbox queued <批次>`、`Outbox sent <批次>`、`Outbox failed <批次> <错误码>`、`Outbox refused` | 被控端发送文件的进展；没有人类控制端在线时拒绝入队 |
 | `Pair declined`、`Pair request ended` | 申请被拒绝、申请方已离开 |
-| `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频命令附带 `video_socket` 路径。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
+| `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频和音频命令附带 `video_socket`，Unix 上是私有目录中的 socket 路径，Windows 上是本机命名管道名。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
 应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
