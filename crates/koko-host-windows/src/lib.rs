@@ -1,5 +1,6 @@
 //! Local application interface to the bundled daemon. Pairing, scope and session
 //! enforcement stay in the daemon; the desktop backend owns the local input policy.
+pub mod agent_policy;
 mod command;
 mod process;
 mod protocol;

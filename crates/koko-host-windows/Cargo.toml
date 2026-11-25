@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+koko-input.workspace = true
 koko-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true

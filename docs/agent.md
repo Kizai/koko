@@ -108,18 +108,20 @@ stateDiagram-v2
 
 Agent 的每条键鼠输入先交给被控端 `Koko.app` 按规则检查（`apps/koko-macos/AgentPolicy.swift`）。只有被控端知道前台应用和点击位置下的控件，所以规则在被控端判定，Agent 无法绕过。命中规则时，daemon 挂起这条输入，控制权状态转为 `awaiting_approval`；被控端屏幕顶部的指示条变为红色，写明 Agent 想做什么，提供「允许一次」「本次会话都允许」「拒绝」，程序坞图标跳动提醒。
 
-| 规则 | 默认命中 |
-| --- | --- |
-| 快捷键 | ⌘Q、⌃⌘Q、⇧⌘Q、⌥⇧⌘Q（退出应用、锁屏、注销），⌘⌫、⌥⌘⌫、⇧⌘⌫、⌥⇧⌘⌫（删除与清倒废纸篓），⌥⌘⎋（强制退出） |
-| 终端类应用 | 前台是终端、iTerm2、Warp、Ghostty、kitty、Alacritty、WezTerm 时，输入文字或按回车 |
-| 受保护的应用 | 前台是系统设置、钥匙串访问、磁盘工具、活动监视器时，任何点击或输入 |
-| 控件名称 | 点击位置上的控件或其上三层容器的名称包含「删除、移除、清空、抹掉、卸载、付款、支付、购买、转账、发送、提交订单、永久」或对应英文词 |
+| 规则 | macOS 默认命中 | Windows 默认命中 |
+| --- | --- | --- |
+| 快捷键 | ⌘Q、⌃⌘Q、⇧⌘Q、⌥⇧⌘Q（退出应用、锁屏、注销），⌘⌫、⌥⌘⌫、⇧⌘⌫、⌥⇧⌘⌫（删除与清倒废纸篓），⌥⌘⎋（强制退出） | Win+R、Alt+F4、Ctrl+Shift+Esc、Shift+Delete、Win+X。用被控端映射后的按键和修饰键判断 |
+| 终端类应用 | 前台是终端、iTerm2、Warp、Ghostty、kitty、Alacritty、WezTerm 时，输入文字或按回车 | 前台进程为 `WindowsTerminal.exe`、`cmd.exe`、`powershell.exe`、`pwsh.exe` 时，输入文字或按主键盘或数字键盘回车 |
+| 受保护的应用 | 前台是系统设置、钥匙串访问、磁盘工具、活动监视器时，任何点击或输入 | 前台进程为 `regedit.exe`、`mmc.exe`、`Taskmgr.exe`、`SystemSettings.exe` 时，按下鼠标按钮、按键或输入文字 |
+| 控件名称 | 点击位置上的控件或其上三层容器的名称包含「删除、移除、清空、抹掉、卸载、付款、支付、购买、转账、发送、提交订单、永久」或对应英文词 | 使用相同的中英文关键词，在对应显示器的点击位置对 UI Automation（UIA）控件名称做不区分大小写的包含匹配 |
 
 - **允许一次**：daemon 把同一条输入标记为已批准后再交给应用执行，Agent 收到正常结果。
 - **本次会话都允许**：同一类操作（同一快捷键、同一应用或同一关键词）在这个 Agent 断开前不再询问。
 - **拒绝**或 2 分钟无人回应：输入不执行，Agent 收到 `approval_declined` 或 `approval_timeout`，仍保有控制权，可以改做别的或询问用户。
 - 等待期间人类控制端有输入，或被控端点「停止」，视为接管：输入不执行，Agent 暂停。
-- 规则写在 `~/.koko/agent-policy.json`，可选键为 `shortcuts`（布尔）、`command_apps`、`protected_apps`（应用 Bundle ID 列表）和 `keywords`。缺少的键保持默认，空列表关闭该规则；文件格式有误时使用默认规则并在被控端提示。
+- 每台被控端通过本机的 `~/.koko/agent-policy.json` 配置规则。可选键为 `shortcuts`（布尔）、`command_apps`、`protected_apps` 和 `keywords`（字符串列表）。键缺失或为 `null` 时保留默认值，空列表关闭相应规则，`shortcuts: false` 关闭快捷键规则。文件缺失时直接使用默认规则，格式错误或读取失败时整份配置回退到默认规则并提示。 Windows 也可读取带 BOM 的 UTF-16LE 配置。
+- macOS 的应用列表接受 Bundle ID。Windows 的应用列表接受带 `.exe` 的进程文件名（不区分大小写）或按原大小写填写的 [AUMID](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/customize-start-layout)，不支持 macOS Bundle ID。
+- Windows 阶段 0B.8 提供独立规则判定。实际前台应用和 UIA 查询、审批界面接入和实机验收留到 [Windows 阶段 3](./windows-plan.md#阶段-3agent-能力对齐)。
 - 规则依赖 `Koko.app`。命令行单独运行的 daemon 无法检查规则，因此拒绝 Agent 的所有键鼠输入。旧的 `click` 与 `key` 命令只对人类控制端开放，Agent 只能用 `pointer` 和 `text`。
 - 审计日志对经人批准的输入记录 `approved_by_person`。
 
