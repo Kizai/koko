@@ -33,7 +33,7 @@ macOS 的原生层是约 8000 行 Swift（`apps/koko-macos/`），承担了以�
 
 以下格式目前没有写进文档，Windows 实现必须与之逐字节兼容：
 
-- 视频记录类型 5、6、7（`audioFormat`、`audioFrame`、`syncFrame`）的载荷格式。编码为 AAC-LC，带 magic cookie 和时间戳，见 `apps/koko-macos/AudioSync.swift` 的 `AudioPacketCodec`。
+- 视频记录类型 5、6、7（`audioFormat`、`audioFrame`、`syncFrame`）的载荷格式。当前音频优先 AAC-ELD、回退 AAC-LC，格式记录带 magic cookie，音频包带序号；类型 7 为历史带时间戳视频帧，仅保留接收兼容。源码依据及准确布局已补入 `architecture.md`。
 - 每种 `Desktop request` 对应的回复 JSON，例如 `displays` 回复里的 `host_name`、`video`、`clipboard`、`clipboard_stream` 能力标记和 `control`。
 - `pointer` 中的 `scroll` 单位（macOS 用像素单位滚动，`wheel1 = dy`，`wheel2 = dx`），以及修饰键位（Core Graphics 修饰位右移 16 位，掩码 `0xbf`）。
 - `UiNode.role` 使用 AX 角色名（如 `AXButton`），`AXMenuBar` 会被跳过。
@@ -90,7 +90,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 | 0.3 数据目录 | 在 `koko-p2p` 增加一个函数，返回 `~/.koko`（Unix 用 `HOME`，Windows 用 `USERPROFILE`），`koko-agent` 的 `koko_directory()` 改为调用它 | Windows 上 `koko-agent pair`、`koko-agent mcp` 无需显式传入密钥路径 |
 | 0.4 **剪贴板路径安全（P0）** | 接收端在 Windows 上额外拒绝：含 `\`、`:`、`<>"|?*` 和控制字符的分段；保留设备名（`CON`、`PRN`、`AUX`、`NUL`、`COM1`–`COM9`、`LPT1`–`LPT9`，不区分大小写，含扩展名形式）；以点或空格结尾的分段。拼接后再确认路径仍位于接收目录内。不合法时整批作废，返回 `clipboard_invalid`。错误码分两层：协议层（`koko_proto::safe_relative_path`，含 NUL、`.`、`..`、空段、绝对路径）在请求入口校验，所有平台都返回 `invalid_command`，保持不变；只有通过协议校验、但 Windows 文件系统不接受的名称才返回 `clipboard_invalid`。是否把 `\` 和 `:` 也加进跨平台的 `safe_relative_path`，在 PR 里给出影响评估，由用户决定 | 新增单元测试覆盖上述每一类输入，在 Windows CI 上运行 |
 | 0.5 视频通道 | 把 `serve_video` 的 Unix socket 抽成「本机私有视频通道」，Unix 用现有实现，Windows 用 `tokio::net::windows::named_pipe`：管道名随机生成（`\\.\pipe\koko-video-<随机>`），设置 `first_pipe_instance(true)` 和 `reject_remote_clients(true)`，并**显式指定只允许当前用户 SID 访问的安全描述符**（Windows 管道的默认 DACL 会给 Everyone 读权限）。`Desktop request` 的 `video_socket` 字段在 Windows 上承载管道名，字段名不变。实现 Windows 视频通道时移除 relay_feedback 上的 allow(dead_code)。 | 集成测试：一个模拟应用写入视频记录，经 QUIC 原样到达订阅端；另一用户身份无法连接管道（若 CI 不便测试，写进实机验收清单） |
-| 0.6 补全协议文档 | 把 1.3 节列出的格式写进 `docs/architecture.md`，并在 `koko-proto` 加上 `displays`、`ui_tree`、视频与音频记录的样例测试，样例取自 macOS 实机输出 | 文档与测试合入 |
+| 0.6 补全协议文档 | 本轮先将 1.3 节的格式、Desktop 实际回复与当前源码差异写进 `docs/architecture.md`；按 [协议样例采集](./protocol-capture.md) 交由用户在两台 Mac 上采集。拿到真实输出后再增加 `koko-proto` 的 displays、ui_tree、音视频样例测试，不手工编造样例 | 本轮验收文档；实机采集与样例测试后续补齐 |
 | 0.7 子进程生命周期 | 记录 Windows 上的约定，供阶段 1 使用：外壳启动 daemon 和 agent 时使用 `CREATE_NO_WINDOW`，并放进设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，保证外壳退出时子进程一并退出 | 文档说明 |
 
 阶段 0 的总验收：在 Windows 上运行 `koko-daemon serve-pair %USERPROFILE%\.koko\host.key 0.0.0.0:27688`，Mac 的 Koko.app 能通过局域网发现它并用连接码配对，截图请求返回 `desktop_unavailable`。这一步证明网络、mDNS 和防火墙路径都是通的，需要在 Windows 防火墙放行 UDP 27688 和 5353，并且网络配置文件为「专用网络」。
@@ -198,8 +198,21 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 | 阶段 | 状态 |
 | --- | --- |
-| 0 工作区跨平台化 | 未开始 |
+| 0 工作区跨平台化 | 本轮代码与文档已提交独立 PR；实机样例、权限及总验收仍待执行，详见下表 |
 | 0B 可脱离实机的平台逻辑 | 未开始 |
 | 1 Windows 被控端 | 未开始 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
+
+阶段 0 的本轮交付按用户缩减后的范围执行，不能把 CI 通过等同于全部 Windows 产品能力可用。阶段 0B 尚未开始，后续须先汇报并由用户决定继续。
+
+| 阶段 0 任务 | 交付与剩余验证 |
+| --- | --- |
+| 前置编译修复、0.2、0.1、方案文档 | #4、#1、#2、#5 已合入；0.1/0.2 均经完整 macOS / Windows CI；阶段名及任务编号已改为 0B、0B.1–0B.8 |
+| 0.3 数据目录 | #6 已合入，两平台完整 CI 通过；真实 Windows↔Mac 配对待总验收 |
+| 0.4 剪贴板路径安全 | #3 已合入，rebase 后完整两平台 CI 通过；真实应用双向文件传输待阶段 1 |
+| 0.5 视频通道 | #7 提交实现与真实 QUIC / 实际管道 DACL 测试；另一用户身份拒绝访问及真实应用接入仍需 Windows 实机，见 PR 清单 |
+| 0.7 生命周期 | #8 提交文档约定；创建、退出与崩溃清理的代码和实机验收属于阶段 1/2 |
+| 0.6 协议 | 本 PR 交付源码核对后的格式与采集步骤；Mac 实机原始样例及相应测试待用户采集后补齐。已记录 audio_volume 缺字段的现存问题，未改 Swift |
+
+本轮到此停止。阶段 0 总验收中的真实 Windows 网络、防火墙与跨设备场景、跨用户管道访问，以及两台 Mac 的协议样例均未冒充已完成。

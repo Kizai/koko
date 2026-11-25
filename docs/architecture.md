@@ -108,8 +108,8 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `request_human` | `reason`（最多 500 字符）、`timeout_s`（10–600） | `human`，含 `result`（`resolved`、`declined`、`taken_over` 或 `timeout`）和可选的 `note`；等人回答期间保持请求打开 |
 | `displays` | 无 | `displays`，含 `host_name`、显示器列表、`video`、`clipboard`、`clipboard_stream` 能力标记和控制权状态 `control` |
 | `capture` | `display`、`edge`（320–4096）、`quality`（20–95），可选 `format`（`jpeg` 或 `png`）和 `cursor` | `image`，Base64 图像，以及 `width`、`height` 和 `format` |
-| `video` | `capture` 的参数、`fps`（30、60、90、120、144、165 或 240），可选 `audio`、`hevc`、`chroma444` 和 `feedback` | 二进制视频记录流；`feedback` 为真时请求头以换行结束，控制端在同一条流上回写反馈记录 |
-| `audio` | `display` | 二进制音频记录流（与 `video` 共享同一条 QUIC 连接上的独立双向流，避免关键帧队头阻塞音频） |
+| `video` | `display`、`edge`、`quality`、`fps`（30、60、90、120、144、165 或 240），可选 `audio`、`hevc`、`chroma444` 和 `feedback` | 二进制视频记录流；`feedback` 为真时请求头以换行结束，控制端在同一条流上回写反馈记录 |
+| `audio` | 无 | 二进制音频记录流（与 `video` 共享同一条 QUIC 连接上的独立双向流，避免关键帧队头阻塞音频） |
 | `pointer` | `display`、1–32 个 `events`，可选 `source_os` | `ok` |
 | `clipboard_pull` | `transfer`（UUID） | 被控端按下 ⌘C 后，流上先发一条清单记录（文字，或文件与文件夹的相对路径和大小），再按清单顺序连续发送全部文件字节；出错时发错误记录 |
 | `outbox_wait` | 无 | 最多等待 25 秒，返回被控端待发送的文件批次 `outbox`（`offers` 含批次 ID 和顶层名称）；有新批次时立即返回，超时返回空列表 |
@@ -139,10 +139,10 @@ Agent 的输入由 daemon 的仲裁器（`crates/koko-daemon/src/arbiter.rs`）�
 | `frame` | 2 | 一帧 H.264 或 HEVC，NAL 单元使用四字节长度前缀（AVCC / HVCC）。 |
 | `error` | 3 | UTF-8 错误码，随后流结束。 |
 | `path` | 4 | 由控制端 `koko-agent` 每秒插入：八字节大端 RTT 毫秒数，加一字节是否为 IP 直连。 |
-| `audioFormat` | 5 | 40 字节大端 `AudioStreamBasicDescription` 字段加解码器 Magic Cookie。 |
-| `audioFrame` | 6 | 一帧 `AAC-ELD`（480 采样 / 10ms）或回退 `AAC-LC` 编码数据。 |
-| `syncFrame` | 7 | 八字节大端微秒级 PTS 加四字节长度前缀 NAL 单元（兼容带时间戳视频帧）。 |
-| `hevcFormat` | 8 | HEVC 的 VPS、SPS 与 PPS，各自带四字节大端长度前缀。 |
+| `audioFormat` | 5 | 14 字节固定头：`u32be formatID`、`u32be sampleRate`、`u16be channels`、`u32be framesPerPacket`，随后是非空 Magic Cookie，直至记录末尾，无独立 cookie 长度。 |
+| `audioFrame` | 6 | `u32be sequence`，随后一个原始 AAC 压缩包；不添加 ADTS、PTS 或时长。序号从 0 开始，按 2³² 回绕。 |
+| `syncFrame` | 7 | 有符号 `i64be ptsUs`（二进制补码），随后是四字节长度前缀 NAL 单元。历史发送端相对初始采集主机时钟换算并四舍五入到微秒；当前只保留接收兼容，不再发送此记录。 |
+| `hevcFormat` | 8 | `u32be` 参数集数量，随后每个参数集为 `u32be` 长度和参数集字节（通常 VPS、SPS、PPS）。 |
 | `streamInfo` | 10 | JSON：首条含被控端编码器（`hardware` / `software`）、采集方式（`ScreenCaptureKit`）和起始码率，在第一帧之前；之后码率每次调整再发一条只含 `bitrate`。只发给请求了 `feedback` 的控制端。 |
 | `sequencedFrame` | 9 | 四字节大端帧序号、一字节标志（第 0 位为关键帧），后接与 `frame` 相同的载荷。只发给请求了 `feedback` 的控制端。 |
 
@@ -163,6 +163,12 @@ foreach ($direction in 'In', 'Out', 'InOut') {
     }
 }
 ```
+
+上述布局依据 `apps/koko-macos/AudioSync.swift` 的 `AudioPacketCodec`、`VideoStream.swift` 的 `VideoStreamRecord` / 编码器与 `LocalConnection.swift` 的接收分支核对（源码基线 `8b10240`）。此前文档中的 40 字节音频头、无序号音频包与缺少数量前缀的 HEVC 头均与该源码不符，此处按当前实现记录；没有借此修改线上的格式。类型 7 的发送布局来自历史提交 `9a20fec`，发送器在 `ff0cd1a` 被移除；当前接收器跳过前 8 字节，不使用其时间戳。
+
+当前 macOS 音频为 48,000 Hz 双声道，优先 AAC-ELD（`formatID=0x61616365`，FourCC `aace`，480 采样/包，即 10 ms），失败回退 AAC-LC（`0x61616320`，FourCC `aac `，1024 采样/包，约 21.33 ms）。编码器取得非空 cookie 后先发一次类型 5，再发类型 6；解码器跳过类型 6 的四字节序号，把余下字节作为一个压缩包解码。
+
+`remote-video` 的 `audio:true` 让辅助进程额外打开独立 `audio` 请求；主机视频采集本身仍禁用音频。音频请求不携带显示器 ID，macOS 为 ScreenCaptureKit 过滤器选择主屏或首个可用屏。辅助进程把两个流的完整记录合并到 stdout，不按跨流时间戳重排；音频流类型 3 错误只结束音频读取，不混入 stdout。当前视频发送类型 2 或 9，不能以缺少类型 7 判断采集失败。实机样例的采集与校验见[协议样例采集](./protocol-capture.md)，本轮尚未生成样例文件。
 
 ### 视频反馈与流控
 
@@ -207,6 +213,67 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
 应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+
+#### Desktop request 与回复 JSON
+
+本机桥接是 UTF-8 行协议：daemon 输出 `Desktop request: <u64十进制编号> <JSON>\n`，应用写回 `desktop-reply <同一编号> <JSON>\n`。编号从 1 开始，用于关联并发请求。请求以 `action`、回复以 `status` 标记；下表描述字段类型，属于格式定义，不是实机采集样例。`?` 表示可省略，Swift 编码器不输出值为 nil 的可选字段。依据 `LocalConnection.swift` 的 `DesktopRequest`、`RemoteReply` 和 `handleDesktopRequest`，以及 `koko-daemon/src/desktop.rs` 的 `AppDesktop`（基线 `8b10240`）。
+
+| `action` | 请求中除 `action` 外的字段 | 应用实际成功回复（除 `status` 外的字段） |
+| --- | --- | --- |
+| `clipboard_read` | `transfer:String` | `status=clipboard_items`，`paths:[String]`（绝对路径，纯文本为空数组），`text:String?`；按 Copy 并等待剪贴板变化 |
+| `clipboard_target` | `transfer:String` | `status=clipboard_folder`，`path:String`（新建接收目录的绝对路径） |
+| `clipboard_publish` | `transfer:String`、`text:String?`、`paths:[String]` | `status=ok`；发布收到的文本或绝对路径并按 Paste |
+| `displays` | 无 | `status=displays`，`host_name:String`、`displays:[Display]`、`clipboard:true`、`video:true`、`clipboard_stream:true`、`outbox:true` |
+| `video` | `display:u32`、`edge:u16`、`quality:u8`、`fps:u16`、`audio:bool?`、`hevc:bool?`、`chroma444:bool?`、`feedback:bool?`、`video_socket:String` | `status=ok`；表示已调度捕获，后续数据或捕获错误经本机通道传输；视频端忽略 `audio`，使用独立音频通道 |
+| `audio` | `video_socket:String` | `status=ok`；表示已调度独立音频捕获，后续错误经该通道传输 |
+| `audio_volume` | `level:u8?`（0–100；省略为读取） | 当前实际仅编码 `status=audio_volume`，见下述已知差异 |
+| `wallpaper` | 无 | `status=image`，`image:String`（Base64 JPEG）、`width:Int`、`height:Int`、`format=jpeg` |
+| `screenshot` | 无 | `status=frame`，`png:String`（主屏 Base64 PNG；边长上限 1600，包含鼠标） |
+| `capture` | `display:u32`、`edge:u16`、`quality:u8`、`format:jpeg\|png?`、`cursor:bool?` | `status=image`，`image:String`（Base64）、`width:Int`、`height:Int`、`format:jpeg\|png`；默认 JPEG、不含鼠标；PNG 忽略 quality |
+| `ui_tree` | `max_nodes:u16`（1–1000） | `status=ui_tree`，`app:String`、`nodes:[UINode]`、`truncated:true?`（false 时省略） |
+| `pointer` | `display:u32`、`events:[PointerEvent]`、`source_os:macos\|windows\|other?` | `status=ok`；Agent 操作也可能回复审批请求，见下文 |
+| `click` | `x:u16`、`y:u16` | `status=ok`；主屏归一化坐标左键点击 |
+| `key` | `key:String` | `status=ok`；支持 enter、escape、tab、backspace、space、up、down、left、right、copy、paste、select_all、undo |
+| `text` | `text:String` | `status=ok`；Agent 操作也可能回复审批请求；网络入口限制非空、无 NUL、至多 2048 个 UTF-8 字节 |
+
+`Display` 含 `id:u32`、`name:String`、`width:Int`、`height:Int`，主屏在前，宽高优先取显示模式的原生像素。`UINode` 必含 `role:String`、`enabled:Bool`、`focused:Bool`、`display:u32`、`x:Int`、`y:Int`、`width:Int`、`height:Int`，另有 `label:String?`、`value:String?`、`parent:Int?`。节点按深度优先展平，parent 是最近保留祖先的数组下标；密码框省略 value，坐标 0–9999，尺寸 1–10000。角色保留 AX 名称；`AXMenuBar` 不输出。Rust 对外重新序列化时省略 `enabled:true` 和 `focused:false`，节点坐标与尺寸类型为无符号整数。
+
+失败回复含 `status=error`、`code:String`；应用会返回 `invalid_command`、`input_permission_required`、`input_failed`、`screen_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed` 及 `ClipboardError` 定义的剪贴板错误。Agent 的 pointer/text 请求增加 `actor=agent`，已获批准重试时才增加 `approved:true`；命中规则的应用回复为 `status=approval_required`、`reason:String`，由 daemon 处理审批，远端最终收到执行结果或 `approval_declined` / `approval_timeout`。
+
+本机回复与远端回复有两处现存差异：Swift `displays` 回复没有 `control`，daemon 丢弃未识别的 `outbox` 字段并加入当前 `control`；Swift `audio_volume` 在内存计算 `level` 和 `muted`，但 `RemoteReply.CodingKeys` 遗漏这两项，实际 JSON 缺字段，Rust 解码失败后返回 `desktop_unavailable`。后者是已发现的实现问题，本轮只记录、不改 Swift，也不把预期字段写成已采集的输出。`remote-stream` 还可能给截图结果添加 `rtt_ms`、`direct`，它们不是 Desktop 回复字段。
+
+`clipboard_pull` / `clipboard_push` 驱动上述三个内部剪贴板动作；hello、disconnect、release_control、request_human、outbox_wait、outbox_pull 由 daemon 处理，不产生对应 Desktop request。
+
+#### Pointer、滚动单位与修饰位
+
+`events` 含 1–32 条按顺序执行的事件，以 `kind` 标记。定位坐标均为从显示器左上角起的 0–9999 归一化值。下表是 Rust 输出到应用的字段；Swift 使用共享结构体解析，动作之外的可选字段不构成必填项。
+
+| `kind` | 其余字段 |
+| --- | --- |
+| `move` | `x:u16`、`y:u16` |
+| `down` | `x:u16`、`y:u16`、`button:String`、`clicks:u8`（1–3） |
+| `up` | `x:u16`、`y:u16`、`button:String` |
+| `scroll` | `x:u16`、`y:u16`、`dx:i16`、`dy:i16`（至少一个非零） |
+| `key_down` | `code:u8`（0–127）、`flags:u8`、`repeat:bool` |
+| `key_up` | `code:u8`（0–127）、`flags:u8` |
+| `release` | 无；释放仍按下的键和按钮 |
+
+按钮为 left、right、middle、back、forward。滚动量为有符号像素单位，保留 AppKit `scrollingDeltaX/Y` 的符号：精确滚动乘 1，普通滚轮乘 12，四舍五入（半值远离零）后饱和到 i16；连续同屏滚动可饱和相加，双零丢弃。主机创建 Core Graphics `.pixel` 双轴滚动事件，`wheel1=dy`、`wheel2=dx`，附带当前按住的修饰键。依据 `RemoteControlView.swift`、`LocalConnection.swift` 的滚动合并及 `DesktopInput.swift`。
+
+键码是 Mac 虚拟键位置。flags 等于设备无关的 Core Graphics 修饰位右移 16 位，允许掩码 `0xbf`：
+
+| 位 | 含义 |
+| --- | --- |
+| `0x01` | Caps Lock |
+| `0x02` | Shift |
+| `0x04` | Control |
+| `0x08` | Option（Windows Alt） |
+| `0x10` | Command（Windows Win） |
+| `0x20` | Numeric Pad |
+| `0x40` | Help；协议拒绝 |
+| `0x80` | Function |
+
+Mac 普通按键使用 `0xbf`，修饰键转换事件使用 `0xbe` 并借设备相关位判断左右键。主机把 flags 左移 16 位用于键盘注入，指针只附加 Shift/Control/Option/Command。Caps Lock 键码 57 的 down 在当前 Mac 主机切换输入法。`source_os=windows` 且主机启用跨系统映射（默认启用）时，主机交换 Control/Command 的标志和左右键码，Option 不变。依据 `RemoteControlView.swift` 的按键编码、`DesktopInput.swift` 的 `windowsShortcut` 及 `koko-proto/src/lib.rs` 的入口校验。
 
 控制端应用为不同用途分别启动 `koko-agent`：`discover` 和 `pair` 各运行一次，`pair` 的目标和验证码通过标准输入传入（目标参数写 `-`，加 `--code-stdin`），避免出现在进程列表里；`remote-stream` 为画面与显示器、键鼠各保持一个进程，按行收发 JSON；`clipboard-pull`、`clipboard-push` 每次复制或粘贴运行一个进程；另有一个 `remote-stream` 进程持续发送 `outbox_wait`，收到批次后用 `outbox-pull` 下载；`remote-video` 每次视频订阅一个进程，把视频记录写到标准输出，并把应用写入标准输入的反馈记录转发给被控端。应用结束订阅时先关闭它的标准输入，让它正常关闭 QUIC 连接，1.5 秒后仍未退出才强制结束；`remote` 用于单次的按键、文本和断开命令。
 
