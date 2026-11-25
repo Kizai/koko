@@ -204,7 +204,7 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 
 交付顺序为 1.1 → 1.2 → 1.3 → 1.4 → 1.6 → 1.7 → 1.5。1.3 复用 0B.5，1.5 复用 0B.6。两项封装仍需按 0.6 的实机样例核对。1.1 与 1.2 的代码及自动测试已交付，编译、Clippy 和单元测试见两项对应的 CI。两项实机结果均为待验证，安装、启动及逐项验收见[显示器、截图、键鼠与生命周期实机验收](./windows-1.2-acceptance.md)。1.3 尚未开始，等待 1.1 和 1.2 实机结果。0B.5 与 0B.6 仍等待 macOS 实机样例。
 
-1.2 的控制台开启跨系统键位映射，可追加 `--no-cross-system-shortcuts` 关闭。人类键鼠请求与采集任务分别处理。仅在确认前台进程完整性高于主机时提前返回`input_failed`。前台窗口为空时允许点击恢复焦点；无法完成完整性比较时由Windows UIPI及SendInput结果判定，实际注入失败仍返回`input_failed`。释放事件不受此前台预检限制。Agent 与已审批 Agent 的注入留到阶段 3 实时策略接入。 [Microsoft SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) · [键盘输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput) · [鼠标输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
+1.2 的控制台开启跨系统键位映射，可追加 `--no-cross-system-shortcuts` 关闭。人类键鼠请求与采集任务分别处理。仅在确认前台进程完整性高于主机时提前返回 `input_failed`。前台窗口为空时允许点击恢复焦点；无法完成完整性比较时由 Windows UIPI 及 SendInput 结果判定，实际注入失败仍返回 `input_failed`。释放事件不受此前台预检限制。Agent 与已审批 Agent 的注入留到阶段 3 实时策略接入。 [Microsoft SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) · [键盘输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput) · [鼠标输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
 
 | 任务 | 内容 | 通过条件 |
 | --- | --- | --- |
@@ -263,7 +263,7 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 
 1. 动手前读 `AGENTS.md` 和 `docs/development.md`，严格遵守其中的验证与文档规则。
 2. **不修改 Swift 代码**。改动共享 Rust 代码（`koko-proto`、`koko-p2p`、`koko-daemon`、`koko-agent`）时，必须保证 macOS 行为不变，并在 macOS 和 Windows 两个平台的 CI 上都通过。
-3. 提交信息与PR标题遵循[开发规则](./development.md#提交信息与pr约定)，方案编号放在正文末行。0.7 生命周期文档随 0.5 一并交付（#7），原独立 PR #8 已关闭。PR 描述写明目标、改动、自动化验收结果，以及**仍需实机验证的场景**。
+3. 提交信息与 PR 标题遵循[开发规则](./development.md#提交信息与-pr-约定)，方案编号放在正文末行。0.7 生命周期文档随 0.5 一并交付（#7），原独立 PR #8 已关闭。PR 描述写明目标、改动、自动化验收结果，以及**仍需实机验证的场景**。
 4. 协议格式以 `docs/architecture.md` 为准。发现 Swift 实现与文档不一致时，先在 PR 里指出，不要自行选择其中一方。
 5. 任何新增错误码、新增命令字段或数据目录的变化，都属于接口变更，需要先说明影响、经用户同意后再实现，并同步更新文档。
 6. 每个阶段结束时更新本文的状态，并在 `docs/README.md` 的索引中保持本文可以找到。
@@ -275,7 +275,7 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 | --- | --- |
 | 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
 | 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3 已交付可移植键位映射。0B.4 已交付双向滚动量换算，方向待阶段 1 实机复核。0B.7 已交付可移植 UI 树映射，UI Automation 接入留到阶段 3。0B.8 已交付可移植高危规则判定，实机审批留到阶段 3。0B.5、0B.6 等待 Mac 实机样例 |
-| 1 Windows被控端 | 1.1与1.2的显示器、截图及键鼠代码已交付，实机待验证。见[联合验收清单](./windows-1.2-acceptance.md)。1.3等待实机结果。 |
+| 1 Windows 被控端 | 1.1 与 1.2 的显示器、截图及键鼠代码已交付，实机待验证。见[联合验收清单](./windows-1.2-acceptance.md)。1.3 等待实机结果。 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
 
