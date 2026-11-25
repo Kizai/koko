@@ -2,16 +2,17 @@
 use super::windows_command::append_argument;
 use crate::{Event, parse_frame};
 use std::{
-    ffi::{OsStr, c_void},
+    env,
+    ffi::{OsStr, OsString, c_void},
     fs::File,
     io::{self, BufRead, BufReader, Write},
     net::SocketAddr,
     os::windows::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         io::{AsRawHandle, FromRawHandle, OwnedHandle},
         process::ExitStatusExt,
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitStatus,
     thread,
     time::Duration,
@@ -23,7 +24,12 @@ use tokio::{
 use windows::{
     Win32::{
         Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0},
-        System::{JobObjects::*, Pipes::CreatePipe, Threading::*},
+        System::{
+            JobObjects::*,
+            Pipes::CreatePipe,
+            SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW},
+            Threading::*,
+        },
     },
     core::{PCWSTR, PWSTR},
 };
@@ -67,7 +73,7 @@ pub(super) fn spawn(
     name: &str,
     events: mpsc::Sender<io::Result<Event>>,
 ) -> io::Result<(Child, ChildStdin)> {
-    let executable = std::path::absolute(executable)?;
+    let executable = resolve_executable(executable)?;
     let mut application: Vec<u16> = executable.as_os_str().encode_wide().collect();
     let mut command = Vec::new();
     let bind = bind.to_string();
@@ -144,6 +150,62 @@ pub(super) fn spawn(
             let _ = terminated.send(wait(&process));
         })?;
     Ok((Child { job, exit }, ChildStdin(writer)))
+}
+
+fn resolve_executable(program: &Path) -> io::Result<PathBuf> {
+    let name = program.as_os_str();
+    let bytes = name.as_encoded_bytes();
+    if bytes.is_empty() || bytes.contains(&0) || bytes.ends_with(b"\\") || bytes.ends_with(b"/") {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let has_exe_suffix = program
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if bytes.iter().any(|byte| matches!(byte, b'/' | b'\\' | b':')) {
+        let path = std::path::absolute(program)?;
+        if !has_exe_suffix {
+            let mut suffixed = path.as_os_str().to_os_string();
+            suffixed.push(".exe");
+            let candidate = PathBuf::from(suffixed);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+        return Ok(path);
+    }
+
+    let mut filename = name.to_os_string();
+    if !bytes.contains(&b'.') {
+        filename.push(".exe");
+    }
+
+    // Follow Command's Windows search order. In particular a bare name does
+    // not make the current directory an implicit lookup location.
+    let application_dir = env::current_exe()
+        .ok()
+        .and_then(|mut path| path.pop().then_some(path));
+    let system_dir = windows_directory(|buf| unsafe { GetSystemDirectoryW(buf) });
+    let windows_dir = windows_directory(|buf| unsafe { GetWindowsDirectoryW(buf) });
+    let path = env::var_os("PATH").unwrap_or_default();
+    let candidate = [application_dir, system_dir, windows_dir]
+        .into_iter()
+        .flatten()
+        .chain(env::split_paths(&path))
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(&filename))
+        .find(|path| path.is_file())
+        .ok_or(io::ErrorKind::NotFound)?;
+    std::path::absolute(candidate)
+}
+
+fn windows_directory(directory: impl Fn(Option<&mut [u16]>) -> u32) -> Option<PathBuf> {
+    let capacity = directory(None);
+    if capacity == 0 {
+        return None;
+    }
+    let mut buffer = vec![0; capacity as usize];
+    let len = directory(Some(&mut buffer)) as usize;
+    (len != 0 && len < buffer.len()).then(|| PathBuf::from(OsString::from_wide(&buffer[..len])))
 }
 
 struct Created {
