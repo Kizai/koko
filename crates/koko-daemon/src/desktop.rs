@@ -714,6 +714,8 @@ async fn send_items(
 /// Passes a controller's frame acknowledgements and key-frame requests to the app. Only
 /// well-formed feedback records are passed on; the first malformed one ends the relay, which
 /// leaves the video itself running.
+// Windows 的视频通道在 windows-plan 0.5 实现，届时移除此属性。
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn relay_feedback(mut input: impl AsyncRead + Unpin, output: &mut (impl AsyncWrite + Unpin)) {
     let mut record = [0u8; 9];
     loop {
