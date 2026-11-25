@@ -147,7 +147,7 @@ Windows 实机的要求：x64 处理器，带独立显卡或 Intel 核显，接�
 
 #### 0.7 Windows 子进程生命周期约定
 
-本节只确定阶段 1 被控端和阶段 2 应用外壳的实现约定；当前 PR 不增加进程管理代码。
+阶段 0.7 确定阶段 1 被控端和阶段 2 应用外壳的实现约定。
 
 外壳启动 `koko-daemon.exe`、`koko-agent.exe` 时使用 `CREATE_NO_WINDOW`，标准输入、输出和错误仍通过各自的重定向管道连接。该标志用于控制台程序，不能与 `CREATE_NEW_CONSOLE` 或 `DETACHED_PROCESS` 混用；隐藏控制台不负责进程回收。[Microsoft：进程创建标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags)
 
@@ -198,9 +198,11 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 
 ### 阶段 1：Windows 被控端执行器（Mac 作为控制端验收）
 
-需要 Windows 实机。在阶段 0B 建好的 `crates/koko-host-windows` 上增加 Windows 桌面后端和可执行入口 `koko-host`。它启动 `koko-daemon serve-pair ... --app-desktop <设备名>`，按[应用与辅助进程的接口](./architecture.md#应用与辅助进程的接口)读写行协议，逻辑对应 `LocalConnection.swift` 的被控端部分。本阶段的审批交互用控制台完成：打印连接码，输入 `approve` / `decline`。平台实现放进 `koko-capture` 和 `koko-input` 的 `#[cfg(windows)]` 模块，macOS 的现有代码不动。
+需要 Windows 实机。在阶段 0B 建好的 `crates/koko-host-windows` 上增加 Windows 桌面后端和可执行入口 `koko-host`。它启动 `koko-daemon serve-pair ... --app-desktop <设备名>`，按[应用与辅助进程的接口](./architecture.md#应用与辅助进程的接口)读写行协议，逻辑对应 `LocalConnection.swift` 的被控端部分。控制台打印连接码，并以 `approve <编号>` 或 `decline <编号>` 回应指定请求，避免过期输入影响后续请求。平台实现放进 `koko-capture` 和 `koko-input` 的 `#[cfg(windows)]` 模块，macOS 的现有代码不动。
 
 进程需要声明 Per-Monitor DPI Aware V2，所有坐标按物理像素和显示器矩形换算。
+
+交付顺序为 1.1 → 1.2 → 1.3 → 1.4 → 1.6 → 1.7 → 1.5。1.3 复用 0B.5，1.5 复用 0B.6。两项封装仍需按 0.6 的实机样例核对。1.1 的启动方法和记录表见[显示器、截图与生命周期实机验收](./windows-1.1-acceptance.md)。
 
 | 任务 | 内容 | 通过条件 |
 | --- | --- | --- |
@@ -271,7 +273,7 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 | --- | --- |
 | 0 工作区跨平台化 | 本轮代码与文档交付已完成，仅 0.6 的 Mac 实机样例及相应测试待补。Windows 实机验收纳入阶段 1。 |
 | 0B 可脱离实机的平台逻辑 | 0.6 采集脚本 #10 已合入。0B.1 已合入，0B.2 已交付。0B.3 已交付可移植键位映射。0B.4 已交付双向滚动量换算，方向待阶段 1 实机复核。0B.7 已交付可移植 UI 树映射，UI Automation 接入留到阶段 3。0B.8 已交付可移植高危规则判定，实机审批留到阶段 3。0B.5、0B.6 等待 Mac 实机样例 |
-| 1 Windows 被控端 | 等待 Windows 实机。准备步骤见[阶段 1 Windows 实机准备](#阶段-1-windows-实机准备) |
+| 1 Windows 被控端 | 1.1 已接入 Windows 主机控制台和只读桌面后端，实机待验证。见[1.1 验收清单](./windows-1.1-acceptance.md)。 |
 | 2 Windows 应用与控制端 | 未开始 |
 | 3 Agent 能力对齐 | 未开始 |
 

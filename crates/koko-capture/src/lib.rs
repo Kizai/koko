@@ -19,3 +19,9 @@ pub fn check_screen_recording_permission(request: bool) -> bool {
         CGPreflightScreenCaptureAccess()
     }
 }
+
+#[cfg(any(windows, test))]
+mod image_geometry;
+
+#[cfg(windows)]
+pub mod windows;
