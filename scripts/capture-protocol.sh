@@ -2,5 +2,4 @@
 set +x
 set -euo pipefail
 umask 077
-cd "$(dirname "$0")/.."
-exec python3 -B scripts/capture_session.py "$@"
+exec python3 -B "$(dirname "$0")/capture_session.py" "$@"

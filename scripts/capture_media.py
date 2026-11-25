@@ -4,10 +4,11 @@ import json
 import struct
 
 
-def inspect_stream(source, audio, feedback):
+def inspect_stream(source, audio, feedback, observe=None):
     counts = Counter()
     info = {}
     next_packet = None
+    next_frame = None
     audio_format = None
     early_packets = 0
     while True:
@@ -46,6 +47,15 @@ def inspect_stream(source, audio, feedback):
                     raise ValueError("missing encoder metadata")
                 info = {key: values[key] for key in ("encoder", "capture", "bitrate")}
         elif kind == 1 or kind in (2, 9):
+            if kind in (2, 9) and not counts[1]:
+                raise ValueError("video frame before format")
+            if kind == 9:
+                if len(payload) < 5 or payload[4] not in (0, 1):
+                    raise ValueError("invalid video flags")
+                sequence = int.from_bytes(payload[:4], "big")
+                if next_frame is not None and sequence != next_frame:
+                    raise ValueError("invalid video sequence")
+                next_frame = (sequence + 1) % (1 << 32)
             units = payload[5:] if kind == 9 else payload
             n = 0
             while units:
@@ -58,6 +68,8 @@ def inspect_stream(source, audio, feedback):
                 raise ValueError("invalid video format or frame")
         elif kind != 4 or len(payload) != 9:
             raise ValueError("unexpected record in H.264 capture")
+        if observe is not None:
+            observe(kind, header, record)
         counts[kind] += 1
         if kind in (5, 6):
             audio.write(header + record)

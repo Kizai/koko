@@ -1,7 +1,9 @@
 """Run a GUI-approved localhost capture and publish only a verified archive."""
 import argparse
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -68,23 +70,76 @@ def test_app(executable, state, env):
         try:
             yield proc
         finally:
+            # Retire the whole private bundle: macOS can deny renaming a running
+            # Mach-O inside an app. The pending open -n URL now has no launch target.
+            marker = state / "cleanup-incomplete"
+            marker.touch()
+            bundle = executable.parents[2]
+            retired = state / "retired-bundle"
+            bundle.rename(retired)
             (state / "stop-bridge").touch()
-            deadline = time.monotonic() + 8
-            while (state / "bridge-running").exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            for pid in app_pids(executable):
-                if pid != proc.pid:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+            daemon = executable.parents[1] / "Helpers/koko-daemon-real"
+            paths = (executable, retired / executable.relative_to(bundle),
+                     daemon, retired / daemon.relative_to(bundle))
+            stop_owned_processes(paths, proc, state)
+            marker.unlink()
 
 
-def wait_for(state, name, app, seconds):
+def active_bridge(state):
+    for path in state.glob("bridge-*/owner.lock"):
+        with path.open("rb") as owner:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+    return False
+
+
+def relaunch_pids(bundle):
+    # PermissionRelaunch.schedule uses these exact trailing argv for its shell and open.
+    url = re.escape(str(bundle))
+    pattern = (r" koko-reopen [0-9]+ " + url + r" --review-desktop-permissions$|"
+               r"^(/usr/bin/)?open -n " + url + r" --args --review-desktop-permissions$")
+    result = subprocess.run(["/usr/bin/pgrep", "-f", pattern], capture_output=True)
+    if result.returncode not in (0, 1):
+        raise CaptureError("Could not verify the private permission relaunch process.")
+    return {int(pid) for pid in result.stdout.splitlines()}
+
+
+def stop_owned_processes(executables, initial, state):
+    start = time.monotonic()
+    quiet_since = None
+    while time.monotonic() - start < 40:
+        initial.poll()  # Reap our own child so ps does not report a zombie.
+        pids = {pid for executable in executables for pid in app_pids(executable)}
+        pids.update(relaunch_pids(executables[0].parents[2]))
+        if initial.poll() is None:
+            pids.add(initial.pid)
+        if pids:
+            quiet_since = None
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM if time.monotonic() - start < 3 else signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        elif active_bridge(state):
+            quiet_since = None
+        else:
+            quiet_since = quiet_since or time.monotonic()
+            if time.monotonic() - quiet_since >= 1:
+                return
+        time.sleep(0.1)
+    raise CaptureError("Private capture processes did not exit.")
+
+
+def wait_for(state, name, app, seconds, instance=None):
     deadline = time.monotonic() + seconds
     missing_since = None
     while time.monotonic() < deadline:
-        if (state / "bridge-error").exists():
+        current = (state / "current").resolve()
+        if instance is not None and (instance != current or not (instance / "running").exists()):
+            raise CaptureError("Test daemon restarted during capture; rerun after permission setup.")
+        if (current / "failed").exists():
             raise CaptureError("Capture bridge stopped. Check the private output space and remove visible credentials from the test desktop.")
         if app.poll() is not None and not app_pids(app.args[0]):
             missing_since = missing_since or time.monotonic()
@@ -93,8 +148,8 @@ def wait_for(state, name, app, seconds):
             time.sleep(0.2)
             continue
         missing_since = None
-        if (state / name).exists():
-            return
+        if (current / "running").exists() and (current / name).exists():
+            return current
         time.sleep(0.1)
     raise CaptureError("Timed out waiting for " + name + ". Check sharing, permissions, and the GUI approval prompt.")
 
@@ -159,8 +214,8 @@ def run_session(state, output, source_dirty):
         raise ValueError("unexpected host public identity")
     with test_app(app / "Contents/MacOS" / plist["CFBundleExecutable"], state, env) as gui:
         print("请在测试 App 中授予权限、开启共享；看到 Protocol Capture 配对请求时点击仅允许本次。", flush=True)
-        wait_for(state, "listener.json", gui, 300)
-        listener = json.loads((state / "listener.json").read_bytes())
+        instance = wait_for(state, "listener.json", gui, 300)
+        listener = json.loads((instance / "listener.json").read_bytes())
         address = listener["address"]
         key = state / "controller.key"
         paired = json.loads(run([agent, "pair", key, "-", "--known", f"{host}/{address}",
@@ -168,18 +223,21 @@ def run_session(state, output, source_dirty):
                                 data=(listener["device_id"] + "\n").encode()))
         if paired.get("host_id") != host or paired.get("status") != "paired":
             raise ValueError("local GUI pairing failed")
-        wait_for(state, "approved", gui, 30)
+        wait_for(state, "approved", gui, 30, instance)
         print("请隐藏 Koko 的连接码窗口并切换到专用测试窗口。15 秒后开始记录画面和测试声音。", flush=True)
         time.sleep(15)
         target = [key, host, address]
         cli = []
         settings = []
+        expected_exchanges = []
         def remote(action, expected):
             result = run([agent, "remote-stream", *target], env=env,
                          data=json.dumps(action).encode() + b'\n')
             reply = json.loads(result)
             if reply.get("status") != expected:
                 raise CaptureError("Desktop request failed: " + action["action"] + ". Check the test app permissions.")
+            if action["action"] != "disconnect":
+                expected_exchanges.append((action, expected))
             cli.append(result)
             return reply
 
@@ -197,45 +255,108 @@ def run_session(state, output, source_dirty):
             settings.append(request)
             print("Recording H.264 and system audio, feedback " + label + "…", flush=True)
             video = folder / f"video-feedback-{label}.bin"
-            start = time.monotonic()
-            with video.open("xb") as stream, owned([agent, "remote-video", *target,
-                    json.dumps(request)], stdin=subprocess.PIPE, stdout=stream, env=env) as recorder:
-                for _ in range(4):
-                    time.sleep(2)
-                    run(["/usr/bin/afplay", "/System/Library/Sounds/Glass.aiff"], timeout=8)
-                    if recorder.poll() is not None:
-                        raise ValueError("media stream ended early")
-                recorder.stdin.close()
-                if recorder.wait(15) != 0:
-                    raise ValueError("recording failed")
-            with video.open("rb") as source, (folder / f"audio-feedback-{label}.bin").open("xb") as audio:
-                try:
-                    reports[label] = inspect_stream(source, audio, feedback)
-                except ValueError:
-                    raise CaptureError("Incomplete or invalid media in feedback-" + label +
-                                       " capture. Check screen recording and system audio availability.") from None
-            reports[label]["elapsed_seconds"] = round(time.monotonic() - start, 2)
+            expected_exchanges.extend([(request, "ok"), ({"action": "audio"}, "ok")])
+            audio_path = folder / f"audio-feedback-{label}.bin"
+            reports[label] = record_media([agent, "remote-video", *target, json.dumps(request)],
+                                          video, audio_path, feedback, env)
         remote({"action": "disconnect"}, "ok")
         (folder / "desktop.cli.jsonl").write_bytes(b"".join(cli))
         for name in ("requests.jsonl", "replies.jsonl"):
             shutil.copyfile(state / name, folder / name)
         requests = desktop_lines(folder / "requests.jsonl", b"Desktop request: ")
         replies = desktop_lines(folder / "replies.jsonl", b"desktop-reply ")
-        if requests.keys() != replies.keys():
-            raise ValueError("incomplete desktop exchanges")
-        for action in ("video", "audio"):
-            matched = [n for n, req in requests.items() if req.get("action") == action]
-            if len(matched) < 2 or any(replies[n].get("status") != "ok" for n in matched):
-                raise ValueError("missing media handshake")
+        verify_exchanges(requests, replies, expected_exchanges)
         meta = dict(commit=run(["git", "-C", ROOT, "rev-parse", "HEAD"]).decode().strip(),
                     source_dirty=source_dirty, macos=platform.mac_ver()[0], app_version=plist["CFBundleShortVersionString"],
                     utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), displays=displays,
                     requests=settings, media=reports)
         (folder / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
         def verify():
-            (state / "scan-request").touch()
-            wait_for(state, "scan-complete", gui, 60)
+            (instance / "scan-request").touch()
+            wait_for(state, "scan-complete", gui, 60, instance)
         package(folder, output, verify)
+
+
+def verify_audio_windows(arrivals, windows):
+    counts = [sum(begin <= packet <= end for packet in arrivals) for begin, end in windows]
+    if not counts or not all(counts):
+        raise CaptureError("Audio stopped during a test sound. Check system audio capture.")
+    return counts
+
+
+def record_media(command, video_path, audio_path, feedback, env):
+    start = time.monotonic()
+    arrivals = []
+    video_first = None
+    video_last = None
+    windows = []
+    with video_path.open("xb") as video, audio_path.open("xb") as audio:
+        def record(kind, header, body):
+            nonlocal video_first, video_last
+            observed = time.monotonic() - start
+            if kind == 6:
+                arrivals.append(observed)
+            elif kind in (2, 9):
+                if video_first is None:
+                    video_first = observed
+                video_last = observed
+            video.write(header)
+            video.write(body)
+
+        # Closing the process before joining the reader guarantees EOF on cancellation.
+        with ThreadPoolExecutor(max_workers=1) as reader, owned(command, env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE) as recorder:
+            result = reader.submit(inspect_stream, recorder.stdout, audio, feedback, record)
+            try:
+                for _ in range(4):
+                    time.sleep(2)
+                    if result.done():
+                        raise CaptureError("Media stream ended before the recording window.")
+                    begin = time.monotonic() - start
+                    run(["/usr/bin/afplay", "/System/Library/Sounds/Glass.aiff"], timeout=8)
+                    time.sleep(0.4)  # Allow encoded audio from the last playback buffer to arrive.
+                    windows.append((begin, time.monotonic() - start))
+                recorder.stdin.close()
+                if recorder.wait(15) != 0:
+                    raise CaptureError("Media recorder failed.")
+                report = result.result(timeout=10)
+            except ValueError:
+                raise CaptureError("Invalid or incomplete H.264 or system audio recording.") from None
+    report["elapsed_seconds"] = round(time.monotonic() - start, 2)
+    report["video_first_last_seconds"] = [video_first, video_last]
+    report["playback_windows_seconds"] = windows
+    report["audio_packets_per_window"] = verify_audio_windows(arrivals, windows)
+    return report
+
+
+def verify_exchanges(requests, replies, expected):
+    if requests.keys() != replies.keys():
+        raise CaptureError("Incomplete desktop exchanges.")
+    unused = list(requests)
+    for wanted, status in expected:
+        for number in unused:
+            request, reply = requests[number], replies[number]
+            # Rust omits false feedback/hevc flags when serializing the host request.
+            if not all(request.get(key, False if key in ("hevc", "feedback") else None) == value
+                       for key, value in wanted.items()):
+                continue
+            if reply.get("status") != status:
+                continue
+            if wanted["action"] in ("video", "audio") and not request.get("video_socket"):
+                continue
+            if status == "image" and (reply.get("format") != wanted.get("format", "jpeg")
+                                      or not reply.get("image")):
+                continue
+            if status == "frame" and not reply.get("png"):
+                continue
+            if status == "displays" and not reply.get("displays"):
+                continue
+            if status == "ui_tree" and not isinstance(reply.get("nodes"), list):
+                continue
+            unused.remove(number)
+            break
+        else:
+            raise CaptureError("Missing required raw desktop exchange: " + wanted["action"])
 
 
 def desktop_lines(path, prefix):
@@ -281,8 +402,19 @@ def main():
                     os.killpg(build.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-    with tempfile.TemporaryDirectory(prefix="koko-capture-") as tmp:
-        run_session(Path(tmp).resolve(), args.output.resolve(), source_dirty)
+    state = Path(tempfile.mkdtemp(prefix="koko-capture-")).resolve()
+    try:
+        destination = args.output.resolve()
+        with tempfile.TemporaryDirectory(dir=destination.parent) as staging:
+            pending = Path(staging) / "verified.tar.gz"
+            run_session(state, pending, source_dirty)
+            # Publication follows confirmed GUI, wrapper and daemon termination.
+            os.link(pending, destination)
+    finally:
+        if (state / "cleanup-incomplete").exists():
+            print("Process cleanup could not be verified; private state retained at", state, file=sys.stderr)
+        else:
+            shutil.rmtree(state)
     print("Archive:", args.output)
 
 
