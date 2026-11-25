@@ -12,4 +12,4 @@ pub use protocol::{DesktopRequest, Event, Origin, PairDetails, Secret, parse_fra
 #[cfg(windows)]
 mod windows_backend;
 #[cfg(windows)]
-pub use windows_backend::WindowsDesktopBackend;
+pub use windows_backend::{WindowsDesktopBackend, WindowsDesktopInput};

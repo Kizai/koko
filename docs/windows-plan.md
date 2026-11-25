@@ -202,7 +202,9 @@ Windows 控制端按 Set 1 make 和 E0 区分主回车与小键盘回车、独�
 
 进程需要声明 Per-Monitor DPI Aware V2，所有坐标按物理像素和显示器矩形换算。
 
-交付顺序为 1.1 → 1.2 → 1.3 → 1.4 → 1.6 → 1.7 → 1.5。1.3 复用 0B.5，1.5 复用 0B.6。两项封装仍需按 0.6 的实机样例核对。1.1 的启动方法和记录表见[显示器、截图与生命周期实机验收](./windows-1.1-acceptance.md)。
+交付顺序为 1.1 → 1.2 → 1.3 → 1.4 → 1.6 → 1.7 → 1.5。1.3 复用 0B.5，1.5 复用 0B.6。两项封装仍需按 0.6 的实机样例核对。1.1 与 1.2 的代码及自动测试已交付，编译、Clippy 和单元测试见两项对应的 CI。两项实机结果均为待验证，安装、启动及逐项验收见[显示器、截图、键鼠与生命周期实机验收](./windows-1.2-acceptance.md)。1.3 尚未开始，等待 1.1 和 1.2 实机结果。0B.5 与 0B.6 仍等待 macOS 实机样例。
+
+1.2 的控制台开启跨系统键位映射，可追加 `--no-cross-system-shortcuts` 关闭。人类键鼠请求与采集任务分别处理。前台完整性高于主机或无法查询时返回 `input_failed`；释放事件不受此前台预检限制。Agent 与已审批 Agent 的注入留到阶段 3 实时策略接入。 [Microsoft SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput) · [键盘输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput) · [鼠标输入记录](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
 
 | 任务 | 内容 | 通过条件 |
 | --- | --- | --- |

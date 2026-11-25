@@ -1,6 +1,6 @@
 # Windows 1.1 显示器、截图与生命周期实机验收
 
-[返回文档目录](./README.md) · [Windows 兼容开发方案](./windows-plan.md)
+[返回文档目录](./README.md) · [Windows 兼容开发方案](./windows-plan.md) · [1.1 和 1.2 从安装到实机验收](./windows-1.2-acceptance.md)
 
 **状态：待验证。** 本页由实机操作者填写。CI 的 WIC 合成像素测试、进程 Job 测试和行协议测试分别检查编码、子进程和协议，实机结果见下表。
 

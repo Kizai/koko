@@ -1,7 +1,11 @@
-use crate::{DesktopBackend, DesktopRequest};
+use crate::{DesktopBackend, DesktopRequest, Origin};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use koko_capture::windows::{self as capture, CaptureError, Image};
-use koko_proto::{ImageFormat, RemoteCommand, RemoteReply};
+use koko_input::{
+    keyboard::KeyboardSource,
+    windows::{Geometry, InputError, WindowsInput},
+};
+use koko_proto::{ImageFormat, KeyboardPlatform, RemoteCommand, RemoteReply};
 
 pub struct WindowsDesktopBackend {
     name: String,
@@ -53,8 +57,72 @@ impl DesktopBackend for WindowsDesktopBackend {
                 cursor.unwrap_or(false),
             )),
             Wallpaper => image_reply(capture::wallpaper()),
-            // Phase 1.1 implements viewing only, for every authorized peer.
             _ => RemoteReply::error("desktop_unavailable"),
+        }
+    }
+}
+
+/// Input is ordered on the console event loop, independently of desktop capture.
+pub struct WindowsDesktopInput(WindowsInput);
+
+impl WindowsDesktopInput {
+    pub fn new(cross_system_shortcuts: bool) -> Self {
+        Self(WindowsInput::new(cross_system_shortcuts))
+    }
+
+    pub fn release(&mut self) {
+        let _ = input_reply(self.0.release());
+    }
+}
+
+impl DesktopBackend for WindowsDesktopInput {
+    fn handle(&mut self, request: &DesktopRequest) -> RemoteReply {
+        // Phase 3 will apply live agent policy at this boundary. Even already
+        // approved agent metadata cannot authorize input in phase 1.2.
+        if !matches!(request.origin, Origin::Person) {
+            return RemoteReply::error("input_failed");
+        }
+        use RemoteCommand::*;
+        let result = match &request.command {
+            Pointer {
+                display,
+                events,
+                source_os,
+            } => self.0.pointer(
+                || input_geometry(Some(*display)),
+                match source_os {
+                    Some(KeyboardPlatform::Macos) => KeyboardSource::MacOs,
+                    Some(KeyboardPlatform::Windows) => KeyboardSource::Windows,
+                    _ => KeyboardSource::Other,
+                },
+                events,
+            ),
+            Click { x, y } => self.0.click(input_geometry(None), (*x, *y)),
+            Key { key } => self.0.key(*key),
+            Text { text } => self.0.text(text),
+            _ => return RemoteReply::error("desktop_unavailable"),
+        };
+        input_reply(result)
+    }
+}
+
+fn input_geometry(display: Option<u32>) -> Option<Geometry> {
+    match capture::input_geometry(display) {
+        Ok(bounds) => bounds.map(|(monitor, desktop)| Geometry { monitor, desktop }),
+        Err(error) => {
+            eprintln!("Could not resolve Windows input display: {error}");
+            None
+        }
+    }
+}
+
+fn input_reply(result: Result<(), InputError>) -> RemoteReply {
+    match result {
+        Ok(()) => RemoteReply::Ok,
+        Err(InputError::DisplayUnavailable) => RemoteReply::error("display_unavailable"),
+        Err(InputError::Failed(message)) => {
+            eprintln!("{message}");
+            RemoteReply::error("input_failed")
         }
     }
 }

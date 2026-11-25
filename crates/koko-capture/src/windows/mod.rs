@@ -4,9 +4,11 @@ mod frame;
 mod image;
 
 use self::displays::{Monitor, monitors};
+use koko_input::coordinates::PhysicalRect;
 use koko_proto::{ImageFormat, RemoteDisplay};
 use windows::{
     Win32::{
+        Foundation::RECT,
         System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize},
         UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
     },
@@ -47,6 +49,40 @@ pub fn displays() -> windows::core::Result<Vec<RemoteDisplay>> {
         .into_iter()
         .map(|monitor| monitor.display)
         .collect())
+}
+
+/// Resolve the stable monitor ID and virtual desktop from the same topology snapshot.
+pub fn input_geometry(
+    display: Option<u32>,
+) -> windows::core::Result<Option<(PhysicalRect, PhysicalRect)>> {
+    let monitors = monitors()?;
+    let Some(target) = monitors
+        .iter()
+        .find(|monitor| display.map_or(monitor.primary, |id| id == monitor.display.id))
+    else {
+        return Ok(None);
+    };
+    let bounds = monitors
+        .iter()
+        .fold(target.bounds, |desktop, monitor| RECT {
+            left: desktop.left.min(monitor.bounds.left),
+            top: desktop.top.min(monitor.bounds.top),
+            right: desktop.right.max(monitor.bounds.right),
+            bottom: desktop.bottom.max(monitor.bounds.bottom),
+        });
+    let monitor = PhysicalRect::new(
+        target.bounds.left,
+        target.bounds.top,
+        target.display.width,
+        target.display.height,
+    );
+    let desktop = PhysicalRect::new(
+        bounds.left,
+        bounds.top,
+        bounds.right.abs_diff(bounds.left),
+        bounds.bottom.abs_diff(bounds.top),
+    );
+    Ok(monitor.zip(desktop))
 }
 
 pub fn capture(
