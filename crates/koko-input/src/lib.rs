@@ -1,1 +1,3 @@
-//! Reserved for cross-platform keyboard and mouse input. macOS input is posted by the Swift app.
+//! Cross-platform input support. macOS input is posted by the Swift app.
+
+pub mod coordinates;
