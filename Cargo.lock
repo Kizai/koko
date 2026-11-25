@@ -1448,6 +1448,10 @@ dependencies = [
 [[package]]
 name = "koko-capture"
 version = "0.1.25"
+dependencies = [
+ "koko-input",
+ "koko-proto",
+]
 
 [[package]]
 name = "koko-daemon"

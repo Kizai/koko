@@ -38,8 +38,8 @@ flowchart LR
 | `koko-desktop` | `apps/koko-macos/desktop/` | 不经图形版、单独运行 daemon 时使用的 Swift 辅助程序，只处理主屏 PNG、比例坐标点击、常用按键和文本。 |
 | `koko-proto` | `crates/koko-proto` | ALPN 常量、远控命令与回复类型、请求校验和大小上限。 |
 | `koko-p2p` | `crates/koko-p2p` | 设备密钥持久化、iroh 端点、设备 ID、验证码证明、直连邀请、mDNS 发现和远控客户端。 |
-| `koko-capture` | `crates/koko-capture` | macOS 录屏权限探测，供 `koko-daemon screen-permission` 在找不到 `koko-desktop` 时使用。 |
-| `koko-input` | `crates/koko-input` | 空 crate，预留给后续跨平台键鼠实现。macOS 键鼠由 Swift 投递。 |
+| `koko-capture` | `crates/koko-capture` | macOS 录屏权限探测，供 `koko-daemon screen-permission` 在找不到 `koko-desktop` 时使用。另提供可移植的 Windows UI 树快照到协议节点的转换。 |
+| `koko-input` | `crates/koko-input` | 提供可移植的坐标换算、键位映射和滚动量换算。macOS 键鼠由 Swift 投递，Windows 原生输入注入留到阶段 1。 |
 
 设备私钥是 32 字节文件，保存在 `~/.koko/host.key`、`~/.koko/controller.key` 和 Agent 默认使用的 `~/.koko/agent.key`。被控端的信任列表保存在 `~/.koko/trusted-controllers.json`，每条记录包含公钥、类型（`human` 或 `agent`）、作用域、名称和批准时间，仅图形版模式（`--app-desktop`）读写。0.1.20 及更早版本的 `trusted-controllers` 每行一个人类控制端公钥，daemon 启动时迁移为新格式并删除旧文件。Agent 的设备注册表与身份文件同目录，默认是 `~/.koko/agent-hosts.json`。
 
@@ -402,8 +402,8 @@ koko/
 ├── crates/
 │   ├── koko-proto/      # ALPN、远控命令与回复、请求校验
 │   ├── koko-p2p/        # 设备身份、iroh 端点、配对、mDNS 发现、远控客户端
-│   ├── koko-capture/    # macOS 录屏权限探测
-│   ├── koko-input/      # 预留，暂无代码
+│   ├── koko-capture/    # macOS 录屏权限探测与可移植 UI 树转换
+│   ├── koko-input/      # 可移植坐标换算、键位映射和滚动量换算
 │   ├── koko-daemon/     # 被控端配对、授权与请求转发
 │   └── koko-agent/      # 控制端 CLI
 ├── scripts/             # macOS 构建、打包、更新附件与桌面回归测试

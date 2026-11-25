@@ -21,6 +21,7 @@ blake3 = "1"
 if-addrs = "0.15"
 iroh = { version = "1.5.0", default-features = false, features = ["tls-ring"] }
 koko-capture = { path = "crates/koko-capture" }
+koko-input = { path = "crates/koko-input" }
 koko-p2p = { path = "crates/koko-p2p" }
 koko-proto = { path = "crates/koko-proto" }
 mdns-sd = { version = "0.22", default-features = false, features = ["async"] }
