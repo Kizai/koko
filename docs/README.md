@@ -9,6 +9,7 @@
 | Agent 身份、截图识别、远程操作、人工接管与 MCP 工具 | [Agent 与 MCP 设计规范](./agent.md) |
 | 当前要交付什么、按什么顺序验收 | [Phase 1 实现计划](./implementation.md) |
 | 如何设计、实现和评审改动 | [开发规则](./development.md) |
+| Windows 兼容的现状评估、方案选择与分阶段计划 | [Windows 兼容开发方案](./windows-plan.md) |
 
 ## 临时笔记
 
