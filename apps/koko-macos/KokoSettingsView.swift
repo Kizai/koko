@@ -10,6 +10,7 @@ struct KokoSettingsView: View {
     @AppStorage("defaultFrameRate") private var defaultFrameRate = 60
     @AppStorage("downloadDirectory") private var downloadDirectory = defaultDownloadDirectory
     @AppStorage("forwardPhysicalKeyboard") private var forwardPhysicalKeyboard = true
+    @AppStorage(SystemShortcutCapture.settingKey) private var forwardSystemShortcuts = true
     @ViewState private var section = Section.general
     @ViewState private var listenPort = ""
     @ViewState private var showForget = false
@@ -163,6 +164,15 @@ struct KokoSettingsView: View {
                     }
                 case .keyboard:
                     Toggle("转发实体键盘", isOn: $forwardPhysicalKeyboard)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("系统快捷键发送到远程", isOn: $forwardSystemShortcuts)
+                            .disabled(!forwardPhysicalKeyboard)
+                        Text(hasInputPermission(request: false)
+                             ? "远控画面有键盘焦点时，⌘⇧4、⌃空格、⌃←/→、⌘Tab 等发往被控端；点击其他窗口即恢复本机。"
+                             : "需要先在「系统设置 → 隐私与安全性 → 辅助功能」中允许 KoKo，才能把系统快捷键发往被控端。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     LabeledContent("关闭远控窗口", value: "⌘W")
                     LabeledContent("退出本机 KoKo", value: "⌘Q")
                 case .network:

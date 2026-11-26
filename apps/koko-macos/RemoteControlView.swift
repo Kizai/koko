@@ -6,6 +6,7 @@ struct RemoteControlView: View {
     @ObservedObject var connection: LocalConnection
     @ViewState private var toolbarHeight = WindowButtonAlignment.defaultHeight
     @AppStorage("forwardPhysicalKeyboard") private var forwardPhysicalKeyboard = true
+    @AppStorage(SystemShortcutCapture.settingKey) private var forwardSystemShortcuts = true
 
     private let keys = [
         ("Esc", "escape"), ("Tab", "tab"), ("回车", "enter"), ("删除", "backspace"),
@@ -24,6 +25,7 @@ struct RemoteControlView: View {
                     videoSurface: connection.videoSurface,
                     display: connection.isViewOnly ? nil : connection.frameDisplayID,
                     acceptsKeyboard: forwardPhysicalKeyboard,
+                    capturesSystemShortcuts: forwardPhysicalKeyboard && forwardSystemShortcuts,
                     clipboard: { key in Task { await connection.clipboardShortcut(key) } },
                     pointer: connection.queuePointer,
                     resize: connection.setViewportEdge
@@ -449,6 +451,7 @@ private struct RemoteCanvas: NSViewRepresentable {
     let videoSurface: VideoSurface
     let display: UInt32?
     let acceptsKeyboard: Bool
+    let capturesSystemShortcuts: Bool
     let clipboard: (String) -> Void
     let pointer: (RemotePointerEvent, UInt32) -> Void
     let resize: (Int) -> Void
@@ -467,6 +470,7 @@ private struct RemoteCanvas: NSViewRepresentable {
     func updateNSView(_ view: CanvasView, context: Context) {
         view.displayID = display
         view.acceptsKeyboard = acceptsKeyboard
+        view.capturesSystemShortcuts = capturesSystemShortcuts
         view.videoSize = videoSize
         view.image = image
         view.needsDisplay = true
@@ -477,7 +481,13 @@ private struct RemoteCanvas: NSViewRepresentable {
 private final class CanvasView: NSView {
     var image: NSImage?
     var videoSurface: VideoSurface?
-    var acceptsKeyboard = true
+    var acceptsKeyboard = true {
+        didSet { if acceptsKeyboard != oldValue { updateShortcutCapture() } }
+    }
+    var capturesSystemShortcuts = true {
+        didSet { if capturesSystemShortcuts != oldValue { updateShortcutCapture() } }
+    }
+    private let shortcutCapture = SystemShortcutCapture()
     var videoSize: CGSize? {
         didSet {
             if videoSize != oldValue {
@@ -491,6 +501,7 @@ private final class CanvasView: NSView {
             if oldValue != displayID {
                 pressed.removeAll()
                 pressedKeys.removeAll()
+                updateShortcutCapture()
             }
         }
     }
@@ -544,9 +555,12 @@ private final class CanvasView: NSView {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        if newWindow == nil, let keyUpMonitor {
-            NSEvent.removeMonitor(keyUpMonitor)
-            self.keyUpMonitor = nil
+        if newWindow == nil {
+            shortcutCapture.stop()
+            if let keyUpMonitor {
+                NSEvent.removeMonitor(keyUpMonitor)
+                self.keyUpMonitor = nil
+            }
         }
     }
 
@@ -564,24 +578,69 @@ private final class CanvasView: NSView {
             }
         }
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
         if let window {
             window.acceptsMouseMovedEvents = true
             NotificationCenter.default.addObserver(
                 self, selector: #selector(windowResigned), name: NSWindow.didResignKeyNotification, object: window
             )
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(windowBecameKey), name: NSWindow.didBecomeKeyNotification, object: window
+            )
         }
+        updateShortcutCapture()
+    }
+
+    @objc private func windowBecameKey() {
+        updateShortcutCapture()
     }
 
     @objc private func windowResigned() {
+        // Clicking any other window, panel or app gives this Mac its keyboard back.
+        shortcutCapture.stop()
         guard !pressed.isEmpty || !pressedKeys.isEmpty, let displayID else { return }
         pressed.removeAll()
         pressedKeys.removeAll()
         onPointer?(.init(kind: .release), displayID)
     }
 
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        // The window reports the new first responder only after this returns.
+        DispatchQueue.main.async { [weak self] in self?.updateShortcutCapture() }
+        return became
+    }
+
     override func resignFirstResponder() -> Bool {
         windowResigned()
         return super.resignFirstResponder()
+    }
+
+    /// System shortcuts go to the remote Mac only while the remote picture has keyboard focus.
+    private func updateShortcutCapture() {
+        let wanted = acceptsKeyboard && capturesSystemShortcuts && displayID != nil
+            && window?.isKeyWindow == true && window?.firstResponder === self
+        guard wanted else { return shortcutCapture.stop() }
+        shortcutCapture.handler = { [weak self] event in self?.captured(event) ?? false }
+        shortcutCapture.start()
+    }
+
+    /// Handles a key taken before macOS could act on it. ⌘Q and ⌘W stay on this Mac so the
+    /// window can always be closed and KoKo quit.
+    private func captured(_ event: NSEvent) -> Bool {
+        switch event.type {
+        case .flagsChanged:
+            flagsChanged(with: event)
+            return true
+        case .keyDown, .keyUp:
+            if event.modifierFlags.contains(.command),
+               ["q", "w"].contains(event.charactersIgnoringModifiers?.lowercased() ?? "") {
+                return false
+            }
+            return forwardKey(event, down: event.type == .keyDown)
+        default:
+            return false
+        }
     }
 
     override func keyDown(with event: NSEvent) {
