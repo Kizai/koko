@@ -245,6 +245,7 @@ private struct RemoteReply: Codable {
 
     enum CodingKeys: String, CodingKey {
         case status, clipboard, png, code, image, displays, direct, video, width, height, format, control
+        case level, muted
         case app, nodes, truncated, reason, text, paths, path, outbox, offers
         case clipboardStream = "clipboard_stream"
         case rttMS = "rtt_ms"
@@ -1056,6 +1057,12 @@ final class LocalConnection: ObservableObject {
         await sendHost("end-agent")
     }
 
+    /// Ends the current remote session without turning sharing off, so another device can still
+    /// connect with the code refreshed afterwards.
+    func endRemoteSession() async {
+        await sendHost("end-session")
+    }
+
     func stopAgent() async {
         await sendHost("stop-agent")
     }
@@ -1597,7 +1604,10 @@ final class LocalConnection: ObservableObject {
         stopVideo()
         videoSettings = settings
         do {
-            let receiver = try VideoReceiver(keyPath: keyPath(for: .controller), host: session, settings: settings)
+            let receiver = try VideoReceiver(
+                keyPath: keyPath(for: .controller), host: session, settings: settings,
+                audio: videoSurface.audioPlayer
+            )
             videoReceiver = receiver
             videoTask = Task { await receiveVideo(receiver, settings: settings) }
         } catch {
@@ -1636,10 +1646,9 @@ final class LocalConnection: ObservableObject {
                     size = try videoSurface.setHEVCFormat(bytes)
                 case .streamInfo:
                     videoSurface.setStreamInfo(bytes)
-                case .audioFormat:
-                    videoSurface.setAudioFormat(bytes)
-                case .audioFrame:
-                    videoSurface.enqueueAudio(bytes)
+                case .audioFormat, .audioFrame:
+                    // Decoded on VideoReceiver's reader queue; audio never enters this loop.
+                    continue
                 case .frame, .syncFrame, .sequencedFrame:
                     var payload = bytes
                     if kind == .sequencedFrame {

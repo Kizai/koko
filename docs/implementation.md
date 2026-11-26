@@ -8,8 +8,8 @@
 
 ## 现状与首轮要验证的问题
 
-- 截至 0.1.20，工作项 1 和 2 已实现，人工远控也已提前落地，包括连续 H.264 视频、多显示器、键鼠、剪贴板、观看模式和 SSH 设备工具。工作项 4、5 和 6 中的 Agent 部分尚未开始。各项状态见下文[实现顺序与验收](#实现顺序与验收)。
-- 截图请求的追踪路径：`koko-agent remote` 经 `koko-p2p::remote` 发出 `koko/remote/1` 命令，`koko-daemon/src/desktop.rs` 核对授权后，以 `Desktop request` 行交给 `Koko.app`（`LocalConnection.executeDesktopAction`）。单独运行 daemon 时改由包内的 `koko-desktop` 执行。公共消息结构在 `koko-proto`。`koko-capture` 只负责录屏权限探测。
+- 截至 0.1.26，工作项 1 和 2 已实现，人工远控也已提前落地，包括连续 H.264 视频、多显示器、键鼠、剪贴板、观看模式和 SSH 设备工具。工作项 4 和 6 的 Agent 部分已实现到 M5（只读 MCP、Agent 键鼠、抢占、求助、界面树和高危审批）；工作项 5 的组网验收仍待实机完成。各项状态见下文[实现顺序与验收](#实现顺序与验收)。
+- 截图请求的追踪路径：`koko-agent remote` 经 `koko-p2p::remote` 发出 `koko/remote/1` 命令，`koko-daemon/src/desktop.rs` 核对授权后，以 `Desktop request` 行交给 `Koko.app`（`LocalConnection.executeDesktopAction`）。单独运行 daemon 时改由包内的 `koko-desktop` 执行。公共消息结构在 `koko-proto`。`koko-capture` 负责录屏权限探测，以及 Windows 的屏幕捕获与 UI Automation 树转换；`koko-input` 提供坐标、键位和滚动换算。
 - 首轮最需要验证的是主机许可、设备身份、实际传输和系统截图能否串成一次可复现的请求。借鉴服务集成中的分段验收，先用本地真实连接定位传输和协议问题，再用双机测试定位网络和系统权限问题。
 
 ## 三种实现方案
@@ -33,7 +33,7 @@
 | `koko-daemon` | 在已登录的 macOS 图形会话中以前台模式运行。`serve` 只为一个指定控制端提供 `koko/1` 自检。`serve-pair` 通过验证码证明、局域网确认或信任列表授权控制端，并按作用域限制 Agent。根据连接认证的公钥授权后，把命令交给 `Koko.app` 或 `koko-desktop`。 |
 | macOS 采集 | 图形版在 `Koko.app` 进程内检查录屏权限，通过 ScreenCaptureKit 采集所选显示器，截图编码为 PNG，远控画面编码为 H.264。CLI 独立运行时使用 `koko-desktop` 中的同一截图实现。 |
 | `koko-agent` | 提供本机设备标识、授权自检、发现、配对，以及从标准输入读取 JSON 命令的单次远控命令。结果以 JSON 写到标准输出，不接受本地输出路径。后续 MCP 复用同一调用路径。 |
-| `koko-input` | 仍为空。macOS 键鼠由 `Koko.app` 和 `koko-desktop` 通过 Core Graphics 投递。 |
+| `koko-input` | 提供可移植的坐标换算、Mac 与 Windows 虚拟键位映射和滚动量换算，以及 Windows 原生输入注入。macOS 键鼠由 `Koko.app` 和 `koko-desktop` 通过 Core Graphics 投递。 |
 
 macOS 测试版通过 `koko/remote/1` 传递截图、视频、键鼠和剪贴板命令。普通命令每条双向流处理一个有长度上限的 JSON 请求和一个结果，视频订阅在同一条流上持续返回记录。daemon 在解码边界执行请求校验，并以连接认证的控制端公钥检查授权。后续 MCP 可以复用这条路径。[命令与视频格式](./architecture.md#远控命令)
 
@@ -48,7 +48,7 @@ macOS 测试版通过 `koko/remote/1` 传递截图、视频、键鼠和剪贴板
 | 3. 双机局域网验收 | 在两台实际 Mac 上安装同一个 DMG，记录配对、连接和截图步骤。 | 局域网验收配置禁用中继和外部地址查询。授权成功、未授权拒绝、重启复用身份三种场景通过。记录 macOS 版本、直连状态和截图尺寸。 | 步骤见 [macOS 双机测试](./macos.md)，验收记录未纳入仓库。 |
 | 4. 只读 MCP | 双机截图验收后引入 `rmcp` stdio，先接 `koko_screenshot`，随后通过真实配对数据实现 `koko_list_devices`。 | MCP 客户端能发现并调用截图工具。工具返回图像，连接与授权仍走同一主机路径，诊断日志写到 stderr。[rmcp stdio 示例](https://github.com/modelcontextprotocol/rust-sdk/tree/main/examples/servers) | 已实现 M1：`koko-agent mcp` 提供 `koko_list_devices`、`koko_pair` 和 `koko_screenshot`，Agent 使用独立身份和 `observer` 作用域。自动化测试与本机端到端配对已通过，Claude Desktop 双机截图待实机验收。设计见 [Agent 与 MCP 设计规范](./agent.md)。 |
 | 5. 组网验收 | 两台设备分处不同物理网络，通过 Tailscale 或 ZeroTier 组网后连接。KoKo 按设计不启用公网中继和外部地址发现。 | 用直连邀请或设备 ID 连接成功，记录组网类型与实测延迟、帧率。设备身份和授权与局域网一致。 | 未开始。组网环境可用直连邀请，前提是控制端能直接访问被控端的 UDP 端口。 |
-| 6. 键鼠与人工协作 | 在完成只读验收后，落实 `AgentSafe` 范围、主机侧租约与显式停止，再打开键鼠命令。定义 `koko_request_human` 的本地人工响应流程和结果语义。 | 在授权测试窗口验证输入。撤销租约后，旧租约的请求被主机拒绝。人工请求的允许、拒绝和未响应结果可区分。实时旁观与自动抢占按 Phase 2 验收。 | M2 已实现：`agent_safe` 作用域、被控端控制权仲裁与人工抢占、指示条和停止快捷键、审计日志，以及 `koko_mouse`、`koko_keyboard`、`koko_release_control`。自动化测试与本机端到端已通过，双机实机验收待完成。M3 已实现：`koko_request_human`、被控端求助卡片与附言、本机实体输入检测；检测效果需实机验证。设计见 [Agent 与 MCP 设计规范](./agent.md)。 |
+| 6. 键鼠与人工协作 | 在完成只读验收后，落实 `AgentSafe` 范围、主机侧租约与显式停止，再打开键鼠命令。定义 `koko_request_human` 的本地人工响应流程和结果语义。 | 在授权测试窗口验证输入。撤销租约后，旧租约的请求被主机拒绝。人工请求的允许、拒绝和未响应结果可区分。实时旁观与自动抢占按 Phase 2 验收。 | M2 已实现：`agent_safe` 作用域、被控端控制权仲裁与人工抢占、指示条和停止快捷键、审计日志，以及 `koko_mouse`、`koko_keyboard`、`koko_release_control`。自动化测试与本机端到端已通过，双机实机验收待完成。M3 已实现：`koko_request_human`、被控端求助卡片与附言、本机实体输入检测；检测效果需实机验证。M4 已实现界面树读取与按元素操作，M5 已实现高危操作审批；双机实机验收与资源开销评估待完成。设计见 [Agent 与 MCP 设计规范](./agent.md)。 |
 
 当前迭代优先验收人工远控。按 [macOS 双机测试](./macos.md) 检查窗口拖动、显示器唤醒、设备类型和双向剪贴板，完成后再扩展 Agent 能力。
 

@@ -437,6 +437,18 @@ impl HostState {
                 }
                 return;
             }
+            // Ends the current remote session without turning sharing off, so the host owner can
+            // stop a viewer and still let another device in with the refreshed code.
+            "end-session" => {
+                if self
+                    .sessions
+                    .send_if_modified(|sessions| sessions.human.take().is_some())
+                {
+                    report_end(PeerKind::Human);
+                    self.outbox.clear();
+                }
+                return;
+            }
             "stop-agent" => {
                 self.arbiter.stop();
                 return;
@@ -948,6 +960,36 @@ mod tests {
             Ok::<_, Box<dyn Error>>(())
         })
         .await??;
+        host.router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_host_ends_only_the_human_session() -> Result<(), Box<dyn Error>> {
+        let mut host = test_host().await?;
+        let person = SecretKey::generate().public();
+        let agent = SecretKey::generate().public();
+        host.state.sessions.send_modify(|sessions| {
+            sessions.human = Some(person);
+            sessions.agent = Some((agent, Scope::Observer));
+        });
+        host.state
+            .outbox
+            .add(vec![std::path::PathBuf::from("/tmp/Report.pdf")]);
+
+        host.state.command("end-session");
+
+        let sessions = host.state.sessions.borrow().clone();
+        assert_eq!(sessions.human, None);
+        assert_eq!(sessions.agent, Some((agent, Scope::Observer)));
+        assert!(
+            host.state
+                .outbox
+                .wait(Duration::from_millis(10))
+                .await
+                .is_empty(),
+            "a person's waiting files go with their session"
+        );
         host.router.shutdown().await?;
         Ok(())
     }

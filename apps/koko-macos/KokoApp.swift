@@ -85,6 +85,10 @@ private struct KokoMenu: View {
         if connection.agentControl == "active" {
             Button("停止 Agent") { Task { await connection.stopAgent() } }
         }
+        if connection.isSharingWithPeer {
+            // Ends the viewer's session only; sharing stays on for the next device.
+            Button("断开远程会话") { Task { await connection.endRemoteSession() } }
+        }
         // One click ends every remote session in both directions and stops listening, so nobody
         // can reconnect until sharing is turned back on in the main window.
         Button("安全锁定") { connection.lockDown() }
@@ -724,6 +728,12 @@ private struct ConnectionView: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 2)
                         .background(Color.green.opacity(0.12), in: Capsule())
+                    Button("断开远程会话") {
+                        Task { await connection.endRemoteSession() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("结束当前远程会话，不会关闭远程协助")
                 }
                 Spacer()
                 Text("允许他人远程协助")

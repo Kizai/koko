@@ -639,14 +639,14 @@ func hevcParameterSets(_ format: CMFormatDescription) throws -> Data {
 @MainActor
 final class VideoSurface {
     private let renderer = MetalVideoRenderer()
-    private let audioPlayer = LiveAudioPlayer()
+    let audioPlayer = LiveAudioPlayer()
     private var format: CMVideoFormatDescription?
 
     var layer: CAMetalLayer { renderer.layer }
     var info: VideoPipelineInfo { renderer.info }
 
     var isMuted: Bool = false {
-        didSet { audioPlayer.isMuted = isMuted }
+        didSet { audioPlayer.setMuted(isMuted) }
     }
 
     func setFormat(_ bytes: Data) throws -> CGSize {
@@ -713,10 +713,6 @@ final class VideoSurface {
         return CGSize(width: Int(size.width), height: Int(size.height))
     }
 
-    func setAudioFormat(_ bytes: Data) {
-        audioPlayer.setFormat(bytes)
-    }
-
     func enqueue(_ bytes: Data) throws {
         guard let format, !bytes.isEmpty else { throw VideoError.packet }
         var buffer: CMBlockBuffer?
@@ -753,10 +749,6 @@ final class VideoSurface {
     /// Whether a frame failed to decode since the last call, so a key frame is needed.
     func takeKeyFrameNeed() -> Bool { renderer.takeKeyFrameNeed() }
 
-    func enqueueAudio(_ bytes: Data) {
-        audioPlayer.enqueue(bytes)
-    }
-
     var isReadyForMoreMediaData: Bool { renderer.canAccept }
     var hasFailed: Bool { renderer.hasFailed }
 
@@ -777,8 +769,11 @@ final class VideoReceiver {
     private let writer = DispatchQueue(label: "KoKo.video.feedback")
     /// Only read and written on `writer`.
     nonisolated(unsafe) private var inputClosed = false
+    /// Audio records are decoded and played on the reader queue, never on the main actor.
+    private let audio: LiveAudioPlayer
 
-    init(keyPath: String, host: PairedHost, settings: VideoSettings) throws {
+    init(keyPath: String, host: PairedHost, settings: VideoSettings, audio: LiveAudioPlayer) throws {
+        self.audio = audio
         let action = RemoteAction(
             action: "video", display: settings.display, edge: settings.edge,
             quality: settings.quality, fps: settings.fps, audio: settings.audio,
@@ -796,19 +791,35 @@ final class VideoReceiver {
 
     func next() async throws -> (VideoRecord, Data)? {
         let file = output.fileHandleForReading
+        let audio = self.audio
         return try await withCheckedThrowingContinuation { continuation in
             reader.async {
                 do {
-                    guard let prefix = try Self.read(4, from: file) else {
-                        continuation.resume(returning: nil)
-                        return
+                    while true {
+                        guard let prefix = try Self.read(4, from: file) else {
+                            continuation.resume(returning: nil)
+                            return
+                        }
+                        let count = prefix.uint32(at: 0)
+                        guard (1...8 * 1024 * 1024).contains(count),
+                              let data = try Self.read(count, from: file),
+                              let kind = VideoRecord(rawValue: data[0]) else {
+                            throw VideoError.packet
+                        }
+                        let payload = data.subdata(in: 1..<data.count)
+                        // Audio goes straight to its own queue. Passing it through the caller
+                        // put 10 ms packets behind video work on the main thread, which showed
+                        // up as growing delay and stutter.
+                        switch kind {
+                        case .audioFormat:
+                            audio.setFormat(payload)
+                        case .audioFrame:
+                            audio.enqueue(payload)
+                        default:
+                            continuation.resume(returning: (kind, payload))
+                            return
+                        }
                     }
-                    let count = prefix.uint32(at: 0)
-                    guard (1...8 * 1024 * 1024).contains(count),
-                          let data = try Self.read(count, from: file), let kind = VideoRecord(rawValue: data[0]) else {
-                        throw VideoError.packet
-                    }
-                    continuation.resume(returning: (kind, data.subdata(in: 1..<data.count)))
                 } catch {
                     continuation.resume(throwing: error)
                 }

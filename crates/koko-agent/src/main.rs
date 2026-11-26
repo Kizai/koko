@@ -444,21 +444,34 @@ async fn stream_video(
 
     // A short queue to the app: when it falls behind, reading stops and so do the acks.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    // Audio has its own queue and is written ahead of video, so a burst of large frames cannot
+    // push 10 ms sound packets behind it.
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
     let video_tx = tx.clone();
     let video_task = tokio::spawn(async move {
         read_media_records(video_recv, video_tx, false, wants_feedback.then_some(acks)).await
     });
-    let audio_task = audio_recv.map(|recv| {
-        let audio_tx = tx.clone();
-        tokio::spawn(async move {
+    let audio_task = match audio_recv {
+        Some(recv) => Some(tokio::spawn(async move {
             let _ = read_media_records(recv, audio_tx, true, None).await;
-        })
-    });
+        })),
+        None => {
+            // No audio stream: close the queue so the writer still ends with the video.
+            drop(audio_tx);
+            None
+        }
+    };
     drop(tx);
 
     let mut output = io::BufWriter::new(io::stdout().lock());
     let mut last_stats = None::<Instant>;
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = tokio::select! {
+            biased;
+            Some(frame) = audio_rx.recv() => frame,
+            Some(frame) = rx.recv() => frame,
+            else => break,
+        };
         if last_stats.is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
             && let Some((rtt, direct)) = client.selected_path()
         {

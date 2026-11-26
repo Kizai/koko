@@ -1,6 +1,6 @@
 //! MCP server: lets an AI client pair with KoKo hosts, look at their screens and operate them.
 
-use std::collections::{HashMap, VecDeque, hash_map::Entry};
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
@@ -380,10 +380,10 @@ impl KokoMcp {
         id: EndpointId,
         command: &RemoteCommand,
     ) -> Result<RemoteReply, String> {
-        let mut clients = self.state.clients.lock().await;
-        let client = match clients.entry(id) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => {
+        let existing = self.state.clients.lock().await.get(&id).cloned();
+        let client = match existing {
+            Some(client) => client,
+            None => {
                 let target = self
                     .state
                     .registry
@@ -392,14 +392,26 @@ impl KokoMcp {
                     .get(id)
                     .map(HostRecord::target)
                     .ok_or("not paired")?;
-                let client = RemoteClient::connect(self.state.key.clone(), target)
+                // Connecting takes a round trip; keep the client map free so another device's
+                // request is not held up behind it.
+                let connected = RemoteClient::connect(self.state.key.clone(), target)
                     .await
                     .map_err(|error| format!("{error:?}"))?;
-                entry.insert(client).clone()
+                let mut clients = self.state.clients.lock().await;
+                match clients.get(&id).cloned() {
+                    Some(existing) => {
+                        drop(clients);
+                        connected.close().await;
+                        existing
+                    }
+                    None => {
+                        clients.insert(id, connected.clone());
+                        connected
+                    }
+                }
             }
         };
         // Requests share the connection on separate streams; a request for help may wait minutes.
-        drop(clients);
         // An agent's input may wait for the person at the host to approve it.
         let limit = if command.is_agent_input() {
             APPROVAL_TIMEOUT + command.desktop_timeout() * 2 + Duration::from_secs(5)

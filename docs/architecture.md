@@ -85,6 +85,7 @@ mDNS 服务类型为 `_koko-pair._udp.local.`。TXT 记录包含主机公钥 `id
 | 已有 Agent 会话时，另一个 Agent 申请 | 拒绝，控制端看到 `agent_busy`。 |
 | 控制端发送 `disconnect` | 只撤销该控制端自己的会话。 |
 | 被控端断开 Agent | 只撤销 Agent 会话。 |
+| 被控端结束远程会话 | 只撤销人类控制端的会话，临时验证码随后刷新；共享保持开启，可继续接受下一次连接。 |
 | 被控端清除信任或停止共享 | 撤销全部会话。 |
 
 | 作用域 | 授予对象 | 允许的命令 |
@@ -169,7 +170,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 当前 macOS 音频为 48,000 Hz 双声道，优先 AAC-ELD（`formatID=0x61616365`，FourCC `aace`，480 采样/包，即 10 ms），失败回退 AAC-LC（`0x61616320`，FourCC `aac `，1024 采样/包，约 21.33 ms）。发送端首次取得非空 cookie 时发送一次类型 5，排在该次编码产生的类型 6 之前。类型 6 的发送本身不等待 cookie。解码器跳过类型 6 的四字节序号，把余下字节作为一个压缩包解码。
 
-`remote-video` 的 `audio:true` 让辅助进程额外打开独立 `audio` 请求；主机视频采集本身仍禁用音频。音频请求不携带显示器 ID，macOS 为 ScreenCaptureKit 过滤器选择主屏或首个可用屏。辅助进程把两个流的完整记录合并到 stdout，不按跨流时间戳重排；音频流类型 3 错误只结束音频读取，不混入 stdout。当前视频发送类型 2 或 9，不能以缺少类型 7 判断采集失败。实机样例的采集与校验见[协议样例采集](./protocol-capture.md)，本轮尚未生成样例文件。
+`remote-video` 的 `audio:true` 让辅助进程额外打开独立 `audio` 请求；主机视频采集本身仍禁用音频。音频请求不携带显示器 ID，macOS 为 ScreenCaptureKit 过滤器选择主屏或首个可用屏。辅助进程把两个流的完整记录合并到 stdout，音频记录优先写出，不按跨流时间戳重排；音频流类型 3 错误只结束音频读取，不混入 stdout。当前视频发送类型 2 或 9，不能以缺少类型 7 判断采集失败。实机样例的采集与校验见[协议样例采集](./protocol-capture.md)，本轮尚未生成样例文件。
 
 ### 视频反馈与流控
 
@@ -190,7 +191,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 控制端收到 `sequencedFrame` 后总是回确认。显示层排不下时跳过该帧并请求关键帧，之后的非关键帧一律跳过，直到关键帧到达，避免花屏。
 
-被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧，带反馈时十秒）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端在专用队列上用 VideoToolbox（`VTDecompressionSession`，优先硬件解码）逐帧解码出 IOSurface 像素缓冲，经 `CVMetalTextureCache` 零拷贝映射为 Metal 纹理，由着色器按 Rec.709（或 601）与全范围（或视频范围）转换为 sRGB，等比绘制到 `CAMetalLayer` 并立即呈现，不经过显示层自己的时钟和队列。每一帧都解码以保持预测链；显示器还在处理上一次绘制时，新帧只替换待画内容，最多两次绘制在途，因此在 60、120 或 165 Hz 屏幕上都跟随最新一帧。解码失败（缺少参考帧、睡眠后会话失效）时请求关键帧，而不是重启视频流。并用独立的低延迟 `AVAudioEngine` 播放声音，同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质；码率与帧率的实时调整见[视频反馈与流控](#视频反馈与流控)。
+被控端 `Koko.app` 以所选帧率启动 ScreenCaptureKit。ScreenCaptureKit 会丢弃早于 `minimumFrameInterval` 到达的帧，若恰好设为目标帧间隔，显示器的时间抖动会让 60 FPS 只剩约 50 FPS；因此采集间隔设为目标的一半、`queueDepth` 为 5，再由应用按目标帧间隔的 75% 过滤，既不丢帧，也能把高刷新率屏幕降到目标帧率。视频用 VideoToolbox 实时硬件编码（Apple Silicon 优先协商 `HEVC Main 4:4:4 FullRange` + sRGB/Rec.709，自动回退 `HEVC Main 4:2:0 FullRange` 或 `H.264 High FullRange`，关闭帧重排，最长两秒一个关键帧，带反馈时十秒）；音频切分为精确 480 采样（10ms）送入 `AAC-ELD` 编码。视频与音频分别写入 daemon 在 0700 临时目录创建的两个 Unix socket（`v` 与 `a`），并由同一条 QUIC 连接上的两条独立双向流并发转发，避免大体积关键帧队头阻塞音频包。控制端在专用队列上用 VideoToolbox（`VTDecompressionSession`，优先硬件解码）逐帧解码出 IOSurface 像素缓冲，经 `CVMetalTextureCache` 零拷贝映射为 Metal 纹理，由着色器按 Rec.709（或 601）与全范围（或视频范围）转换为 sRGB，等比绘制到 `CAMetalLayer` 并立即呈现，不经过显示层自己的时钟和队列。每一帧都解码以保持预测链；显示器还在处理上一次绘制时，新帧只替换待画内容，最多两次绘制在途，因此在 60、120 或 165 Hz 屏幕上都跟随最新一帧。解码失败（缺少参考帧、睡眠后会话失效）时请求关键帧，而不是重启视频流。并用独立的低延迟 `AVAudioEngine` 播放声音。控制端在读取辅助进程输出的线程上直接解码音频，播放与积压管理在独立串行队列完成，不经过主线程；待播音频超过 80 ms 时丢弃最旧的包并重建解码器，网络抖动只表现为短暂空隙，不会累积成持续延迟或破音。控制端同时按 `path` 记录中的 RTT 自适应调整自动分辨率和画质；码率与帧率的实时调整见[视频反馈与流控](#视频反馈与流控)。
 
 ### 应用与辅助进程的接口
 
@@ -213,7 +214,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `Desktop request: <编号> <JSON>` | 需要应用执行的远控命令；视频和音频命令附带 `video_socket`，Unix 上是私有目录中的 socket 路径，Windows 上是本机命名管道名。剪贴板传输时还会请求 `clipboard_read`（按 ⌘C 并返回路径或文字）、`clipboard_target`（新建接收目录）和 `clipboard_publish`（放入剪贴板并按 ⌘V） |
 | `Pointer closed` | 键鼠连接结束，应用释放仍按下的键和鼠标按钮 |
 
-应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
+应用向 daemon 写入 `approve <编号> [作用域]`、`remember <编号> [作用域]`、`decline <编号>`、`end-session`、`end-agent`、`stop-agent`、`resume-agent`、`agent-help <resolved|declined|taken_over> [附言]`、`approval allow`、`approval deny`、`local-input`、`outbox {"paths":[…]}`、`forget-trusted`、`refresh-code`、`code-mode <temporary|custom|both>`、`custom-code [验证码]` 或 `desktop-reply <编号> <JSON>`。作用域参数只能缩小 Agent 申请的范围。
 
 #### Desktop request 与回复 JSON
 
@@ -227,7 +228,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 | `displays` | 无 | `status=displays`，`host_name:String`、`displays:[Display]`、`clipboard:true`、`video:true`、`clipboard_stream:true`、`outbox:true` |
 | `video` | `display:u32`、`edge:u16`、`quality:u8`、`fps:u16`、`audio:bool?`、`hevc:bool?`、`chroma444:bool?`、`feedback:bool?`、`video_socket:String` | `status=ok`；表示已调度捕获，后续数据或捕获错误经本机通道传输；视频端忽略 `audio`，使用独立音频通道；四个布尔选项为 false 时 daemon 省略该键 |
 | `audio` | `video_socket:String` | `status=ok`；表示已调度独立音频捕获，后续错误经该通道传输 |
-| `audio_volume` | `level:u8?`（0–100；省略为读取） | 当前实际仅编码 `status=audio_volume`，见下述已知差异 |
+| `audio_volume` | `level:u8?`（0–100；省略为读取） | `status=audio_volume`、`level:u8`、`muted:Bool` |
 | `wallpaper` | 无 | `status=image`，`image:String`（Base64 JPEG）、`width:Int`、`height:Int`、`format=jpeg` |
 | `screenshot` | 无 | `status=frame`，`png:String`（主屏 Base64 PNG；边长上限 1600，包含鼠标） |
 | `capture` | `display:u32`、`edge:u16`、`quality:u8`、`format:jpeg\|png?`、`cursor:bool?` | `status=image`，`image:String`（Base64）、`width:Int`、`height:Int`、`format:jpeg\|png`；默认 JPEG、不含鼠标；PNG 忽略 quality |
@@ -241,7 +242,7 @@ foreach ($direction in 'In', 'Out', 'InOut') {
 
 失败回复含 `status=error`、`code:String`；应用会返回 `invalid_command`、`input_permission_required`、`input_failed`、`screen_permission_required`、`display_unavailable`、`capture_busy`、`capture_failed` 及 `ClipboardError` 定义的剪贴板错误。Agent 的 pointer/text 请求增加 `actor=agent`，已获批准重试时才增加 `approved:true`；命中规则的应用回复为 `status=approval_required`、`reason:String`，由 daemon 处理审批，远端最终收到执行结果或 `approval_declined` / `approval_timeout`。
 
-本机回复与远端回复有两处现存差异：Swift `displays` 回复没有 `control`，daemon 丢弃未识别的 `outbox` 字段并加入当前 `control`；Swift `audio_volume` 在内存计算 `level` 和 `muted`，但 `RemoteReply.CodingKeys` 遗漏这两项，实际 JSON 缺字段，Rust 解码失败后返回 `desktop_unavailable`。后者是已发现的实现问题，本轮只记录、不改 Swift，也不把预期字段写成已采集的输出。`remote-stream` 还可能给截图结果添加 `rtt_ms`、`direct`，它们不是 Desktop 回复字段。
+本机回复与远端回复仍有一处现存差异：Swift `displays` 回复没有 `control`，daemon 丢弃未识别的 `outbox` 字段并加入当前 `control`。`audio_volume` 回复已包含 `level` 和 `muted`，Rust 可以正常解码。`remote-stream` 还可能给截图结果添加 `rtt_ms`、`direct`，它们不是 Desktop 回复字段。
 
 `clipboard_pull` / `clipboard_push` 驱动上述三个内部剪贴板动作；hello、disconnect、release_control、request_human、outbox_wait、outbox_pull 由 daemon 处理，不产生对应 Desktop request。
 
@@ -294,7 +295,7 @@ Mac 普通按键使用 `0xbf`，修饰键转换事件使用 `0xbe` 并借设备�
 
 ## 1. MVP 技术栈定案
 
-> 实现状态：iroh 已用于身份与传输，局域网发现另用 mDNS。macOS 采集、编码和键鼠已按下表的系统框架实现。桌面客户端由 Swift/SwiftUI 的 `Koko.app` 承担，未采用 Tauri。`koko-agent mcp` 已用 rmcp 提供 MCP，可截图与操作键鼠。Windows 与 Linux 尚无实现。
+> 实现状态：iroh 已用于身份与传输，局域网发现另用 mDNS。macOS 采集、编码和键鼠已按下表的系统框架实现。桌面客户端由 Swift/SwiftUI 的 `Koko.app` 承担，未采用 Tauri。`koko-agent mcp` 已用 rmcp 提供 MCP，可截图与操作键鼠。Windows 已有被控端实现（`koko-host-windows`，以及 `koko-capture` 的 Windows 截图与 UI 树转换、`koko-input` 的 Windows 输入注入），Linux 尚无实现。
 
 为避免在早期陷入 6 端适配与底层编解码泥潭，MVP 阶段锁定 **Desktop 优先（Windows / macOS / Linux）+ P2P 打洞 + 原生 MCP 桥接**，优先跑通“人类旁观 + AI 远程操控真实电脑 + 随时接管”的完整闭环。
 

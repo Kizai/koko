@@ -355,65 +355,110 @@ final class LowDelayAACDecoder {
     }
 }
 
-/// Independent low-latency audio player (~30 ms jitter target) decoupled from video rendering.
-@MainActor
-final class LiveAudioPlayer {
+/// Plays remote audio on its own serial queue, away from the main thread. Packets that pile up
+/// past a short buffer are dropped from the oldest side and the decoder is rebuilt, so a burst
+/// costs a brief gap instead of permanent delay; a packet is never silently skipped while the
+/// decoder keeps running on state that no longer matches what is playing.
+final class LiveAudioPlayer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "KoKo.audio.play", qos: .userInteractive)
     private let engine = AVAudioEngine()
     private let node = AVAudioPlayerNode()
-    private let decoder = LowDelayAACDecoder()
-    private var started = false
+    private let pcmFormat = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)
+    // Only touched on `queue`.
+    private var decoder: LowDelayAACDecoder?
+    private var formatHeader: Data?
     private var queued = 0
-
-    var isMuted: Bool = false {
-        didSet { engine.mainMixerNode.outputVolume = isMuted ? 0 : 1 }
-    }
+    private var generation = 0
+    private var started = false
+    private var muted = false
+    /// At most 80 ms of audio waits for playback, in 10 ms AAC-ELD packets.
+    private let maxQueued = 8
+    /// Playback starts once this much audio is buffered, absorbing network jitter.
+    private let startQueued = 3
 
     init() {
-        if let decoder {
-            engine.attach(node)
-            engine.connect(node, to: engine.mainMixerNode, format: decoder.pcmFormat)
+        guard let pcmFormat else { return }
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: pcmFormat)
+    }
+
+    func setMuted(_ value: Bool) {
+        queue.async { [self] in
+            muted = value
+            applyVolume()
         }
     }
 
     func setFormat(_ header: Data) {
-        stop()
-        _ = decoder?.configure(header: header)
+        queue.async { [self] in
+            formatHeader = header
+            reset()
+        }
     }
 
     func enqueue(_ frame: Data) {
-        guard let decoder, let pcm = decoder.decode(frame: frame) else { return }
-        // Cap queued latency at ~90 ms (9 x 10 ms packets) so network bursts never cause permanent lag.
-        if queued > 9 { return }
-        if !engine.isRunning {
-            do {
-                try engine.start()
-                engine.mainMixerNode.outputVolume = isMuted ? 0 : 1
-            } catch {
-                return
+        queue.async { [self] in
+            guard decoder != nil else { return }
+            if queued >= maxQueued {
+                // Drop what is already late rather than the newest packet, then rebuild the
+                // converter so the packets that follow decode from a clean state.
+                reset()
             }
-        }
-        queued += 1
-        node.scheduleBuffer(pcm) { [weak self] in
-            Task { @MainActor in
+            guard let decoder, let pcm = decoder.decode(frame: frame) else { return }
+            if !engine.isRunning {
+                do {
+                    try engine.start()
+                    applyVolume()
+                } catch {
+                    return
+                }
+            }
+            queued += 1
+            let generation = self.generation
+            node.scheduleBuffer(pcm) { [weak self] in
                 guard let self else { return }
-                self.queued = max(0, self.queued - 1)
+                queue.async { [self] in
+                    guard generation == self.generation else { return }
+                    queued = max(0, queued - 1)
+                }
             }
-        }
-        // Start playback once 3 packets (~30 ms) are buffered to absorb micro-jitter cleanly.
-        if !started, queued >= 3 {
-            node.play()
-            started = true
-        } else if started, !node.isPlaying, queued >= 2 {
-            node.play()
+            if !started, queued >= startQueued {
+                node.play()
+                started = true
+            } else if started, !node.isPlaying {
+                node.play()
+            }
         }
     }
 
     func stop() {
-        started = false
+        queue.async { [self] in
+            reset()
+            decoder = nil
+            formatHeader = nil
+        }
+    }
+
+    /// Discards scheduled audio and starts the decoder over. Older buffers' completion handlers
+    /// see a stale generation and do not touch the new queue count.
+    private func reset() {
+        generation += 1
+        node.stop()
         queued = 0
+        started = false
+        if let formatHeader {
+            decoder = LowDelayAACDecoder()
+            if decoder?.configure(header: formatHeader) != true {
+                decoder = nil
+            }
+        } else {
+            decoder = nil
+        }
+    }
+
+    private func applyVolume() {
         if engine.isRunning {
-            node.stop()
-            engine.stop()
+            engine.mainMixerNode.outputVolume = muted ? 0 : 1
         }
     }
 }
