@@ -127,6 +127,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .collect();
             println!("{}", serde_json::to_string(&devices)?);
         }
+        [command, targets @ ..] if command == "reach" => {
+            // Each target is `host_id/ip:port[,ip:port…]`; prints the IDs that answered. A
+            // malformed saved address only skips that device.
+            let targets = targets
+                .iter()
+                .filter_map(|target| parse_known(target).ok())
+                .collect();
+            let reachable = koko_p2p::reachable_hosts(targets, Duration::from_secs(3)).await?;
+            let ids: Vec<String> = reachable.iter().map(ToString::to_string).collect();
+            println!("{}", serde_json::to_string(&ids)?);
+        }
         [command, file, host, address] if command == "remote-stream" => {
             let key = load_identity(Path::new(file))?;
             let target = EndpointAddr::new(host.parse()?).with_ip_addr(address.parse()?);

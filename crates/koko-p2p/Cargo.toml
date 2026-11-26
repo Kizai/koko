@@ -12,4 +12,4 @@ koko-proto.workspace = true
 mdns-sd.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "time"] }

@@ -503,6 +503,10 @@ final class LocalConnection: ObservableObject {
     /// When each nearby host last answered a LAN scan. A host stays online for one missed scan,
     /// because mDNS answers are sometimes lost, and goes offline after `offlineAfter`.
     private var lastSeen: [String: ContinuousClock.Instant] = [:]
+    /// Remembered devices that mDNS did not find but that answered a direct probe at their known
+    /// addresses, such as hosts on Tailscale or ZeroTier, which do not carry mDNS.
+    @Published private(set) var reachableIDs: Set<String> = []
+    private var lastReached: [String: ContinuousClock.Instant] = [:]
     nonisolated static let scanInterval: Duration = .seconds(8)
     nonisolated static let offlineAfter: Duration = .seconds(20)
     @Published private(set) var rememberedDevices: [DeviceRecord] = DeviceHistoryStore.loadRecords()
@@ -568,7 +572,7 @@ final class LocalConnection: ObservableObject {
                     label: record.name,
                     request: "",
                     os: record.os,
-                    isOnline: connected,
+                    isOnline: connected || reachableIDs.contains(record.id),
                     knownAddresses: addresses,
                     lastConnectedAt: record.lastConnectedAt
                 )
@@ -1393,6 +1397,7 @@ final class LocalConnection: ObservableObject {
                 .filter { $0.id != hostID }
             let merged = Self.mergeScan(found, previous: discoveredHosts, lastSeen: &lastSeen, now: .now)
             if merged != discoveredHosts { discoveredHosts = merged }
+            await probeRemembered()
             if !quiet {
                 controllerNotice = nearbyHosts.isEmpty
                     ? ConnectionNotice(message: "未发现可连接的 Koko 设备。") : nil
@@ -1420,10 +1425,37 @@ final class LocalConnection: ObservableObject {
         return kept + found.filter { !keptIDs.contains($0.id) }
     }
 
+    /// Probes remembered devices that mDNS did not find, directly at the addresses they were
+    /// last reached on. This keeps hosts on Tailscale, ZeroTier or a VPN online after a session ends.
+    private func probeRemembered() async {
+        let discovered = Set(discoveredHosts.map(\.id))
+        let targets = rememberedDevices
+            .filter { !discovered.contains($0.id) && !hiddenDevices.contains($0.id) && $0.id != hostID && !$0.addresses.isEmpty }
+            .map { "\($0.id)/\($0.addresses.joined(separator: ","))" }
+        var reached: [String] = []
+        if !targets.isEmpty, let command = try? LocalCommand(.controller, arguments: ["reach"] + targets),
+           let result = try? await command.result() {
+            reached = (try? JSONDecoder().decode([String].self, from: Data(result.utf8))) ?? []
+        }
+        let reachable = Self.mergeReach(Set(reached), lastReached: &lastReached, now: .now)
+        if reachable != reachableIDs { reachableIDs = reachable }
+    }
+
+    /// Devices that answered a probe within `offlineAfter`, so one lost answer does not flicker.
+    nonisolated static func mergeReach(
+        _ reached: Set<String>, lastReached: inout [String: ContinuousClock.Instant], now: ContinuousClock.Instant
+    ) -> Set<String> {
+        for id in reached { lastReached[id] = now }
+        lastReached = lastReached.filter { now - $0.value < offlineAfter }
+        return Set(lastReached.keys)
+    }
+
     /// A host that could not be reached is shown offline at once instead of at the next scan.
     private func markUnreachable(_ id: String) {
         discoveredHosts.removeAll { $0.id == id }
         lastSeen[id] = nil
+        lastReached[id] = nil
+        reachableIDs.remove(id)
     }
 
     func watchRemoteScreen() async {

@@ -131,9 +131,87 @@ pub async fn check_host(
     Ok(())
 }
 
+/// Returns the hosts among `targets` that complete a QUIC handshake within `wait`.
+///
+/// LAN discovery uses mDNS, which Tailscale, ZeroTier and most VPNs do not carry, so a device
+/// remembered from an overlay network is probed at its known addresses instead. The probe uses a
+/// throwaway key: the handshake alone proves the host's identity, the host refuses the
+/// unauthorized key at once, and the probe gains no access.
+pub async fn reachable_hosts(
+    targets: Vec<EndpointAddr>,
+    wait: std::time::Duration,
+) -> Result<Vec<iroh::EndpointId>, Box<dyn Error>> {
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::generate())
+        .bind()
+        .await?;
+    let mut probes = tokio::task::JoinSet::new();
+    for target in targets {
+        let endpoint = endpoint.clone();
+        probes.spawn(async move {
+            let id = target.id;
+            match tokio::time::timeout(wait, endpoint.connect(target, ALPN)).await {
+                Ok(Ok(connection)) => {
+                    connection.close(0u32.into(), b"probe complete");
+                    Some(id)
+                }
+                _ => None,
+            }
+        });
+    }
+    let mut reachable = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        if let Some(id) = result? {
+            reachable.push(id);
+        }
+    }
+    // The answer is known; do not hold the caller while closing waits on silent peers.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), endpoint.close()).await;
+    Ok(reachable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct Refuse;
+
+    impl iroh::protocol::ProtocolHandler for Refuse {
+        async fn accept(
+            &self,
+            connection: iroh::endpoint::Connection,
+        ) -> Result<(), iroh::protocol::AcceptError> {
+            connection.close(1u32.into(), b"peer not authorized");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_that_refuses_the_probe_is_still_reachable() -> Result<(), Box<dyn Error>> {
+        let host = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let address = host.bound_sockets()[0];
+        let host_id = host.id();
+        let router = iroh::protocol::Router::builder(host)
+            .accept(ALPN, Refuse)
+            .spawn();
+        // Nothing listens at this address, so the second target must time out.
+        let silent = bind_host(SecretKey::generate(), "127.0.0.1:0".parse()?).await?;
+        let silent_target = EndpointAddr::new(silent.id()).with_ip_addr(silent.bound_sockets()[0]);
+        silent.close().await;
+
+        let reachable = reachable_hosts(
+            vec![
+                EndpointAddr::new(host_id).with_ip_addr(address),
+                silent_target,
+            ],
+            std::time::Duration::from_secs(2),
+        )
+        .await?;
+        assert_eq!(reachable, vec![host_id]);
+        router.shutdown().await?;
+        Ok(())
+    }
 
     #[test]
     fn data_directory_resolves_platform_home() {

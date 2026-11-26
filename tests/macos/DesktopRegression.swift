@@ -79,6 +79,14 @@ struct DesktopRegression {
         guard hosts.map(\.id) == ["a", "b"] else { throw Failure("重新扫描不应打乱设备顺序") }
         seen.removeAll()
 
+        // Overlay-network devices answer direct probes; one missed probe keeps them online.
+        var reached: [String: ContinuousClock.Instant] = [:]
+        var online = LocalConnection.mergeReach(["tail"], lastReached: &reached, now: start)
+        online = LocalConnection.mergeReach([], lastReached: &reached, now: start + .seconds(8))
+        guard online == ["tail"] else { throw Failure("组网设备单次探测失败不应立即显示离线") }
+        online = LocalConnection.mergeReach([], lastReached: &reached, now: start + LocalConnection.offlineAfter)
+        guard online.isEmpty, reached.isEmpty else { throw Failure("组网设备长时间无法连通应显示离线") }
+
         // A 60 Hz display delivers frames about 16.7 ms apart with jitter; none may be lost.
         var pacer = FramePacer(fps: 60)
         let jittered = (0..<60).map { Double($0) / 60 + ($0.isMultiple(of: 2) ? 0.0015 : -0.0015) }
