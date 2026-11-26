@@ -46,16 +46,34 @@ final class ReleaseUpdates: ObservableObject {
     @Published private(set) var offered: Release?
     @Published private(set) var notes: [String: String] = [:]
     @Published private(set) var installPhase = InstallPhase.idle
+    /// True while the update window confirms that the offered release is still the newest.
+    @Published private(set) var isConfirmingOffer = false
 
     private lazy var installer = UpdateInstaller { [weak self] phase in self?.installPhase = phase }
 
     /// Shows a release in the update window. Nothing downloads until the person chooses to update.
+    /// The automatic notice may come from a check up to a day old, so the window asks GitHub again
+    /// before installing; otherwise a newer release published since then would take two updates.
     func offer(_ release: Release) {
         offered = release
         if case .failed = installPhase { installPhase = .idle }
+        guard !isConfirmingOffer, let installedVersion, let current = ReleaseVersion(installedVersion) else { return }
+        isConfirmingOffer = true
+        Task {
+            defer { isConfirmingOffer = false }
+            // When GitHub cannot be reached the shown release is still a valid update.
+            guard let newest = try? await newestRelease(after: current), let shown = offered,
+                  let newer = ReleaseVersion(newest.version), let older = ReleaseVersion(shown.version),
+                  newer > older else { return }
+            offered = newest
+            state = .available(newest)
+            defaults.set(newest.version, forKey: "releaseAvailableVersion")
+            if automaticNotice != nil { automaticNotice = newest }
+        }
     }
 
     func install(_ release: Release) {
+        guard !isConfirmingOffer else { return }
         installPhase = .preparing
         do {
             try installer.install(version: release.version, feedURL: release.feedURL)

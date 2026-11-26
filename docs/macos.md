@@ -212,7 +212,7 @@ KOKO_NOTARY_PROFILE="koko-notary" \
 
 ### 发布应用内更新
 
-首次安装继续使用 DMG。0.1.21 起的应用会从所选 GitHub Release 加载该版本的 `appcast.xml`，并在解压前校验 ZIP 的 Ed25519 签名。KoKo 用自己的更新窗口代替 Sparkle 的默认界面：窗口显示 GitHub Release 中写的更新说明，点「立即更新」后一条进度条依次显示下载（可取消）、校验解压和安装，准备就绪后自动安装并重新启动。重启会结束当前会话。Release 的说明会原样显示在更新窗口中，支持标题、列表和行内格式。macOS 在安装位置需要更高权限时会提示授权。
+首次安装继续使用 DMG。0.1.21 起的应用会从所选 GitHub Release 加载该版本的 `appcast.xml`，并在解压前校验 ZIP 的 Ed25519 签名。KoKo 用自己的更新窗口代替 Sparkle 的默认界面：窗口显示 GitHub Release 中写的更新说明。主窗口的更新提醒可能来自一天内的缓存检查，打开更新窗口时会重新查询一次 GitHub，若期间发布了更新的版本，窗口直接改为提供最新版本，确认完成前「立即更新」不可点，避免逐版升级；查询失败时保留原先显示的版本。点「立即更新」后一条进度条依次显示下载（可取消）、校验解压和安装，准备就绪后自动安装并重新启动。重启会结束当前会话。Release 的说明会原样显示在更新窗口中，支持标题、列表和行内格式。macOS 在安装位置需要更高权限时会提示授权。
 
 构建脚本从 Sparkle 官方发行页下载固定版本并校验 SHA-256。公开签名构建默认生成更新附件。内测发布可执行 `KOKO_UPDATE_ASSETS=1 ./scripts/build-macos.sh --allow-ad-hoc`。把 DMG 与同目录下 `updates/<版本>/` 中的 `Koko-<版本>.zip` 和 `appcast.xml` 一起上传到 `v<版本>` 的 GitHub Release。
 

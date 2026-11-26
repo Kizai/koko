@@ -83,9 +83,13 @@ struct UpdateWindow: View {
                     Spacer()
                     Button("稍后") { dismiss() }
                         .keyboardShortcut(.cancelAction)
+                    if updates.isConfirmingOffer {
+                        ProgressView().controlSize(.small)
+                    }
                     Button(phase == .idle ? "立即更新" : "重试") { updates.install(release) }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
+                        .disabled(updates.isConfirmingOffer)
                 }
             }
         }

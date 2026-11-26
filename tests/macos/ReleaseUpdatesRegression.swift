@@ -113,6 +113,38 @@ extension DesktopRegression {
         let offline = ReleaseUpdates(installedVersion: "0.1.8", defaults: defaults, load: { _ in throw URLError(.notConnectedToInternet) })
         await offline.check(manual: true)
         guard case .failed = offline.state, offline.automaticNotice == nil else { throw Failure("网络断开时应返回失败状态") }
+
+        // The automatic notice can be a day old. A release published since then is offered directly
+        // when the update window opens, instead of updating one version at a time.
+        let staleSuite = "koko.tests.updates.stale." + UUID().uuidString
+        guard let stale = UserDefaults(suiteName: staleSuite) else { throw Failure("无法隔离更新测试偏好") }
+        defer { stale.removePersistentDomain(forName: staleSuite) }
+        stale.set("0.1.24", forKey: "releaseCheckedBuild")
+        stale.set(Date(), forKey: "releaseCheckedAt")
+        stale.set("0.1.25", forKey: "releaseAvailableVersion")
+        stale.set(true, forKey: "releaseCheckSucceeded")
+        apiStatus = 200
+        payload = try JSONSerialization.data(withJSONObject: [assetRelease("0.1.25"), assetRelease("0.1.26")])
+        let before = requests.count
+        let cached = ReleaseUpdates(installedVersion: "0.1.24", defaults: stale, load: load)
+        await cached.check(manual: false)
+        guard requests.count == before, let notice = cached.automaticNotice, notice.version == "0.1.25" else {
+            throw Failure("一天内的自动检查应沿用缓存")
+        }
+        cached.offer(notice)
+        guard cached.isConfirmingOffer else { throw Failure("打开更新窗口时应重新确认最新版本") }
+        cached.install(notice)
+        guard cached.installPhase == .idle else { throw Failure("确认最新版本前不应开始安装") }
+        while cached.isConfirmingOffer { await Task.yield() }
+        guard requests.count == before + 1, let offered = cached.offered, offered.version == "0.1.26",
+              cached.automaticNotice == offered, cached.state == .available(offered),
+              stale.string(forKey: "releaseAvailableVersion") == "0.1.26" else {
+            throw Failure("缓存的提醒落后时，更新窗口应直接提供最新版本，不应逐版升级")
+        }
+        let failing = ReleaseUpdates(installedVersion: "0.1.24", defaults: stale, load: { _ in throw URLError(.timedOut) })
+        failing.offer(notice)
+        while failing.isConfirmingOffer { await Task.yield() }
+        guard failing.offered == notice else { throw Failure("无法连接 GitHub 时应保留已显示的可用更新") }
     }
 
     @MainActor static func checkLiveReleaseUpdates(installedVersion: String) async throws {
