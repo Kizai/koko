@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "koko-agent"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "iroh",
  "koko-p2p",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "koko-capture"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "koko-input",
  "koko-proto",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "koko-daemon"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "base64 0.22.1",
  "iroh",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "koko-host-windows"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "base64 0.22.1",
  "koko-capture",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "koko-input"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "koko-proto",
  "windows",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "koko-p2p"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "blake3",
  "if-addrs",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "koko-proto"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "serde",
  "serde_json",
