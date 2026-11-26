@@ -62,6 +62,9 @@ struct DesktopRegression {
         guard !latency.constrained else { throw Failure("单次延迟波动不应切换画质") }
         latency.observe(151)
         guard latency.constrained else { throw Failure("持续高延迟时应降低自动画质") }
+        guard LocalConnection.isSessionRevoked("Error: peer not authorized"),
+              !LocalConnection.isSessionRevoked("capture_failed")
+        else { throw Failure("会话撤销错误识别不正确") }
 
         // A host missing from one LAN scan stays online; one silent for longer goes offline.
         let start = ContinuousClock.now

@@ -1154,6 +1154,11 @@ final class LocalConnection: ObservableObject {
         await sendHost("code-mode \(mode.rawValue)")
     }
 
+    /// Whether an error means the host ended this controller's session.
+    nonisolated static func isSessionRevoked(_ message: String) -> Bool {
+        message.contains("peer not authorized")
+    }
+
     /// The host only accepts ASCII letters and digits, compared without case.
     nonisolated static func cleanedCode(_ code: String) -> String {
         String(String.UnicodeScalarView(code.unicodeScalars.filter {
@@ -1582,11 +1587,15 @@ final class LocalConnection: ObservableObject {
             if reply.code == "display_unavailable" { displayRefresh = .distantPast }
             screenNotice = remoteError(reply.code)
         } catch {
+            if Self.isSessionRevoked(error.localizedDescription) {
+                endRevokedSession()
+                return false
+            }
             if self.session == session && !Task.isCancelled {
                 frameChannel?.close()
                 frameChannel = nil
                 // A display-list timeout can occur while the independent video stream is still delivering frames.
-                if videoTask != nil, frameDisplayID != nil, !error.localizedDescription.contains("peer not authorized") {
+                if videoTask != nil, frameDisplayID != nil {
                     displayRefresh = .now
                     return true
                 }
@@ -1720,7 +1729,11 @@ final class LocalConnection: ObservableObject {
         screenNotice = remoteError(failure)
         stopVideo()
         videoRetryAfter = .now.advanced(by: failure == "video_busy" ? .milliseconds(300) : .seconds(1))
-        if failure == "display_unavailable" { displayRefresh = .distantPast }
+        // Ask for the display list at once: if the host ended the session, the control channel
+        // reports it and the window closes instead of showing a frozen picture.
+        if failure == "display_unavailable" || failure == "capture_failed" {
+            displayRefresh = .distantPast
+        }
     }
 
     private func syncHostAudioVolume(_ session: PairedHost) async {
@@ -1828,6 +1841,10 @@ final class LocalConnection: ObservableObject {
                 pointerQueue.removeFirst(events.count)
                 let reply = try await channel.send(.init(action: "pointer", display: next.display, events: events, sourceOS: "macos"))
                 guard pointerChannel === channel else { return }
+                if Self.isSessionRevoked(reply.code ?? "") {
+                    endRevokedSession()
+                    return
+                }
                 if reply.status != "ok" {
                     inputNotice = remoteError(reply.code)
                     channel.close()
@@ -1839,6 +1856,10 @@ final class LocalConnection: ObservableObject {
             }
             return
         } catch {
+            if Self.isSessionRevoked(error.localizedDescription) {
+                endRevokedSession()
+                return
+            }
             if !Task.isCancelled { inputNotice = remoteError(error.localizedDescription) }
         }
         if !Task.isCancelled {
@@ -1953,9 +1974,18 @@ final class LocalConnection: ObservableObject {
         do {
             let reply = try await remote(action, session: session)
             guard self.session == session else { return }
+            if reply.status != "ok", Self.isSessionRevoked(reply.code ?? "") {
+                endRevokedSession()
+                return
+            }
             inputNotice = reply.status == "ok" ? nil : remoteError(reply.code)
         } catch {
-            if self.session == session { inputNotice = remoteError(error.localizedDescription) }
+            guard self.session == session else { return }
+            if Self.isSessionRevoked(error.localizedDescription) {
+                endRevokedSession()
+            } else {
+                inputNotice = remoteError(error.localizedDescription)
+            }
         }
     }
 
@@ -2081,6 +2111,14 @@ final class LocalConnection: ObservableObject {
                 : "远程操作未完成，请检查被控端是否仍在运行。"
         }
         return ConnectionNotice(message: message, isError: true)
+    }
+
+    /// The host ended this session. Clear the picture and close the remote window instead of
+    /// leaving a dead connection and the last frame on screen.
+    private func endRevokedSession() {
+        guard session != nil else { return }
+        disconnect()
+        controllerNotice = ConnectionNotice(message: "远程会话已结束，请重新连接。")
     }
 
     func disconnect() {
